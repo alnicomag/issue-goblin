@@ -1,0 +1,17 @@
+services:
+  agent:
+    build: ./agent
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      PYTHONUNBUFFERED: "1"
+    volumes:
+      - ./data:/data
+      - ./workspace:/workspace
+    mem_limit: 2g
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
