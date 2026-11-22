@@ -19,3 +19,6 @@ coverage/
 
 # ファクトリー側の実設定(例のみGit管理)
 config/factory.config.yml
+
+# Claude Code の個人設定
+.claude/settings.local.json
