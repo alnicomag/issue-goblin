@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 
@@ -12,6 +13,23 @@ const ImageName = z
     /^[a-z0-9][a-z0-9._/:@-]*$/,
     "イメージ名を書いてください(英小文字と数字で始める)",
   );
+
+/** 置き場所のディレクトリ。相対パスは、実行する場所で意味が変わるので通さない。 */
+const AbsoluteDir = z
+  .string()
+  .refine((value) => path.isAbsolute(value), "絶対パスで書いてください")
+  .transform((value) => path.resolve(value));
+
+/** `child` が `parent` と同じか、その内側にあるか。どちらも絶対パスで渡す。 */
+export function isInsideDir(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return (
+    relative === "" ||
+    (!path.isAbsolute(relative) &&
+      relative !== ".." &&
+      !relative.startsWith(`..${path.sep}`))
+  );
+}
 
 const RepoConfigSchema = z.strictObject({
   repo: z
@@ -38,6 +56,10 @@ const FactoryConfigSchema = z
     dry_run: z.boolean().default(true),
     poll_interval_sec: z.number().int().min(1).default(60),
     db_path: z.string().min(1),
+    /** 事務局専用のミラーの置き場所。ワーカーには見せない。 */
+    repos_dir: AbsoluteDir,
+    /** イシューごとの作業場所の置き場所。ワーカーには、このうち1件分だけを見せる。 */
+    work_dir: AbsoluteDir,
     /** ワーカーの既定のイメージ。 */
     worker_image: ImageName.default("factory-worker"),
     /**
@@ -51,6 +73,21 @@ const FactoryConfigSchema = z
     repos: z.array(RepoConfigSchema).min(1),
   })
   .superRefine((config, ctx) => {
+    // ミラーが作業場所の内側にあると、ワーカーから見える場所に入りうる。
+    // 逆向きでも、片方の後片付けがもう片方を消しうるので、どちらも通さない。
+    if (isInsideDir(config.work_dir, config.repos_dir)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["repos_dir"],
+        message: `work_dir(${config.work_dir})の外に置いてください`,
+      });
+    } else if (isInsideDir(config.repos_dir, config.work_dir)) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["work_dir"],
+        message: `repos_dir(${config.repos_dir})の外に置いてください`,
+      });
+    }
     const seen = new Set<string>();
     config.repos.forEach((entry, index) => {
       const key = entry.repo.toLowerCase();

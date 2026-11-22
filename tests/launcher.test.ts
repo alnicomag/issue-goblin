@@ -22,6 +22,8 @@ import {
 
 const CONFIG = parseConfig(`
 db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
 repos:
   - repo: owner/first
     token_env: TOKEN_FIRST

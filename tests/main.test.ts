@@ -76,6 +76,8 @@ describe("起動時のトークンの確認", () => {
     dry_run: true,
     poll_interval_sec: 60,
     db_path: ":memory:",
+    repos_dir: "/data/repos",
+    work_dir: "/work",
     worker_image: "factory-worker",
     retry_wait_minutes: [5, 30, 120],
     repos: [
