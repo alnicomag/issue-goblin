@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # ワーカーの隔離を、実際にコンテナを立てて確かめる。
+# あわせて、事務局のコンテナで作業場所の準備と後片付けが通ることを確かめる。
 #
 # 確認用の環境を、稼働中のものとは別の名前(既定: factory-check)で立て、終わったら消す。
 # 稼働中のファクトリーや、同じホストのほかのコンテナには触れない。
@@ -104,9 +105,15 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 
+result=0
+
+echo "# 事務局のコンテナで、作業場所の準備と後片付けを調べる"
+echo
+compose run --rm --no-deps -T office node scripts/workspace-check.ts 2>&1 || result=1
+echo
+
 echo "# ワーカーを立てて調べる"
 echo
-result=0
 compose run --rm --no-deps -T \
   --env "CHECK_HOST_ADDR=${HOST_IP}:${LISTENER_PORT}" \
   --env "CHECK_HOST_IP=${HOST_IP}" \
@@ -136,6 +143,15 @@ if docker run --rm --volume "${PROJECT}_factory-work:/work:ro" busybox:1.37 \
 else
   check 0 "作業場所に、トークンが含まれない"
 fi
+
+# gitが要るのは事務局だけ。起動係とプロキシには持たせない。
+for service in launcher proxy; do
+  if compose exec -T "$service" sh -c 'command -v git' >/dev/null 2>&1; then
+    check 1 "${service} のコンテナに、gitが入っていない"
+  else
+    check 0 "${service} のコンテナに、gitが入っていない"
+  fi
+done
 
 launcher_env="$(compose exec -T launcher env)"
 if printf '%s' "$launcher_env" | grep -q -e "$GITHUB_DUMMY" -e '^GITHUB'; then
