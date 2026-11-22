@@ -123,6 +123,7 @@ export function listSteps(db: Db, runId: number): Step[] {
 /**
  * 次の実行の試行回数。
  * 数えるのは `failed` で終わった実行だけで、質問での終了と取り消しは数えない。
+ * `resetAttempts` でリセットされた失敗も数えない。
  */
 export function nextAttempt(db: Db, repo: string, issueNumber: number): number {
   return countFailedRuns(db, repo, issueNumber) + 1;
@@ -132,10 +133,32 @@ function countFailedRuns(db: Db, repo: string, issueNumber: number): number {
   const row = db
     .prepare(
       `SELECT COUNT(*) AS n FROM runs
-       WHERE repo = ? AND issue_number = ? AND status = 'failed'`,
+       WHERE repo = ? AND issue_number = ? AND status = 'failed'
+         AND attempt_reset_at IS NULL`,
     )
     .get(repo, issueNumber) as { n: number };
   return row.n;
+}
+
+/**
+ * イシューの試行回数をリセットする。人間が `failed` のイシューを戻したときに呼ぶ。
+ *
+ * それまでの失敗を試行に数えなくするだけで、実行の記録は消さない。次の実行は1回目になる。
+ * 2回呼んでも、最初にリセットした時刻は変わらない。リセットした失敗の数を返す。
+ */
+export function resetAttempts(
+  db: Db,
+  clock: Clock,
+  target: { repo: string; issueNumber: number },
+): number {
+  const info = db
+    .prepare(
+      `UPDATE runs SET attempt_reset_at = ?
+       WHERE repo = ? AND issue_number = ? AND status = 'failed'
+         AND attempt_reset_at IS NULL`,
+    )
+    .run(isoNow(clock), target.repo, target.issueNumber);
+  return info.changes;
 }
 
 /**

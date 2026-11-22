@@ -9,6 +9,7 @@ import {
   getRun,
   listSteps,
   nextAttempt,
+  resetAttempts,
   startRun,
   startStep,
 } from "../src/office/runs.ts";
@@ -547,6 +548,63 @@ describe("実行とステップの記録", () => {
       failRun();
       expect(nextAttempt(db, target.repo, 8)).toBe(1);
       expect(nextAttempt(db, "owner/other", target.issueNumber)).toBe(1);
+    });
+
+    it("リセットすると、次の実行は1回目になり、待機時間も最初の値に戻る", () => {
+      failRun();
+      failRun();
+      const other = failRun(8);
+      expect(nextAttempt(db, target.repo, target.issueNumber)).toBe(3);
+
+      clock.set("2026-01-02T09:00:00.000Z");
+      expect(resetAttempts(db, clock, target)).toBe(2);
+      expect(nextAttempt(db, target.repo, target.issueNumber)).toBe(1);
+
+      // 実行の記録は残り、リセットした時刻だけが入る。ほかのイシューには及ばない。
+      expect(
+        db
+          .prepare(
+            "SELECT issue_number, status, attempt, attempt_reset_at FROM runs ORDER BY id",
+          )
+          .all(),
+      ).toEqual([
+        {
+          issue_number: 7,
+          status: "failed",
+          attempt: 1,
+          attempt_reset_at: "2026-01-02T09:00:00.000Z",
+        },
+        {
+          issue_number: 7,
+          status: "failed",
+          attempt: 2,
+          attempt_reset_at: "2026-01-02T09:00:00.000Z",
+        },
+        {
+          issue_number: 8,
+          status: "failed",
+          attempt: 1,
+          attempt_reset_at: null,
+        },
+      ]);
+      expect(nextAttempt(db, target.repo, other.issueNumber)).toBe(2);
+
+      clock.set("2026-01-02T10:00:00.000Z");
+      const retried = failRun();
+      expect(retried.attempt).toBe(1);
+      expect(retried.nextRetryAt).toBe("2026-01-02T10:05:00.000Z");
+      expect(nextAttempt(db, target.repo, target.issueNumber)).toBe(2);
+    });
+
+    it("2回リセットしても変わらない", () => {
+      failRun();
+      clock.set("2026-01-02T09:00:00.000Z");
+      resetAttempts(db, clock, target);
+      const before = db.prepare("SELECT * FROM runs").all();
+
+      clock.set("2026-01-02T09:30:00.000Z");
+      expect(resetAttempts(db, clock, target)).toBe(0);
+      expect(db.prepare("SELECT * FROM runs").all()).toEqual(before);
     });
 
     it("失敗のたびに、設定の待機時間から次に再試行してよい時刻を決める", () => {
