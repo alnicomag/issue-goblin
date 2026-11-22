@@ -1,0 +1,9 @@
+# ファクトリー側の設定の例。
+# config/factory.config.yml に複製して書き換える(実際の設定はGit管理外)。
+
+dry_run: true # true の間、GitHubへ一切書き込まない
+poll_interval_sec: 60
+db_path: /data/factory.db
+repos:
+  - repo: owner/name # 対象リポジトリ
+    token_env: GITHUB_TOKEN_EXAMPLE # トークンを入れた環境変数の名前(値は .env に書く)
