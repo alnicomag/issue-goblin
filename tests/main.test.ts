@@ -77,6 +77,7 @@ describe("起動時のトークンの確認", () => {
     poll_interval_sec: 60,
     db_path: ":memory:",
     worker_image: "factory-worker",
+    retry_wait_minutes: [5, 30, 120],
     repos: [
       { repo: "owner/first", token_env: "TOKEN_FIRST" },
       { repo: "owner/second", token_env: "TOKEN_SECOND" },

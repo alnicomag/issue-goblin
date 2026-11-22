@@ -67,9 +67,22 @@ describe("マイグレーション", () => {
   it("空のDBに適用できる", () => {
     const result = migrate(db, { clock });
 
-    expect(result.applied).toEqual([1]);
+    expect(result.applied).toEqual([1, 2]);
     expect(tableNames(db)).toEqual(EXPECTED_TABLES);
-    expect(currentVersion(db)).toBe(1);
+    expect(currentVersion(db)).toBe(2);
+  });
+
+  it("実行中の実行とステップの重複を防ぐ索引がある", () => {
+    migrate(db, { clock });
+    const indexes = db
+      .prepare(
+        "SELECT name, tbl_name FROM sqlite_master WHERE type = 'index' AND sql IS NOT NULL ORDER BY name",
+      )
+      .all();
+    expect(indexes).toEqual([
+      { name: "runs_one_running_per_issue", tbl_name: "runs" },
+      { name: "steps_one_running_per_run", tbl_name: "steps" },
+    ]);
   });
 
   it("状態を持つテーブルはリポジトリの列を持つ", () => {
@@ -100,7 +113,7 @@ describe("マイグレーション", () => {
 
     expect(second).toEqual({ applied: [], backupPath: null });
     expect(schemaDump(db)).toEqual(before);
-    expect(currentVersion(db)).toBe(1);
+    expect(currentVersion(db)).toBe(2);
     expect(backups()).toEqual(backupsBefore);
   });
 

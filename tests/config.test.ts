@@ -23,8 +23,23 @@ describe("ファクトリー側の設定", () => {
       poll_interval_sec: 30,
       db_path: "/data/factory.db",
       worker_image: "factory-worker",
+      retry_wait_minutes: [5, 30, 120],
       repos: [{ repo: "owner/name", token_env: "GITHUB_TOKEN_EXAMPLE" }],
     });
+  });
+
+  it("失敗後の待機時間を指定できる", () => {
+    const config = parseConfig(`${VALID}retry_wait_minutes: [1, 10]\n`);
+    expect(config.retry_wait_minutes).toEqual([1, 10]);
+  });
+
+  it("失敗後の待機時間は、1つ以上の0以上の整数でなければ通さない", () => {
+    for (const value of ["[]", "[5, -1]", "[1.5]", "5", '["5"]']) {
+      expect(
+        () => parseConfig(`${VALID}retry_wait_minutes: ${value}\n`),
+        value,
+      ).toThrow("retry_wait_minutes");
+    }
   });
 
   it("ワーカーのイメージは、リポジトリごとの指定が全体の指定より優先される", () => {

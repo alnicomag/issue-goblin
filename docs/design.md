@@ -131,11 +131,13 @@ Nov 22, 2026 · @tatsuya
 | 7. cleanup | 事務局 | マージまたはクローズの後に作業場所を消す | なし |
 
 - **差し戻し:** verify の失敗と review の修正要求は implement に戻します。1回の実行の中で2回までです。
+- **ステップの結果:** 終わったステップは、`done`(次へ進む)、`rework`(差し戻し)、`question`(質問を返して終了)、`failed`(失敗して終了)のいずれかを `steps.status` に残します。次に行うことは、この記録だけから決まります。
 - **再開:** 事務局が落ちたら、最後のチェックポイントの次のステップからやり直します。どのステップも、やり直して安全な作りにします(ブランチがあれば使う、PRがあれば更新する)。
 - **上限:** Claudeの各ステップにターン数の上限とタイムアウトを設けます。
 - **試行の上限:** 1つのイシューに対する実行は、製品の `factory.yml` の `limits.max_attempts` 回までです(既定は3回)。上限に達したら `failed` にします。上限を製品側に置くのは、どこまで自動で粘るかが製品ごとに違うからです。
 - **待機時間:** 失敗して `ready` に戻したイシューは、1回目の失敗の後は5分、2回目の後は30分、3回目以降は2時間待ってから再試行します。値はファクトリー側の設定(`retry_wait_minutes`)に置きます。上限が3回なら、使うのは5分と30分の2つです。間隔を伸ばすのは、一時的な障害(レート制限、通信の失敗)は短い待機で直り、直らない失敗を短い間隔で繰り返しても利用枠を使うだけだからです。
 - **試行に数えるもの:** 実行が `failed` で終わった場合だけを数えます。質問を返して終了した場合、人間のラベル変更で取り消された場合、事務局の再起動で同じ実行を再開した場合は数えません。どれもワーカーの失敗ではないからです。
+- **試行回数のリセット:** 人間が `failed` のイシューを戻したら、それまでの失敗は数えません。次の実行は1回目になり、待機時間も最初の値に戻ります。人間が方針を示した後は、別の取り組みとして扱うからです。実行の記録は消さず、リセットした時刻(`runs.attempt_reset_at`)を残します。
 - **結果の形式:** Claudeのステップは `done` / `question` / `failed` のいずれかと要約をJSONで返します。事務局は、申告ではなくコミットやPRの実在を確かめてから状態を進めます。
 - **定期タスク:** スケジュールがイシューを起票し、以降は通常のイシューと同じ経路を通ります。
 
@@ -198,7 +200,8 @@ CREATE TABLE runs (
   pr_number     INTEGER,
   started_at    TEXT NOT NULL,
   finished_at   TEXT,
-  next_retry_at TEXT
+  next_retry_at TEXT,
+  attempt_reset_at TEXT             -- 値のある失敗は、試行に数えない
 );
 
 -- ステップごとのチェックポイント
@@ -206,7 +209,7 @@ CREATE TABLE steps (
   id          INTEGER PRIMARY KEY,
   run_id      INTEGER NOT NULL REFERENCES runs(id),
   name        TEXT NOT NULL,         -- prepare / plan / implement / ...
-  status      TEXT NOT NULL,         -- running / done / failed
+  status      TEXT NOT NULL,         -- running / done / rework / question / failed / cancelled
   output      TEXT,                  -- JSON
   session_id  TEXT,
   cost_usd    REAL,
@@ -214,6 +217,12 @@ CREATE TABLE steps (
   started_at  TEXT NOT NULL,
   finished_at TEXT
 );
+
+-- 実行中の実行はイシューごとに1つ、実行中のステップは実行ごとに1つ
+CREATE UNIQUE INDEX runs_one_running_per_issue
+  ON runs (repo, issue_number) WHERE status = 'running';
+CREATE UNIQUE INDEX steps_one_running_per_run
+  ON steps (run_id) WHERE status = 'running';
 
 -- 定期タスク
 CREATE TABLE schedules (
@@ -512,7 +521,9 @@ factory/
       github.ts        同期と書き出し
       transitions.ts   遷移表と指示の検査
       scheduler.ts     定期タスク
-      runner.ts        実行のステップ管理と再開
+      run-steps.ts     ステップの進み方(純粋関数)
+      runs.ts          実行とステップの記録、再開の対象の検索
+      runner.ts        ステップの実行
     agents/
       conductor.ts     司令塔の呼び出し
       worker.ts        plan / implement / review の呼び出し

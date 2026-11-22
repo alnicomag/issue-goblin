@@ -40,6 +40,14 @@ const FactoryConfigSchema = z
     db_path: z.string().min(1),
     /** ワーカーの既定のイメージ。 */
     worker_image: ImageName.default("factory-worker"),
+    /**
+     * 失敗した後に、再試行まで待つ時間(分)。
+     * 1回目の失敗の後は1つ目、2回目の後は2つ目を使い、回数が足りなければ最後の値を使う。
+     */
+    retry_wait_minutes: z
+      .array(z.number().int().min(0))
+      .min(1, "待機時間を1つ以上書いてください")
+      .default([5, 30, 120]),
     repos: z.array(RepoConfigSchema).min(1),
   })
   .superRefine((config, ctx) => {
