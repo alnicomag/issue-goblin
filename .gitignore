@@ -9,3 +9,14 @@ workspace/
 *.db
 *.db-*
 .pytest_cache/
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/
+dist/
+coverage/
+
+# ファクトリー側の実設定(例のみGit管理)
+config/factory.config.yml
