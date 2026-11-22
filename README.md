@@ -2,11 +2,12 @@
 
 GitHubのイシューを入力として、AIエージェントが実装からプルリクエストの作成までを進める「ソフトウェアファクトリー」です。
 
-現在は段階0(事務局の骨組み)で、次のことができます。
+現在は段階1(ワーカー)の途中で、次のことができます。
 
 - 対象リポジトリのイシューとコメントをポーリングで取り込み、SQLiteに記録する。
 - `state:` ラベルのない新規イシューに `state:triage` を付ける(`dry_run: false` のときだけ)。
 - 対象リポジトリの `factory.yml` を取得して検証する。
+- ワーカーを、資格情報のない隔離されたコンテナで動かす(起動の仕組みまで。イシューの実装はまだ行わない)。
 
 設計は `docs/design.md`、段階0の仕様は `docs/stage0.md` にあります。
 
@@ -14,7 +15,7 @@ GitHubのイシューを入力として、AIエージェントが実装からプ
 
 - Node 22.18 以上(TypeScriptをビルドせずに直接実行します)
 - pnpm(`corepack enable pnpm` で使えます)
-- Docker と Docker Compose(常駐させる場合)
+- Docker 26 以上と Docker Compose 2.24 以上(常駐させる場合)
 
 ## セットアップ
 
@@ -51,12 +52,55 @@ GITHUB_TOKEN_EXAMPLE=<トークン>
 
 `config/factory.config.yml` と `.env` はGit管理外です。
 
+### ワーカーの実行環境
+
+ワーカーは、事務局とは別のコンテナで動きます。コンテナを立てるのは「起動係」で、事務局は起動係に依頼します。仕組みは `docs/design.md` の「ワーカーの封じ込め」にあります。
+
+1. `.env` に、ホストの docker グループの番号を書きます。起動係がDockerソケットを使うために要ります。
+
+   ```bash
+   echo "DOCKER_GID=$(getent group docker | cut -d: -f3)" >> .env
+   ```
+
+2. Claudeのトークンを、起動係だけが読むファイルに書きます。事務局の `.env` には書きません。
+
+   ```bash
+   cp .env.launcher.example .env.launcher
+   claude setup-token        # 発行された値を .env.launcher に書く
+   ```
+
+3. ワーカーのイメージを作ります。
+
+   ```bash
+   docker compose build worker-image
+   ```
+
+製品に固有のツールが要る場合は、`docker/worker.Dockerfile` を土台にした別のイメージを作り、`config/factory.config.yml` の `worker_image` で指定します。
+
+```yaml
+worker_image: factory-worker          # 既定のイメージ
+repos:
+  - repo: owner/name
+    token_env: GITHUB_TOKEN_EXAMPLE
+    worker_image: owner-name-worker   # 省略可。この製品だけ別のイメージにする
+```
+
+`.env.launcher` もGit管理外です。
+
 ## 起動
 
 ```bash
 docker compose up -d --build
 docker compose logs -f office
 ```
+
+常駐するコンテナは3つです。
+
+| コンテナ | 役割 | 持っているもの |
+| --- | --- | --- |
+| `office` | 事務局 | GitHubのトークン、DB |
+| `launcher` | 起動係。事務局の依頼で、ワーカーのコンテナを立てる | Dockerソケット、Claudeのトークン |
+| `proxy` | ワーカーの唯一の出口。内部宛ての通信を拒否する | なし |
 
 - 起動時にマイグレーションを実行します。未適用のものがあれば、適用前にDBファイルを同じ場所に複製します(`factory.db.bak-v<版>-<日時>`)。
 - DBファイルは名前付きボリューム `factory-data` に置かれます。
@@ -69,6 +113,31 @@ docker compose logs -f office
 ### GitHubへの書き込みを有効にする
 
 `dry_run` を `false` にすると、`state:` ラベルのないオープンのイシューに `state:triage` が付きます。`true` の間は、付ける予定だったことをログに出すだけです(`github.write_skipped`)。
+
+## ワーカーの隔離を確かめる
+
+ワーカーから見えるもの、できること、届く先を、実際にコンテナを立てて確かめます。
+
+```bash
+scripts/check-isolation.sh
+```
+
+- 確認用の環境を、稼働中のものとは別の名前(`factory-check`)で立て、終わったら消します。稼働中のファクトリーや、同じホストのほかのコンテナには触れません。
+- GitHubのトークンとClaudeのトークンには、その場で作った仮の値を使います。実際のトークンは読みません。
+- 項目ごとに `OK` か `NG` を出し、1つでも `NG` があれば終了コード1で終わります。
+- 外部への接続の確認で、`github.com` に接続します(公開リポジトリの読み取りと、認証のない `git push` の失敗)。
+
+確かめる内容は次のとおりです。
+
+| 分類 | 確かめること |
+| --- | --- |
+| 見えるもの | 事務局のDBファイル、`.env`、設定ファイル、ソケットを読めない。環境変数が明示した一覧だけである。マウントが作業場所だけである。ほかのイシューとほかの製品の作業場所が見えない |
+| できること | 作業場所でファイルの変更とコミットができる。作業場所の外に書けない。`git push` が認証できずに失敗する。`gh` がない |
+| 届く先 | インスタンスメタデータ、ホスト、ほかのコンテナに、直接にもプロキシ経由でも届かない。プロキシを通して外部のHTTPSに届く |
+| トークン | Claudeのトークンが、求めた実行にだけ渡る。事務局の環境、ログ、作業場所に含まれない |
+| 起動係 | 事務局がDockerソケットを持たない。不正な依頼を拒否する。時間の上限を過ぎた実行を止める。コンテナを残さない |
+
+環境を残して調べたいときは、`CHECK_KEEP=1 scripts/check-isolation.sh` で実行します。
 
 ## 状況表示
 
@@ -127,6 +196,10 @@ pnpm test
 | `src/office/events.ts` | イベントの記録 |
 | `src/office/log.ts` | 構造化ログ |
 | `src/office/clock.ts` | 時計 |
+| `src/launcher/` | 起動係と、事務局から起動係に依頼する口 |
+| `src/proxy/` | ワーカーの出口になるプロキシ |
+| `docker/worker.Dockerfile` | ワーカーの基本イメージ |
+| `scripts/` | 確認用のスクリプト |
 | `migrations/` | 連番のSQLファイル |
 | `config/` | ファクトリー側の設定の例 |
 | `tests/` | 自動テスト |

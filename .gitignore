@@ -2,6 +2,7 @@
 .env
 .env.*
 !.env.example
+!.env.launcher.example
 
 # 実行時のデータ
 data/

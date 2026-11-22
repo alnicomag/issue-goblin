@@ -1,7 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { parseConfig, resolveToken } from "../src/office/config.ts";
+import {
+  parseConfig,
+  resolveToken,
+  workerImageFor,
+} from "../src/office/config.ts";
 
 const VALID = `
 dry_run: false
@@ -18,8 +22,56 @@ describe("ファクトリー側の設定", () => {
       dry_run: false,
       poll_interval_sec: 30,
       db_path: "/data/factory.db",
+      worker_image: "factory-worker",
       repos: [{ repo: "owner/name", token_env: "GITHUB_TOKEN_EXAMPLE" }],
     });
+  });
+
+  it("ワーカーのイメージは、リポジトリごとの指定が全体の指定より優先される", () => {
+    const config = parseConfig(`
+db_path: /data/factory.db
+worker_image: registry.example/base-worker:1
+repos:
+  - repo: owner/first
+    token_env: TOKEN_FIRST
+  - repo: owner/second
+    token_env: TOKEN_SECOND
+    worker_image: second-worker
+`);
+    expect(workerImageFor(config, "owner/first")).toBe(
+      "registry.example/base-worker:1",
+    );
+    expect(workerImageFor(config, "Owner/Second")).toBe("second-worker");
+    expect(() => workerImageFor(config, "owner/unknown")).toThrow(
+      "設定にないリポジトリです: owner/unknown",
+    );
+  });
+
+  it("置き場所の外を指すリポジトリ名は通さない", () => {
+    for (const repo of ["../name", "owner/..", "./name", "owner/."]) {
+      expect(() =>
+        parseConfig(`
+db_path: /data/factory.db
+repos:
+  - repo: ${repo}
+    token_env: GITHUB_TOKEN_EXAMPLE
+`),
+      ).toThrow("repos.0.repo");
+    }
+  });
+
+  it("オプションに見えるイメージ名は通さない", () => {
+    for (const image of ["--privileged", "-v", "Image Name", ""]) {
+      expect(() =>
+        parseConfig(`
+db_path: /data/factory.db
+worker_image: "${image}"
+repos:
+  - repo: owner/name
+    token_env: GITHUB_TOKEN_EXAMPLE
+`),
+      ).toThrow("worker_image");
+    }
   });
 
   it("リポジトリに置いた例のファイルを読める", () => {
