@@ -78,6 +78,7 @@ describe("起動時のトークンの確認", () => {
     db_path: ":memory:",
     repos_dir: "/data/repos",
     work_dir: "/work",
+    logs_dir: "/data/logs",
     worker_image: "factory-worker",
     retry_wait_minutes: [5, 30, 120],
     repos: [
