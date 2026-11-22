@@ -37,11 +37,11 @@ GitHubのイシューを入力として、AIエージェントが実装からプ
 ## コマンド
 
 ```bash
-npm ci
-npm run typecheck
-npm run lint
-npm test
-npm run status        # 状態別のイシュー数、未処理のイベント数、最終同期時刻
+pnpm install --frozen-lockfile
+pnpm run typecheck
+pnpm run lint
+pnpm test
+pnpm run status       # 状態別のイシュー数、未処理のイベント数、最終同期時刻
 ```
 
 変更後は必ず `typecheck`、`lint`、`test` を実行し、すべて通ってから完了とする。
