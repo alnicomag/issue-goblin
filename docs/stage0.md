@@ -45,39 +45,43 @@
 
 ## 3. 技術
 
-- Node 22以上、TypeScript(strict)、ESM
+- Node 22.18以上、TypeScript(strict)、ESM。TypeScriptはビルドせず、Nodeで直接実行する
+- パッケージ管理: pnpm
 - SQLite: better-sqlite3
-- GitHub API: Octokit
+- GitHub API: Octokit(レート制限の待機に `@octokit/plugin-throttling` を使う)
 - 入力の検証: zod
 - YAML: yaml
 - テスト: Vitest
-- lintと整形: 任意の1つに決めてよい。`npm run lint` の1コマンドで実行できること
+- lintと整形: Biome。`pnpm run lint` の1コマンドで実行できること
 
 上記以外の依存を追加するときは、理由を説明してください。大きなフレームワークは入れないでください。
 
 ## 4. 構成
 
+リポジトリ直下に置く。
+
 ```text
-factory/
-  src/
-    office/
-      main.ts          起動とメインループ
-      config.ts        ファクトリー側の設定
-      db.ts            SQLiteとマイグレーション
-      github.ts        GitHubクライアント(読み取りと書き込みをここに集約)
-      sync.ts          同期の処理
-      transitions.ts   遷移表
-      product.ts       factory.yml の取得と検証
-      status.ts        状況表示コマンド
-      log.ts           構造化ログ
-  migrations/
-    001_init.sql
-  config/
-    factory.config.example.yml
-  tests/
-  Dockerfile
-  docker-compose.yml
-  .env.example
+src/
+  office/
+    main.ts          起動とメインループ
+    config.ts        ファクトリー側の設定
+    db.ts            SQLiteとマイグレーション
+    github.ts        GitHubクライアント(読み取りと書き込みをここに集約)
+    sync.ts          同期の処理
+    transitions.ts   遷移表
+    product.ts       factory.yml の取得と検証
+    status.ts        状況表示コマンド
+    events.ts        イベントの記録
+    log.ts           構造化ログ
+    clock.ts         時計
+migrations/
+  001_init.sql
+config/
+  factory.config.example.yml
+tests/
+Dockerfile
+docker-compose.yml
+.env.example
 ```
 
 ## 5. 仕様
@@ -142,7 +146,7 @@ repos:
 
 ### 5.4 スキーマ
 
-`migrations/001_init.sql` に次のテーブルを作る。段階0で読み書きするのは `repos`、`issues`、`events` だけだが、後の段階で使うテーブルも今回作っておく。
+`migrations/001_init.sql` に次のテーブルを作る。ただし `schema_version` だけは `db.ts` が作り、適用済みの最大の番号を1行で持つ(どこまで適用済みかを、マイグレーションの適用前に読めるようにするため)。段階0で読み書きするのは `repos`、`issues`、`events` だけだが、後の段階で使うテーブルも今回作っておく。
 
 ```sql
 CREATE TABLE schema_version (version INTEGER NOT NULL);
@@ -245,6 +249,7 @@ CREATE TABLE reports (
 - 適用はトランザクションで行い、失敗したら元に戻す。
 - 未適用のものがある場合は、適用前にDBファイルを複製する。
 - 起動のたびに実行しても安全であること。
+- 1ファイルを1トランザクションで適用する。
 - 日時はすべてUTCのISO 8601形式の文字列で保存する。
 
 ### 5.5 GitHubとの同期
@@ -264,7 +269,7 @@ CREATE TABLE reports (
    | クローズされた | `issue.closed` |
    | `state:` ラベルが複数付いている | `issue.label_conflict`(状態は更新しない) |
 
-4. **新規イシューへのラベル付け。** オープンで `state:` ラベルがないイシューには `state:triage` を付ける。`dry_run` が `true` のときは付けず、付ける予定だったことをログに出す。DB上の状態は `triage` として扱う。
+4. **新規イシューへのラベル付け。** オープンで `state:` ラベルがないイシューには `state:triage` を付ける。`dry_run` が `true` のときは付けず、付ける予定だったことをログに出す。DB上の状態は `triage` として扱う。起動後、最初に成功したポーリングではイシューを全件取り直し、`dry_run` の間に取り込んだものにもラベルを付ける。
 5. **コメントの取得。** 前回の取得位置より後のイシューコメントを取得し、`issue.commented` を記録する。本文に `<!-- factory -->` を含むコメントはファクトリー自身のものなので、記録しない。
 6. **取得位置の更新。** `repos` の取得位置を進める。
 
@@ -307,7 +312,7 @@ issues:
 - 起動時にマイグレーションを実行し、設定を検証してから、`poll_interval_sec` ごとに同期する。
 - SIGTERMとSIGINTを受けたら、実行中のポーリングを終えてから終了する。
 - ログは1行1件のJSONで標準出力に出す。トークンを出力しない。
-- 状況表示コマンド(`npm run status`)を用意する。リポジトリごとに、状態別のイシュー数、未処理のイベント数、最後に同期した時刻を表示する。
+- 状況表示コマンド(`pnpm run status`)を用意する。リポジトリごとに、状態別のイシュー数、未処理のイベント数、最後に同期した時刻を表示する。
 
 ### 5.8 Docker Compose
 
@@ -335,10 +340,10 @@ Vitestで、次を自動テストにする。ネットワークには出ない�
 
 ## 7. 受け入れ条件
 
-- [ ] `npm ci`、`npm run typecheck`、`npm run lint`、`npm test` がすべて通る。
+- [ ] `pnpm install --frozen-lockfile`、`pnpm run typecheck`、`pnpm run lint`、`pnpm test` がすべて通る。
 - [ ] `docker compose up -d` で起動し、ログにエラーが出ない。
 - [ ] 対象リポジトリの既存のイシューが、最初のポーリングで `issues` に入る。
-- [ ] 対象リポジトリにイシューを1件作ると、ポーリング2回以内に `issues` と `events` に入り、`npm run status` に反映される。
+- [ ] 対象リポジトリにイシューを1件作ると、ポーリング2回以内に `issues` と `events` に入り、`pnpm run status` に反映される。
 - [ ] コンテナを再起動しても、イベントが重複せず、続きから同期する。
 - [ ] `dry_run: true` の間、GitHub上のラベルやコメントが一切変わらない。
 - [ ] `dry_run: false` にすると、`state:` ラベルのない新規イシューに `state:triage` が付く。
