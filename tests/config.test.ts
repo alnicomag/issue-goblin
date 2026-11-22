@@ -11,6 +11,8 @@ const VALID = `
 dry_run: false
 poll_interval_sec: 30
 db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
 repos:
   - repo: owner/name
     token_env: GITHUB_TOKEN_EXAMPLE
@@ -22,10 +24,20 @@ describe("ファクトリー側の設定", () => {
       dry_run: false,
       poll_interval_sec: 30,
       db_path: "/data/factory.db",
+      repos_dir: "/data/repos",
+      work_dir: "/work",
       worker_image: "factory-worker",
       retry_wait_minutes: [5, 30, 120],
       repos: [{ repo: "owner/name", token_env: "GITHUB_TOKEN_EXAMPLE" }],
     });
+  });
+
+  it("置き場所は、名前が前方一致するだけの別の場所なら通す", () => {
+    const config = parseConfig(
+      VALID.replace("repos_dir: /data/repos", "repos_dir: /work-repos"),
+    );
+    expect(config.repos_dir).toBe("/work-repos");
+    expect(config.work_dir).toBe("/work");
   });
 
   it("失敗後の待機時間を指定できる", () => {
@@ -45,6 +57,8 @@ describe("ファクトリー側の設定", () => {
   it("ワーカーのイメージは、リポジトリごとの指定が全体の指定より優先される", () => {
     const config = parseConfig(`
 db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
 worker_image: registry.example/base-worker:1
 repos:
   - repo: owner/first
@@ -67,6 +81,8 @@ repos:
       expect(() =>
         parseConfig(`
 db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
 repos:
   - repo: ${repo}
     token_env: GITHUB_TOKEN_EXAMPLE
@@ -80,6 +96,8 @@ repos:
       expect(() =>
         parseConfig(`
 db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
 worker_image: "${image}"
 repos:
   - repo: owner/name
@@ -104,6 +122,8 @@ repos:
   it("dry_run の既定値は true、poll_interval_sec の既定値は 60", () => {
     const config = parseConfig(`
 db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
 repos:
   - repo: owner/name
     token_env: GITHUB_TOKEN_EXAMPLE
@@ -115,6 +135,8 @@ repos:
   it("複数のリポジトリを書ける", () => {
     const config = parseConfig(`
 db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
 repos:
   - repo: owner/first
     token_env: TOKEN_FIRST
@@ -130,20 +152,28 @@ repos:
   it.each([
     [
       "db_path の欠落",
-      "repos:\n  - repo: owner/name\n    token_env: T\n",
+      "repos_dir: /data/repos\nwork_dir: /work\nrepos:\n  - repo: owner/name\n    token_env: T\n",
       /db_path/,
     ],
-    ["repos の欠落", "db_path: /data/factory.db\n", /repos/],
-    ["repos が空", "db_path: /data/factory.db\nrepos: []\n", /repos/],
+    [
+      "repos の欠落",
+      "db_path: /data/factory.db\nrepos_dir: /data/repos\nwork_dir: /work\n",
+      /repos/,
+    ],
+    [
+      "repos が空",
+      "db_path: /data/factory.db\nrepos_dir: /data/repos\nwork_dir: /work\nrepos: []\n",
+      /repos/,
+    ],
     [
       "token_env の欠落",
-      "db_path: /data/factory.db\nrepos:\n  - repo: owner/name\n",
+      "db_path: /data/factory.db\nrepos_dir: /data/repos\nwork_dir: /work\nrepos:\n  - repo: owner/name\n",
       /repos\.0\.token_env/,
     ],
     ["未知のキー", `${VALID}unknown_key: 1\n`, /unknown_key/],
     [
       "リポジトリ内の未知のキー",
-      "db_path: /d\nrepos:\n  - repo: owner/name\n    token_env: T\n    token: abc\n",
+      "db_path: /d\nrepos_dir: /data/repos\nwork_dir: /work\nrepos:\n  - repo: owner/name\n    token_env: T\n    token: abc\n",
       /token/,
     ],
     [
@@ -170,6 +200,42 @@ repos:
       "同じリポジトリが2回",
       `${VALID}  - repo: Owner/Name\n    token_env: OTHER\n`,
       /repos\.1\.repo/,
+    ],
+    [
+      "repos_dir の欠落",
+      VALID.replace("repos_dir: /data/repos\n", ""),
+      /repos_dir/,
+    ],
+    ["work_dir の欠落", VALID.replace("work_dir: /work\n", ""), /work_dir/],
+    [
+      "repos_dir が相対パス",
+      VALID.replace("repos_dir: /data/repos", "repos_dir: data/repos"),
+      /repos_dir/,
+    ],
+    [
+      "work_dir が相対パス",
+      VALID.replace("work_dir: /work", "work_dir: ./work"),
+      /work_dir/,
+    ],
+    [
+      "repos_dir と work_dir が同じ",
+      VALID.replace("repos_dir: /data/repos", "repos_dir: /work/"),
+      /repos_dir/,
+    ],
+    [
+      "repos_dir が work_dir の内側",
+      VALID.replace("repos_dir: /data/repos", "repos_dir: /work/repos"),
+      /repos_dir/,
+    ],
+    [
+      "repos_dir が work_dir の内側(.. を挟む書き方)",
+      VALID.replace("repos_dir: /data/repos", "repos_dir: /data/../work/x"),
+      /repos_dir/,
+    ],
+    [
+      "work_dir が repos_dir の内側",
+      VALID.replace("work_dir: /work", "work_dir: /data/repos/work"),
+      /work_dir/,
     ],
     ["YAMLとして不正", "repos: [", /YAML/],
     ["空のファイル", "", /不正/],

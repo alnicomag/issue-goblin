@@ -32,6 +32,8 @@ cp .env.example .env
 dry_run: true              # true の間、GitHubへ一切書き込まない
 poll_interval_sec: 60
 db_path: /data/factory.db
+repos_dir: /data/repos      # 事務局専用のミラーの置き場所(絶対パス)
+work_dir: /work            # イシューごとの作業場所の置き場所(絶対パス)
 repos:
   - repo: owner/name
     token_env: GITHUB_TOKEN_EXAMPLE   # トークンを入れた環境変数の名前
@@ -155,7 +157,7 @@ pnpm run status
 
 ## Dockerを使わずに動かす
 
-`db_path` を手元のパス(例: `./data/factory.db`)にして、トークンを環境変数に入れて起動します。
+`db_path` を手元のパス(例: `./data/factory.db`)に、`repos_dir` と `work_dir` を手元の絶対パスにして、トークンを環境変数に入れて起動します。
 
 ```bash
 GITHUB_TOKEN_EXAMPLE=<トークン> pnpm start

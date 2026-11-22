@@ -60,6 +60,8 @@ CLAUDE_DUMMY_SHA256="$(printf '%s' "$CLAUDE_DUMMY" | sha256sum | cut -d' ' -f1)"
 cat >"$TMP/config.yml" <<CONFIG
 dry_run: true
 db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
 worker_image: ${PROJECT}-worker
 repos:
   - repo: owner/first
