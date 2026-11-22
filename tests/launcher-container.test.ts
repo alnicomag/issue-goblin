@@ -171,7 +171,7 @@ describe("ワーカーのコンテナの引数", () => {
       "--memory=2g",
       "--pids-limit=512",
       "--cpus=2",
-      "--label=factory.worker=1",
+      "--label=factory.worker=factory-work",
       "--name=factory-worker-abc123",
       "--workdir=/workspace/repo",
     ]) {

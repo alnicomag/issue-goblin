@@ -1,16 +1,31 @@
+# 常駐するのは、事務局、起動係、プロキシの3つ。
+# ワーカーは常駐させず、起動係がステップごとに使い捨てのコンテナとして立てる。
+#
+# ファイルの場所は、環境変数で差し替えられる(確認用の環境を、別の名前で立てるため)。
+#   FACTORY_CONFIG_FILE  ファクトリー側の設定(既定: ./config/factory.config.yml)
+#   FACTORY_ENV_FILE     事務局の環境変数(既定: .env)
+#   LAUNCHER_ENV_FILE    起動係の環境変数(既定: .env.launcher)
+#   DOCKER_GID           ホストの docker グループの番号(起動係に必要)
+
 services:
+  # 事務局。GitHubのトークンとDBを持つ。Dockerソケットは持たない。
   office:
-    build: .
+    build:
+      context: .
+      target: office
     # コンテナの異常終了と、ホスト(EC2)の再起動のどちらからも自動で復旧する。
     restart: unless-stopped
     init: true
     # トークンは .env から渡す(.env はGit管理外)。
-    env_file: .env
+    env_file: ${FACTORY_ENV_FILE:-.env}
     environment:
       FACTORY_CONFIG: /app/config/factory.config.yml
+      LAUNCHER_SOCKET: /run/launcher/launcher.sock
     volumes:
       - factory-data:/data
-      - ./config/factory.config.yml:/app/config/factory.config.yml:ro
+      - factory-work:/work
+      - launcher-socket:/run/launcher
+      - ${FACTORY_CONFIG_FILE:-./config/factory.config.yml}:/app/config/factory.config.yml:ro
     mem_limit: 1g
     pids_limit: 128
     security_opt:
@@ -18,5 +33,82 @@ services:
     cap_drop:
       - ALL
 
+  # 起動係。Dockerソケットを持ち、事務局の依頼でワーカーのコンテナを立てる。
+  # GitHubのトークンもDBも持たない。ネットワークにもつながない。
+  launcher:
+    build:
+      context: .
+      target: launcher
+    restart: unless-stopped
+    init: true
+    # Claudeのトークンは .env.launcher から渡す(Git管理外)。事務局には渡さない。
+    # ファイルがなくても起動はするが、Claudeを呼ぶ依頼は拒否する。
+    env_file:
+      - path: ${LAUNCHER_ENV_FILE:-.env.launcher}
+        required: false
+    environment:
+      FACTORY_CONFIG: /app/config/factory.config.yml
+      LAUNCHER_SOCKET: /run/launcher/launcher.sock
+      WORK_VOLUME: ${COMPOSE_PROJECT_NAME}_factory-work
+      WORKER_NETWORK: ${COMPOSE_PROJECT_NAME}_workers
+      WORKER_PROXY_URL: http://proxy:3128
+    network_mode: none
+    # Dockerソケットを読み書きできるように、ホストの docker グループに入れる。
+    # 番号は .env の DOCKER_GID に書く(getent group docker | cut -d: -f3)。
+    # 書いていない場合は、権限のないグループになり、起動係は理由をログに出して止まる。
+    group_add:
+      - "${DOCKER_GID:-65534}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - launcher-socket:/run/launcher
+      - ${FACTORY_CONFIG_FILE:-./config/factory.config.yml}:/app/config/factory.config.yml:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    mem_limit: 512m
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # プロキシ。ワーカーの唯一の出口。内部宛ての通信を拒否する。資格情報は持たない。
+  proxy:
+    build:
+      context: .
+      target: office
+    command: ["node", "src/proxy/main.ts"]
+    restart: unless-stopped
+    init: true
+    networks:
+      - workers
+      - egress
+    read_only: true
+    mem_limit: 256m
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+  # ワーカーの基本イメージ。常駐はさせず、ビルドだけに使う。
+  #   docker compose build worker-image
+  worker-image:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    image: ${WORKER_IMAGE:-factory-worker}
+    profiles:
+      - build
+
+networks:
+  # ワーカーをつなぐネットワーク。外への経路がない。
+  workers:
+    internal: true
+  # プロキシが外に出るためのネットワーク。
+  egress: {}
+
 volumes:
   factory-data:
+  factory-work:
+  launcher-socket:

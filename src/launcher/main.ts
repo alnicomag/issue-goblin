@@ -108,7 +108,15 @@ async function main(): Promise<void> {
   });
 
   // 前回の起動で残ったコンテナを消してから、依頼を受け始める。
-  await launcher.removeLeftovers();
+  // Dockerに届くことの確認も兼ねる。
+  try {
+    await launcher.removeLeftovers();
+  } catch (error) {
+    throw new Error(
+      "Dockerを使えません。.env の DOCKER_GID が、ホストの docker グループの番号と合っているかを確かめてください",
+      { cause: error },
+    );
+  }
 
   // 前回のソケットが残っていると、待ち受けに失敗する。
   fs.rmSync(socketPath, { force: true });

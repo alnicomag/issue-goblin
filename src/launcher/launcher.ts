@@ -10,7 +10,7 @@ import {
   buildRunArgs,
   CLAUDE_TOKEN_ENV,
   type ContainerSettings,
-  WORKER_LABEL,
+  workerLabel,
 } from "./container.ts";
 import type { Docker } from "./docker.ts";
 import { parseRunRequest, type RunResult } from "./request.ts";
@@ -221,7 +221,7 @@ export function createLauncher(deps: LauncherDeps): Launcher {
 
     async removeLeftovers() {
       const listed = await docker.exec(
-        ["ps", "--all", "--quiet", `--filter=label=${WORKER_LABEL}=1`],
+        ["ps", "--all", "--quiet", `--filter=label=${workerLabel(settings)}`],
         quiet,
       );
       if (listed.exitCode !== 0) {

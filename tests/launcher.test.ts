@@ -343,7 +343,7 @@ describe("起動係", () => {
     };
     expect(await launcherWith(docker).removeLeftovers()).toBe(2);
     expect(calls).toEqual([
-      ["ps", "--all", "--quiet", "--filter=label=factory.worker=1"],
+      ["ps", "--all", "--quiet", "--filter=label=factory.worker=factory-work"],
       ["rm", "--force", "abc123", "def456"],
     ]);
   });

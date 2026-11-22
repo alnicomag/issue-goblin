@@ -7,8 +7,16 @@
 import path from "node:path";
 import type { RunRequest } from "./request.ts";
 
-/** ワーカーのコンテナに付ける目印。残ったコンテナの片付けに使う。 */
+/**
+ * ワーカーのコンテナに付ける目印の名前。残ったコンテナの片付けに使う。
+ * 値は作業場所のボリュームの名前にして、同じホストの別のファクトリーのものと区別する。
+ */
 export const WORKER_LABEL = "factory.worker";
+
+/** この起動係が立てたコンテナを表す目印(`名前=値`)。 */
+export function workerLabel(settings: ContainerSettings): string {
+  return `${WORKER_LABEL}=${settings.workVolume}`;
+}
 
 /** コンテナの中での、作業場所のマウント先。 */
 export const WORKSPACE_MOUNT = "/workspace";
@@ -113,7 +121,7 @@ export function buildRunArgs(input: {
     "--init",
     "--pull=never",
     `--name=${containerName}`,
-    `--label=${WORKER_LABEL}=1`,
+    `--label=${workerLabel(settings)}`,
     `--network=${settings.network}`,
     `--user=${settings.user}`,
     "--cap-drop=ALL",
