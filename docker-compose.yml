@@ -76,8 +76,7 @@ services:
   proxy:
     build:
       context: .
-      target: office
-    command: ["node", "src/proxy/main.ts"]
+      target: proxy
     restart: unless-stopped
     init: true
     networks:
