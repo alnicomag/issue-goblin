@@ -175,6 +175,9 @@ function sinceParam(since: string | null): { since?: string } {
   return { since: since.replace(/\.\d+Z$/, "Z") };
 }
 
+/** Octokitが失敗したリクエストごとに出す記録(例: `GET /path - 404 with id ... in 12ms`)。 */
+const REQUEST_LOG_PATTERN = /^[A-Z]+ \S+ - \d{3} with id /;
+
 const ThrottledOctokit = Octokit.plugin(throttling);
 
 export function createOctokitApi(options: {
@@ -184,6 +187,18 @@ export function createOctokitApi(options: {
   const { logger } = options;
   const octokit = new ThrottledOctokit({
     auth: options.token,
+    // Octokit自身の出力も、1行1件のJSONに揃える。
+    log: {
+      debug: () => {},
+      info: () => {},
+      warn: (message: string) => logger.warn("github.client", { message }),
+      error: (message: string) => {
+        // 失敗したリクエストの記録。失敗は呼び出し側が文脈つきでログに出す。
+        // また、304(変更なし)と404(ファイルなし)は、失敗ではなく通常の応答として扱う。
+        if (REQUEST_LOG_PATTERN.test(message)) return;
+        logger.error("github.client", { message });
+      },
+    },
     // レート制限に達したら、解除時刻まで待ってからやり直す。
     throttle: {
       onRateLimit: (retryAfter, request) => {
