@@ -26,6 +26,7 @@ describe("ファクトリー側の設定", () => {
       db_path: "/data/factory.db",
       repos_dir: "/data/repos",
       work_dir: "/work",
+      logs_dir: "/data/logs",
       worker_image: "factory-worker",
       retry_wait_minutes: [5, 30, 120],
       repos: [{ repo: "owner/name", token_env: "GITHUB_TOKEN_EXAMPLE" }],
@@ -38,6 +39,11 @@ describe("ファクトリー側の設定", () => {
     );
     expect(config.repos_dir).toBe("/work-repos");
     expect(config.work_dir).toBe("/work");
+  });
+
+  it("ログの置き場所を指定できる", () => {
+    const config = parseConfig(`${VALID}logs_dir: /var/log/factory/\n`);
+    expect(config.logs_dir).toBe("/var/log/factory");
   });
 
   it("失敗後の待機時間を指定できる", () => {
@@ -236,6 +242,18 @@ repos:
       "work_dir が repos_dir の内側",
       VALID.replace("work_dir: /work", "work_dir: /data/repos/work"),
       /work_dir/,
+    ],
+    ["logs_dir が相対パス", `${VALID}logs_dir: logs\n`, /logs_dir/],
+    [
+      "logs_dir が work_dir の内側",
+      `${VALID}logs_dir: /work/logs\n`,
+      /logs_dir/,
+    ],
+    ["logs_dir が work_dir を含む", `${VALID}logs_dir: /\n`, /logs_dir/],
+    [
+      "logs_dir が repos_dir の内側",
+      `${VALID}logs_dir: /data/repos/logs\n`,
+      /logs_dir/,
     ],
     ["YAMLとして不正", "repos: [", /YAML/],
     ["空のファイル", "", /不正/],

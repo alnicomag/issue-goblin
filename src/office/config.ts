@@ -60,6 +60,11 @@ const FactoryConfigSchema = z
     repos_dir: AbsoluteDir,
     /** イシューごとの作業場所の置き場所。ワーカーには、このうち1件分だけを見せる。 */
     work_dir: AbsoluteDir,
+    /**
+     * ワーカーの呼び出しのログの置き場所。事務局だけが読み書きする。
+     * ワーカーに書き換えられないように、作業場所の外に置く。
+     */
+    logs_dir: AbsoluteDir.default("/data/logs"),
     /** ワーカーの既定のイメージ。 */
     worker_image: ImageName.default("factory-worker"),
     /**
@@ -87,6 +92,22 @@ const FactoryConfigSchema = z
         path: ["work_dir"],
         message: `repos_dir(${config.repos_dir})の外に置いてください`,
       });
+    }
+    // ログは、ワーカーから見える場所(作業場所)にも、ミラーの中にも置かない。
+    for (const [name, dir] of [
+      ["work_dir", config.work_dir],
+      ["repos_dir", config.repos_dir],
+    ] as const) {
+      if (
+        isInsideDir(dir, config.logs_dir) ||
+        isInsideDir(config.logs_dir, dir)
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["logs_dir"],
+          message: `${name}(${dir})と重ならない場所に置いてください`,
+        });
+      }
     }
     const seen = new Set<string>();
     config.repos.forEach((entry, index) => {
