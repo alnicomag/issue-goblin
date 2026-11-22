@@ -117,6 +117,15 @@ export interface SyncDeps {
   readonly logger: Logger;
 }
 
+export interface SyncOptions {
+  /**
+   * 取得位置を使わず、イシューを全件取り直すリポジトリ。
+   * 起動直後の1回目に使う。`dry_run` の間に取り込んだラベルなしのイシューや、
+   * 手で直された食い違いを拾い直すため。イベントは差分で記録するので、重複しない。
+   */
+  readonly fullRepos?: ReadonlySet<string>;
+}
+
 export interface RepoSyncResult {
   readonly repo: string;
   readonly ok: boolean;
@@ -135,11 +144,14 @@ export interface RepoSyncResult {
 export async function syncAll(
   deps: SyncDeps,
   repos: readonly string[],
+  options: SyncOptions = {},
 ): Promise<RepoSyncResult[]> {
   const results: RepoSyncResult[] = [];
   for (const repo of repos) {
     try {
-      const result = await syncRepo(deps, repo);
+      const result = await syncRepo(deps, repo, {
+        full: options.fullRepos?.has(repo) ?? false,
+      });
       deps.logger.info("sync.repo_done", { ...result });
       results.push(result);
     } catch (error) {
@@ -166,6 +178,7 @@ interface IssueRow {
 export async function syncRepo(
   deps: SyncDeps,
   repo: string,
+  options: { full?: boolean } = {},
 ): Promise<RepoSyncResult> {
   const { db, clock, logger } = deps;
   const api = deps.apiFor(repo);
@@ -181,11 +194,15 @@ export async function syncRepo(
   let events = 0;
 
   // 1〜4. イシュー
-  const issues = await api.listIssues(repo, position.issues_synced_until);
+  const full = options.full ?? false;
+  const issues = await api.listIssues(
+    repo,
+    full ? null : position.issues_synced_until,
+  );
   let processedIssues = 0;
   for (const issue of issues) {
     if (issue.isPullRequest) continue;
-    const recorded = await syncIssue(deps, write, repo, issue);
+    const recorded = await syncIssue(deps, write, repo, issue, full);
     if (recorded !== null) {
       processedIssues += 1;
       events += recorded;
@@ -248,6 +265,7 @@ async function syncIssue(
   write: WriteContext,
   repo: string,
   issue: GitHubIssue,
+  full: boolean,
 ): Promise<number | null> {
   const { db, clock, logger } = deps;
   const existing = db
@@ -269,7 +287,8 @@ async function syncIssue(
       issue.title === existing.title &&
       derived.priority === existing.priority &&
       derived.size === existing.size;
-    if (unchanged) return null;
+    const labelDue = full && derived.needsTriageLabel;
+    if (unchanged && !labelDue) return null;
   }
 
   for (const warning of derived.warnings) {
@@ -285,7 +304,8 @@ async function syncIssue(
 
   // ラベル付けはDBの更新より先に行う。失敗したら行を書かずに例外を投げ、
   // 次回のポーリングで同じイシューをやり直せるようにする。
-  if (derived.needsTriageLabel && fresh) {
+  // 全件の取り直しでは、以前に付けられなかった分(dry_run だった間など)も対象にする。
+  if (derived.needsTriageLabel && (fresh || full)) {
     await addLabels(write, repo, issue.number, [TRIAGE_LABEL]);
   }
 

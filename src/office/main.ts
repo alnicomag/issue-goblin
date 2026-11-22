@@ -99,12 +99,15 @@ async function main(): Promise<void> {
       });
     }
 
+    // 起動してから、まだ全件の取り直しに成功していないリポジトリ。
+    const pendingFull = new Set(config.repos.map((repo) => repo.repo));
+
     await runLoop({
       intervalMs: config.poll_interval_sec * 1000,
       signal: controller.signal,
       logger,
       poll: async () => {
-        await syncAll(
+        const results = await syncAll(
           {
             db,
             apiFor: (repo) => {
@@ -119,7 +122,11 @@ async function main(): Promise<void> {
             logger,
           },
           config.repos.map((repo) => repo.repo),
+          { fullRepos: pendingFull },
         );
+        for (const result of results) {
+          if (result.ok) pendingFull.delete(result.repo);
+        }
       },
     });
     logger.info("office.stopped");

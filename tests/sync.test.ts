@@ -45,7 +45,9 @@ describe("同期", () => {
     github = new Map([[REPO, fake]]);
   });
 
-  const sync = (options: { dryRun?: boolean; repos?: string[] } = {}) =>
+  const sync = (
+    options: { dryRun?: boolean; repos?: string[]; full?: string[] } = {},
+  ) =>
     syncAll(
       {
         db,
@@ -59,6 +61,7 @@ describe("同期", () => {
         logger,
       },
       options.repos ?? [REPO],
+      { fullRepos: new Set(options.full ?? []) },
     );
 
   const events = (type?: string): EventRow[] => {
@@ -432,6 +435,38 @@ describe("同期", () => {
         "issue.created",
         "issue.created",
       ]);
+    });
+
+    it("dry_run の間に取り込んだイシューにも、全件の取り直しでラベルを付ける", async () => {
+      fake.putIssue({ number: 1, labels: [], updatedAt: T1 });
+      fake.putIssue({ number: 2, labels: [], updatedAt: T2 });
+      fake.putIssue({ number: 3, labels: ["state:ready"], updatedAt: T3 });
+      await sync({ dryRun: true });
+      const before = events();
+
+      // 起動直後の1回目は、全件を取り直す。
+      fake.calls.length = 0;
+      await sync({ dryRun: false, full: [REPO] });
+      await sync({ dryRun: false });
+
+      expect(fake.calls[0]).toEqual({
+        method: "listIssues",
+        repo: REPO,
+        since: null,
+      });
+      expect(
+        fake.writes.map(
+          (call) => call.method === "addLabels" && call.issueNumber,
+        ),
+      ).toEqual([1, 2]);
+      expect(events()).toEqual(before);
+    });
+
+    it("全件の取り直しでも、dry_run が true なら書き込まない", async () => {
+      fake.putIssue({ number: 1, labels: [], updatedAt: T1 });
+      await sync({ dryRun: true });
+      await sync({ dryRun: true, full: [REPO] });
+      expect(fake.writes).toEqual([]);
     });
 
     it("ラベル付けに失敗したら、次回のポーリングでやり直す", async () => {
