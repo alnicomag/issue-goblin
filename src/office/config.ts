@@ -16,7 +16,13 @@ const ImageName = z
 const RepoConfigSchema = z.strictObject({
   repo: z
     .string()
-    .regex(/^[\w.-]+\/[\w.-]+$/, "owner/name の形式で書いてください"),
+    .regex(/^[\w.-]+\/[\w.-]+$/, "owner/name の形式で書いてください")
+    // リポジトリ名は作業場所のパスに使うので、置き場所の外を指す書き方を通さない。
+    .refine(
+      (value) =>
+        value.split("/").every((part) => part !== "." && part !== ".."),
+      "owner と name に . や .. は使えません",
+    ),
   token_env: z
     .string()
     .regex(

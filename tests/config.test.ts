@@ -47,6 +47,19 @@ repos:
     );
   });
 
+  it("置き場所の外を指すリポジトリ名は通さない", () => {
+    for (const repo of ["../name", "owner/..", "./name", "owner/."]) {
+      expect(() =>
+        parseConfig(`
+db_path: /data/factory.db
+repos:
+  - repo: ${repo}
+    token_env: GITHUB_TOKEN_EXAMPLE
+`),
+      ).toThrow("repos.0.repo");
+    }
+  });
+
   it("オプションに見えるイメージ名は通さない", () => {
     for (const image of ["--privileged", "-v", "Image Name", ""]) {
       expect(() =>
