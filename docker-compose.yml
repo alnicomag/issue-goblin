@@ -1,0 +1,22 @@
+services:
+  office:
+    build: .
+    # コンテナの異常終了と、ホスト(EC2)の再起動のどちらからも自動で復旧する。
+    restart: unless-stopped
+    init: true
+    # トークンは .env から渡す(.env はGit管理外)。
+    env_file: .env
+    environment:
+      FACTORY_CONFIG: /app/config/factory.config.yml
+    volumes:
+      - factory-data:/data
+      - ./config/factory.config.yml:/app/config/factory.config.yml:ro
+    mem_limit: 1g
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  factory-data:
