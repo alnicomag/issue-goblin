@@ -1,0 +1,10 @@
+.git
+.env
+.env.*
+node_modules
+data
+*.db
+*.db-*
+config/factory.config.yml
+docs
+tests
