@@ -1,14 +1,13 @@
+# 秘密情報
 .env
 .env.*
 !.env.example
-__pycache__/
-*.pyc
-.venv/
+
+# 実行時のデータ
 data/
-workspace/
 *.db
 *.db-*
-.pytest_cache/
+*.db.bak-*
 
 # macOS
 .DS_Store
