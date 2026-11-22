@@ -5,6 +5,14 @@ import { z } from "zod";
 /** 設定ファイルの場所。環境変数 FACTORY_CONFIG で変えられる。 */
 export const DEFAULT_CONFIG_PATH = "config/factory.config.yml";
 
+/** Dockerのイメージ名。引数として渡すので、オプションに見える書き方を通さない。 */
+const ImageName = z
+  .string()
+  .regex(
+    /^[a-z0-9][a-z0-9._/:@-]*$/,
+    "イメージ名を書いてください(英小文字と数字で始める)",
+  );
+
 const RepoConfigSchema = z.strictObject({
   repo: z
     .string()
@@ -15,6 +23,8 @@ const RepoConfigSchema = z.strictObject({
       /^[A-Za-z_][A-Za-z0-9_]*$/,
       "環境変数の名前を書いてください(トークンそのものは書かない)",
     ),
+  /** この製品のワーカーに使うイメージ。省略すると、全体の `worker_image` を使う。 */
+  worker_image: ImageName.optional(),
 });
 
 const FactoryConfigSchema = z
@@ -22,6 +32,8 @@ const FactoryConfigSchema = z
     dry_run: z.boolean().default(true),
     poll_interval_sec: z.number().int().min(1).default(60),
     db_path: z.string().min(1),
+    /** ワーカーの既定のイメージ。 */
+    worker_image: ImageName.default("factory-worker"),
     repos: z.array(RepoConfigSchema).min(1),
   })
   .superRefine((config, ctx) => {
@@ -80,6 +92,17 @@ export function loadConfig(path: string): FactoryConfig {
     );
   }
   return parseConfig(text, path);
+}
+
+/** リポジトリのワーカーに使うイメージ。設定にないリポジトリなら失敗する。 */
+export function workerImageFor(config: FactoryConfig, repo: string): string {
+  const entry = config.repos.find(
+    (candidate) => candidate.repo.toLowerCase() === repo.toLowerCase(),
+  );
+  if (entry === undefined) {
+    throw new Error(`設定にないリポジトリです: ${repo}`);
+  }
+  return entry.worker_image ?? config.worker_image;
 }
 
 /**

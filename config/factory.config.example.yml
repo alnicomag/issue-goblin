@@ -4,6 +4,8 @@
 dry_run: true # true の間、GitHubへ一切書き込まない
 poll_interval_sec: 60
 db_path: /data/factory.db
+worker_image: factory-worker # ワーカーの既定のイメージ(docker compose build worker-image で作る)
 repos:
   - repo: owner/name # 対象リポジトリ
     token_env: GITHUB_TOKEN_EXAMPLE # トークンを入れた環境変数の名前(値は .env に書く)
+    # worker_image: owner-name-worker # 省略可。製品に固有のツールが要る場合に指定する

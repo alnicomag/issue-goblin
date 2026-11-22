@@ -76,6 +76,7 @@ describe("起動時のトークンの確認", () => {
     dry_run: true,
     poll_interval_sec: 60,
     db_path: ":memory:",
+    worker_image: "factory-worker",
     repos: [
       { repo: "owner/first", token_env: "TOKEN_FIRST" },
       { repo: "owner/second", token_env: "TOKEN_SECOND" },
