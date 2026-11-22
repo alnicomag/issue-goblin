@@ -1,0 +1,392 @@
+/**
+ * 実行(`runs`)とステップ(`steps`)の記録と、再開。
+ *
+ * 進み方の判断は `run-steps.ts` の純粋関数に任せ、ここでは記録だけを行う。
+ * どの関数も、同じ呼び出しを2回行っても行が重複しない。
+ */
+import { z } from "zod";
+import { type Clock, isoNow } from "./clock.ts";
+import type { Db } from "./db.ts";
+import {
+  type NextAction,
+  nextAction,
+  nextRetryAt,
+  STEP_NAMES,
+  STEP_OUTCOMES,
+  type StepName,
+  type StepOutcome,
+} from "./run-steps.ts";
+
+export const RUN_STATUSES = [
+  "running",
+  "done",
+  "question",
+  "failed",
+  "cancelled",
+] as const;
+export type RunStatus = (typeof RUN_STATUSES)[number];
+
+/** ステップの状態。終わったステップは、その結果(`StepOutcome`)を状態として持つ。 */
+export const STEP_STATUSES = [
+  "running",
+  ...STEP_OUTCOMES,
+  "cancelled",
+] as const;
+export type StepStatus = (typeof STEP_STATUSES)[number];
+
+const RunRowSchema = z
+  .object({
+    id: z.number().int(),
+    repo: z.string(),
+    issue_number: z.number().int(),
+    attempt: z.number().int().min(1),
+    status: z.enum(RUN_STATUSES),
+    current_step: z.enum(STEP_NAMES).nullable(),
+    started_at: z.string(),
+    finished_at: z.string().nullable(),
+    next_retry_at: z.string().nullable(),
+  })
+  .transform((row) => ({
+    id: row.id,
+    repo: row.repo,
+    issueNumber: row.issue_number,
+    attempt: row.attempt,
+    status: row.status,
+    currentStep: row.current_step,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    nextRetryAt: row.next_retry_at,
+  }));
+export type Run = z.infer<typeof RunRowSchema>;
+
+const StepRowSchema = z
+  .object({
+    id: z.number().int(),
+    run_id: z.number().int(),
+    name: z.enum(STEP_NAMES),
+    status: z.enum(STEP_STATUSES),
+    output: z.string().nullable(),
+    started_at: z.string(),
+    finished_at: z.string().nullable(),
+  })
+  .transform((row) => ({
+    id: row.id,
+    runId: row.run_id,
+    name: row.name,
+    status: row.status,
+    /** チェックポイントの内容(JSONの文字列)。 */
+    output: row.output,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+  }));
+export type Step = z.infer<typeof StepRowSchema>;
+
+const RUN_COLUMNS =
+  "id, repo, issue_number, attempt, status, current_step, started_at, finished_at, next_retry_at";
+const STEP_COLUMNS =
+  "id, run_id, name, status, output, started_at, finished_at";
+
+function parseRun(row: unknown): Run {
+  const result = RunRowSchema.safeParse(row);
+  if (!result.success) {
+    throw new Error("runs の行が想定外の内容です", { cause: result.error });
+  }
+  return result.data;
+}
+
+function parseStep(row: unknown): Step {
+  const result = StepRowSchema.safeParse(row);
+  if (!result.success) {
+    throw new Error("steps の行が想定外の内容です", { cause: result.error });
+  }
+  return result.data;
+}
+
+export function getRun(db: Db, runId: number): Run {
+  const row = db
+    .prepare(`SELECT ${RUN_COLUMNS} FROM runs WHERE id = ?`)
+    .get(runId);
+  if (row === undefined) {
+    throw new Error(`実行がありません: ${runId}`);
+  }
+  return parseRun(row);
+}
+
+/** 実行のステップを、記録した順に返す。 */
+export function listSteps(db: Db, runId: number): Step[] {
+  return db
+    .prepare(`SELECT ${STEP_COLUMNS} FROM steps WHERE run_id = ? ORDER BY id`)
+    .all(runId)
+    .map(parseStep);
+}
+
+/**
+ * 次の実行の試行回数。
+ * 数えるのは `failed` で終わった実行だけで、質問での終了と取り消しは数えない。
+ */
+export function nextAttempt(db: Db, repo: string, issueNumber: number): number {
+  return countFailedRuns(db, repo, issueNumber) + 1;
+}
+
+function countFailedRuns(db: Db, repo: string, issueNumber: number): number {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM runs
+       WHERE repo = ? AND issue_number = ? AND status = 'failed'`,
+    )
+    .get(repo, issueNumber) as { n: number };
+  return row.n;
+}
+
+/**
+ * イシューに対する実行を始める。
+ * そのイシューに実行中の実行がすでにあれば、新しく作らずにそれを返す。
+ */
+export function startRun(
+  db: Db,
+  clock: Clock,
+  target: { repo: string; issueNumber: number },
+): Run {
+  return db
+    .transaction((): Run => {
+      const existing = db
+        .prepare(
+          `SELECT ${RUN_COLUMNS} FROM runs
+           WHERE repo = ? AND issue_number = ? AND status = 'running'`,
+        )
+        .get(target.repo, target.issueNumber);
+      if (existing !== undefined) {
+        return parseRun(existing);
+      }
+      const info = db
+        .prepare(
+          `INSERT INTO runs (repo, issue_number, attempt, status, started_at)
+           VALUES (?, ?, ?, 'running', ?)`,
+        )
+        .run(
+          target.repo,
+          target.issueNumber,
+          nextAttempt(db, target.repo, target.issueNumber),
+          isoNow(clock),
+        );
+      return getRun(db, Number(info.lastInsertRowid));
+    })
+    .immediate();
+}
+
+/** 実行中の実行について、次に行うステップを `steps` の記録から決める。 */
+function pendingStep(
+  db: Db,
+  run: Run,
+): { step: StepName; interrupted: boolean } {
+  const steps = listSteps(db, run.id);
+  const last = steps.at(-1);
+  if (last?.status === "running") {
+    return { step: last.name, interrupted: true };
+  }
+  const action = actionAfter(steps, last);
+  if (action.kind !== "run_step") {
+    throw new Error(
+      `実行 ${run.id} は ${action.status} で終わっているはずですが、実行中のままです`,
+    );
+  }
+  return { step: action.step, interrupted: false };
+}
+
+/** `finished` が終わった後に行うこと。`steps` は、その実行のステップを記録した順に並べたもの。 */
+function actionAfter(
+  steps: readonly Step[],
+  finished: Step | undefined,
+): NextAction {
+  if (finished === undefined) {
+    return nextAction({ reworkCount: 0 }, null);
+  }
+  if (finished.status === "running" || finished.status === "cancelled") {
+    throw new Error(
+      `ステップ ${finished.name} は終わっていません(${finished.status})`,
+    );
+  }
+  const reworkCount = steps.filter(
+    (step) => step.status === "rework" && step.id < finished.id,
+  ).length;
+  return nextAction(
+    { reworkCount },
+    { step: finished.name, outcome: finished.status },
+  );
+}
+
+/**
+ * ステップの開始を記録する。
+ *
+ * 同じステップが実行中のまま残っていれば(事務局が落ちた場合)、その行を使う。
+ * 進み方に合わないステップは、記録せずにエラーにする。
+ */
+export function startStep(
+  db: Db,
+  clock: Clock,
+  runId: number,
+  step: StepName,
+): Step {
+  return db
+    .transaction((): Step => {
+      const run = getRun(db, runId);
+      if (run.status !== "running") {
+        throw new Error(
+          `実行 ${runId} は終わっています(${run.status})。ステップを始められません`,
+        );
+      }
+      const pending = pendingStep(db, run);
+      if (pending.step !== step) {
+        throw new Error(
+          `実行 ${runId} の次のステップは ${pending.step} です。${step} は始められません`,
+        );
+      }
+      if (!pending.interrupted) {
+        db.prepare(
+          `INSERT INTO steps (run_id, name, status, started_at)
+           VALUES (?, ?, 'running', ?)`,
+        ).run(runId, step, isoNow(clock));
+        db.prepare("UPDATE runs SET current_step = ? WHERE id = ?").run(
+          step,
+          runId,
+        );
+      }
+      const started = listSteps(db, runId).at(-1);
+      if (started === undefined) {
+        throw new Error(`ステップ ${step} を記録できませんでした`);
+      }
+      return started;
+    })
+    .immediate();
+}
+
+export interface StepFinish {
+  readonly runId: number;
+  readonly step: StepName;
+  readonly outcome: StepOutcome;
+  /** チェックポイントの内容。JSONにして `output` に残す。 */
+  readonly output?: unknown;
+  readonly sessionId?: string;
+  readonly costUsd?: number;
+  readonly logPath?: string;
+}
+
+/**
+ * ステップの終了を記録し、次に行うことを返す。
+ *
+ * 実行が終わる場合は、同じトランザクションの中で `runs` も終了にする。
+ * 失敗で終わる場合は、次に再試行してよい時刻も記録する。
+ * 同じ内容でもう一度呼ばれた場合は、何も書かずに同じ答えを返す。
+ */
+export function finishStep(
+  db: Db,
+  clock: Clock,
+  finish: StepFinish,
+  options: { retryWaitMinutes: readonly number[] },
+): NextAction {
+  const output =
+    finish.output === undefined ? null : JSON.stringify(finish.output);
+  return db
+    .transaction((): NextAction => {
+      const run = getRun(db, finish.runId);
+      const steps = listSteps(db, finish.runId);
+      const last = steps.at(-1);
+      if (last === undefined || last.name !== finish.step) {
+        throw new Error(
+          `実行 ${finish.runId} のステップ ${finish.step} は始まっていません`,
+        );
+      }
+      if (last.status !== "running") {
+        if (last.status === finish.outcome && last.output === output) {
+          return actionAfter(steps, last);
+        }
+        throw new Error(
+          `実行 ${finish.runId} のステップ ${finish.step} は、別の結果(${last.status})で終わっています`,
+        );
+      }
+
+      // あり得ない組み合わせ(prepare が差し戻しを返すなど)は、書く前にここで失敗する。
+      const finished: Step = { ...last, status: finish.outcome, output };
+      const action = actionAfter(steps, finished);
+
+      const now = clock.now();
+      db.prepare(
+        `UPDATE steps
+         SET status = ?, output = ?, session_id = ?, cost_usd = ?, log_path = ?, finished_at = ?
+         WHERE id = ?`,
+      ).run(
+        finish.outcome,
+        output,
+        finish.sessionId ?? null,
+        finish.costUsd ?? null,
+        finish.logPath ?? null,
+        now.toISOString(),
+        last.id,
+      );
+
+      if (action.kind === "finish") {
+        db.prepare(
+          "UPDATE runs SET status = ?, finished_at = ? WHERE id = ?",
+        ).run(action.status, now.toISOString(), run.id);
+        if (action.status === "failed") {
+          const failedCount = countFailedRuns(db, run.repo, run.issueNumber);
+          db.prepare("UPDATE runs SET next_retry_at = ? WHERE id = ?").run(
+            nextRetryAt(now, failedCount, options.retryWaitMinutes),
+            run.id,
+          );
+        }
+      }
+      return action;
+    })
+    .immediate();
+}
+
+/**
+ * 実行を取り消す。実行中のステップがあれば、それも取り消しにする。
+ * すでに取り消されていれば何もしない。ほかの形で終わった実行は取り消せない。
+ */
+export function cancelRun(db: Db, clock: Clock, runId: number): void {
+  db.transaction(() => {
+    const run = getRun(db, runId);
+    if (run.status === "cancelled") return;
+    if (run.status !== "running") {
+      throw new Error(
+        `実行 ${runId} は終わっています(${run.status})。取り消せません`,
+      );
+    }
+    const now = isoNow(clock);
+    db.prepare(
+      `UPDATE steps SET status = 'cancelled', finished_at = ?
+       WHERE run_id = ? AND status = 'running'`,
+    ).run(now, runId);
+    db.prepare(
+      "UPDATE runs SET status = 'cancelled', finished_at = ? WHERE id = ?",
+    ).run(now, runId);
+  }).immediate();
+}
+
+export interface ResumableRun {
+  readonly run: Run;
+  /** 次に行うステップ。 */
+  readonly step: StepName;
+  /** 実行中のまま残っていたステップをやり直す場合は true。 */
+  readonly interrupted: boolean;
+}
+
+/**
+ * 終わっていない実行と、それぞれの続きのステップを返す。起動時に呼ぶ。
+ *
+ * 続きは、最後に完了したステップの次。実行中のまま残ったステップがあれば、そのステップをやり直す。
+ * 何も書かないので、再開しても試行回数は変わらない。
+ */
+export function findResumableRuns(db: Db): ResumableRun[] {
+  return db
+    .prepare(
+      `SELECT ${RUN_COLUMNS} FROM runs WHERE status = 'running' ORDER BY id`,
+    )
+    .all()
+    .map((row) => {
+      const run = parseRun(row);
+      return { run, ...pendingStep(db, run) };
+    });
+}
