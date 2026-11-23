@@ -2,13 +2,20 @@
  * publish: ワーカーのコミットを確かめ、push してPRにする。
  *
  * ワーカーの申告には頼らない。事務局が、作業場所のcloneから事務局専用のミラーにコミットを取り込み、
- * ミラーで既定ブランチとの差分を調べる。push はミラーから行う。
+ * ミラーで既定ブランチとの差分と、コミットの作者を調べる。push はミラーから行う。
  *
  * 作業場所はワーカーが書き換えられる。そこにあるフックやgit設定で、事務局の権限のまま
  * コマンドが動かないように、gitは `git.ts` を通して実行する。差分の検査も、作業場所ではなく
  * ミラーで行う。
  */
 import fs from "node:fs";
+import {
+  COMMIT_IDENTITY_FORMAT,
+  type CommitIdentity,
+  checkCommitAuthors,
+  type Identity,
+  parseCommitIdentities,
+} from "./authors.ts";
 import type { Db } from "./db.ts";
 import type { Git } from "./git.ts";
 import {
@@ -156,6 +163,43 @@ export async function inspectChanges(
   };
 }
 
+/**
+ * ミラーで、既定ブランチになく、作業用のブランチにあるコミットの、作者とコミッターを読む。
+ * 読むだけで、何も変えない。
+ *
+ * 作業場所のgit設定ではなく、取り込んだコミットそのものを読む。取得元にもとからあるコミット
+ * (既定ブランチから届くもの)は含めない。`expectedCount` は、同じ範囲を数えたコミットの数で、
+ * 読めた数と合わなければ失敗させる。作者の欄に区切りの文字を仕込んで、コミットを隠したり
+ * 増やしたりした場合に、気づけるようにするためである。
+ */
+export async function listCommitIdentities(
+  git: Git,
+  input: {
+    mirrorDir: string;
+    branch: string;
+    defaultBranch: string;
+    expectedCount: number;
+  },
+): Promise<CommitIdentity[]> {
+  const output = await git.run(
+    [
+      "log",
+      "-z",
+      `--format=${COMMIT_IDENTITY_FORMAT}`,
+      `refs/remotes/origin/${input.defaultBranch}..refs/heads/${input.branch}`,
+      "--",
+    ],
+    { cwd: input.mirrorDir },
+  );
+  const commits = parseCommitIdentities(output);
+  if (commits.length !== input.expectedCount) {
+    throw new Error(
+      `コミットの作者を読めません: ブランチ ${input.branch} のコミットは${input.expectedCount}件ですが、読めたのは${commits.length}件です`,
+    );
+  }
+  return commits;
+}
+
 // ---------------------------------------------------------------------------
 // PRの内容
 // ---------------------------------------------------------------------------
@@ -244,6 +288,7 @@ export function buildPrBody(input: {
  * - `published`: push して、PRを作った(または更新した)。
  * - `dry_run`: 検査は通ったが、`dry_run` なので push もPRの作成もしていない。
  * - `no_commits`: ワーカーのコミットがない(ブランチがない場合を含む)。
+ * - `author_mismatch`: 作者かコミッターが `commit_author` と一致しないコミットがある。push していない。
  * - `empty_diff`: コミットはあるが、既定ブランチとの差分が空。
  * - `forbidden`: `paths.forbidden` に当たる変更がある。push していない。
  * - `needs_approval`: `paths.protected` に当たる変更がある。push しておらず、人間の承認待ち。
@@ -252,6 +297,7 @@ export type PublishStatus =
   | "published"
   | "dry_run"
   | "no_commits"
+  | "author_mismatch"
   | "empty_diff"
   | "forbidden"
   | "needs_approval";
@@ -272,6 +318,11 @@ export interface PublishResult {
   readonly changedPaths: readonly string[];
   readonly forbidden: readonly PathHit[];
   readonly protected: readonly PathHit[];
+  /**
+   * 作者かコミッターが `commit_author` と一致しなかったコミット(`author_mismatch` のときだけ入る)。
+   * コミットのハッシュと、そのコミットに書かれていた作者とコミッターを残す。
+   */
+  readonly authorMismatches: readonly CommitIdentity[];
   /** PRの番号。作っていなければ null(`dry_run` で、既存のPRがあればその番号)。 */
   readonly prNumber: number | null;
   readonly prUrl: string | null;
@@ -297,6 +348,11 @@ export interface PublishInput {
   readonly issueTitle: string;
   /** 取得と push の宛先。トークンは、gitの実行時にだけ渡す。 */
   readonly source: RepoSource;
+  /**
+   * ワーカーのコミットの作者。ファクトリー側の設定(`commit_author`)から渡す。
+   * 取り込んだコミットの作者とコミッターが、これと一致しなければ push しない。
+   */
+  readonly author: Identity;
   /** verify の結果。PRの本文に載せる。記録がなければ null。 */
   readonly verify: PublishVerifySummary | null;
 }
@@ -307,16 +363,32 @@ function describeHits(hits: readonly PathHit[]): string {
   return `${shown.join("、")}${rest > 0 ? ` ほか${rest}件` : ""}`;
 }
 
+function describeIdentity(identity: Identity): string {
+  return oneLine(`${identity.name} <${identity.email}>`);
+}
+
+function describeMismatches(mismatches: readonly CommitIdentity[]): string {
+  const shown = mismatches
+    .slice(0, 5)
+    .map(
+      (entry) =>
+        `${entry.commit.slice(0, 12)}(作者 ${describeIdentity(entry.author)}、コミッター ${describeIdentity(entry.committer)})`,
+    );
+  const rest = mismatches.length - shown.length;
+  return `${shown.join("、")}${rest > 0 ? ` ほか${rest}件` : ""}`;
+}
+
 /**
  * ワーカーのコミットを確かめ、push してPRを作る(すでにあれば更新する)。
  *
  * 1. 保存済みの `factory.yml` を読む(作業場所のファイルは使わない)。
  * 2. ミラーを最新にし、作業場所のcloneから作業用のブランチを取り込む。
- * 3. ミラーで既定ブランチとの差分を調べ、`paths.forbidden` と `paths.protected` に照らす。
- * 4. 検査を通ったら、ミラーから push し、PRを作る。同じブランチのオープンなPRがあれば、
+ * 3. ミラーで、既定ブランチにないコミットの作者とコミッターが、`author` と一致するかを確かめる。
+ * 4. ミラーで既定ブランチとの差分を調べ、`paths.forbidden` と `paths.protected` に照らす。
+ * 5. 検査を通ったら、ミラーから push し、PRを作る。同じブランチのオープンなPRがあれば、
  *    作らずに更新する。
  *
- * 検査で止まった場合(コミットなし、差分が空、禁止や保護対象のパス)は、例外ではなく結果として返す。
+ * 検査で止まった場合(コミットなし、作者の不一致、差分が空、禁止や保護対象のパス)は、例外ではなく結果として返す。
  * そのとき、push もPRの作成もしない。例外になるのは、検査そのものを行えない場合
  * (`factory.yml` が未取得または不正、パターンを読めない、作業場所がない、gitやGitHubの失敗)である。
  *
@@ -353,6 +425,7 @@ export async function publish(
       changedPaths: [],
       forbidden: [],
       protected: [],
+      authorMismatches: [],
       prNumber: null,
       prUrl: null,
       prCreated: false,
@@ -366,6 +439,7 @@ export async function publish(
       head: result.headCommit,
       forbidden: result.forbidden,
       protected: result.protected,
+      author_mismatches: result.authorMismatches,
     });
     return result;
   };
@@ -385,6 +459,22 @@ export async function publish(
     return stopped(
       "no_commits",
       `ブランチ ${branch} に、${baseBranch} にないコミットがありません。PRを作りません`,
+    );
+  }
+  const mismatches = checkCommitAuthors(
+    await listCommitIdentities(git, {
+      mirrorDir,
+      branch,
+      defaultBranch: baseBranch,
+      expectedCount: changes.commitCount,
+    }),
+    input.author,
+  );
+  if (mismatches.length > 0) {
+    return stopped(
+      "author_mismatch",
+      `作者かコミッターが、設定(commit_author)の ${describeIdentity(input.author)} と一致しないコミットがあります。push していません: ${describeMismatches(mismatches)}`,
+      { authorMismatches: mismatches },
     );
   }
   if (changes.paths.length === 0) {
@@ -457,6 +547,7 @@ export async function publish(
     baseBranch,
     headCommit: changes.headCommit,
     ...checked,
+    authorMismatches: [],
     prNumber: pr?.number ?? null,
     prUrl: pr?.url ?? null,
     prCreated,
