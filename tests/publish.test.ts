@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -11,6 +12,7 @@ import {
   buildPrTitle,
   importCommits,
   inspectChanges,
+  listCommitIdentities,
   type PublishVerifySummary,
   publish,
 } from "../src/office/publish.ts";
@@ -26,8 +28,10 @@ import {
   commitFile,
   makeRepo,
   makeTempDir,
+  PLAIN_IDENTITY,
   plainGit,
   plantHooks,
+  unconfiguredGit,
 } from "./git-fixtures.ts";
 
 const REPO = "owner/name";
@@ -341,6 +345,17 @@ describe("PRの内容", () => {
 
 describe("publish", () => {
   const TOKEN = "dummy-token-value";
+  /**
+   * ワーカーのコミットの作者(設定の `commit_author` に当たる)。
+   * このテストでは、ワーカーのコミットを `plainGit` で作るので、その作者に合わせる。
+   */
+  const WORKER = PLAIN_IDENTITY;
+  /** 取得元にもとからあるコミットの作者。ワーカーの作者とは別にする。 */
+  const UPSTREAM = {
+    name: "Upstream Person",
+    email: "upstream@example.invalid",
+  };
+  const OTHER = { name: "Someone Else", email: "someone@example.invalid" };
   const VERIFY: PublishVerifySummary = {
     passed: true,
     commands: [{ name: "test", status: "passed", exitCode: 0 }],
@@ -365,6 +380,7 @@ describe("publish", () => {
         issue: ISSUE,
         issueTitle,
         source: { url: source, token: TOKEN },
+        author: WORKER,
         verify: VERIFY,
       },
     );
@@ -378,6 +394,28 @@ describe("publish", () => {
       `refs/heads/${BRANCH}`,
     );
     return out === "" ? null : out;
+  };
+
+  /** 作者とコミッターを指定して、空のコミットを作り、そのハッシュを返す。 */
+  const commitAs = (
+    repoDir: string,
+    author: { name: string; email: string },
+    committer: { name: string; email: string } = author,
+  ): string => {
+    plainGit(
+      repoDir,
+      "-c",
+      `user.name=${committer.name}`,
+      "-c",
+      `user.email=${committer.email}`,
+      "commit",
+      "--quiet",
+      "--allow-empty",
+      `--author=${author.name} <${author.email}>`,
+      "-m",
+      "empty",
+    );
+    return plainGit(repoDir, "rev-parse", "HEAD");
   };
 
   const pushCalls = () => gitCalls.filter((args) => args.includes("push"));
@@ -398,6 +436,7 @@ describe("publish", () => {
   beforeEach(async () => {
     tmp = makeTempDir();
     source = makeRepo(path.join(tmp, "source"));
+    commitAs(source, UPSTREAM);
     dirs = {
       reposDir: path.join(tmp, "data", "repos"),
       workDir: path.join(tmp, "work"),
@@ -432,7 +471,7 @@ describe("publish", () => {
         repo: REPO,
         issue: ISSUE,
         source: { url: source },
-        author: AUTHOR,
+        author: WORKER,
       },
     );
   });
@@ -614,7 +653,7 @@ describe("publish", () => {
           repo: REPO,
           issue: ISSUE,
           source: { url: source },
-          author: AUTHOR,
+          author: WORKER,
         },
       );
       gitCalls.length = 0;
@@ -627,6 +666,187 @@ describe("publish", () => {
         "generated/out.txt",
       ]);
       expectNothingWritten();
+    });
+  });
+
+  describe("コミットの作者", () => {
+    const stoppedLog = () =>
+      logs.find((line) => line.event === "publish.stopped")?.fields;
+
+    it("取得元にもとからあるコミットの作者は検査しない", async () => {
+      // 既定ブランチには、別の作者のコミットがある。作業場所を作った後に増えた分も含めて、検査しない。
+      commitAs(source, OTHER);
+      expect(
+        plainGit(source, "log", "--format=%an", "main").split("\n"),
+      ).toEqual([OTHER.name, UPSTREAM.name, WORKER.name]);
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+
+      const result = await run(false);
+      expect(result).toMatchObject({
+        status: "published",
+        authorMismatches: [],
+      });
+    });
+
+    it("作者だけが違うコミットがあれば、push もPRの作成もせず、ハッシュと作者を残す", async () => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      const bad = commitAs(paths.repoDir, OTHER, WORKER);
+
+      const result = await run(false);
+      const mismatches = [{ commit: bad, author: OTHER, committer: WORKER }];
+      expect(result).toMatchObject({
+        status: "author_mismatch",
+        outcome: "failed",
+        awaitingApproval: false,
+        headCommit: bad,
+        prNumber: null,
+      });
+      expect(result.authorMismatches).toEqual(mismatches);
+      expect(result.summary).toContain(bad.slice(0, 12));
+      expect(result.summary).toContain(`${OTHER.name} <${OTHER.email}>`);
+      expect(stoppedLog()).toMatchObject({
+        status: "author_mismatch",
+        author_mismatches: mismatches,
+      });
+      expectNothingWritten();
+    });
+
+    it("コミッターだけが違うコミットがあれば、止める", async () => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      const bad = commitAs(paths.repoDir, WORKER, OTHER);
+
+      const result = await run(false);
+      expect(result.status).toBe("author_mismatch");
+      expect(result.authorMismatches).toEqual([
+        { commit: bad, author: WORKER, committer: OTHER },
+      ]);
+      expectNothingWritten();
+    });
+
+    it("複数のコミットのうち1つだけが違う場合も、止める", async () => {
+      commitFile(paths.repoDir, "first.txt", "first\n");
+      const bad = commitAs(paths.repoDir, {
+        name: WORKER.name,
+        email: OTHER.email,
+      });
+      commitFile(paths.repoDir, "last.txt", "last\n");
+
+      const result = await run(false);
+      expect(result.status).toBe("author_mismatch");
+      expect(result.authorMismatches.map((entry) => entry.commit)).toEqual([
+        bad,
+      ]);
+      expectNothingWritten();
+    });
+
+    it("差分が空でも、パスの検査で止まる変更でも、作者の不一致を先に報告する", async () => {
+      commitAs(paths.repoDir, OTHER);
+      expect((await run(false)).status).toBe("author_mismatch");
+
+      fs.mkdirSync(path.join(paths.repoDir, "generated"));
+      commitFile(paths.repoDir, "generated/out.txt", "out\n");
+      expect((await run(false)).status).toBe("author_mismatch");
+      expectNothingWritten();
+    });
+
+    it("dry_run でも同じ結果になる", async () => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      commitAs(paths.repoDir, OTHER);
+
+      const result = await run(true);
+      expect(result.status).toBe("author_mismatch");
+      expect(skippedActions()).toEqual([]);
+    });
+
+    describe("作業場所のgit設定をワーカーが書き換えた場合", () => {
+      /** 作者を渡さずにコミットする。作者は、作業場所のgit設定で決まる。 */
+      const commitWithRepoConfig = (name: string): string => {
+        fs.writeFileSync(path.join(paths.repoDir, name), `${name}\n`);
+        unconfiguredGit(paths.repoDir, "add", "--", name);
+        unconfiguredGit(paths.repoDir, "commit", "--quiet", "-m", name);
+        return plainGit(paths.repoDir, "rev-parse", "HEAD");
+      };
+      const setRepoConfig = (identity: { name: string; email: string }) => {
+        plainGit(paths.repoDir, "config", "user.name", identity.name);
+        plainGit(paths.repoDir, "config", "user.email", identity.email);
+      };
+
+      it("書き換えた設定で作ったコミットは、止める", async () => {
+        setRepoConfig(OTHER);
+        const bad = commitWithRepoConfig("feature.txt");
+
+        const result = await run(false);
+        expect(result.status).toBe("author_mismatch");
+        expect(result.authorMismatches).toEqual([
+          { commit: bad, author: OTHER, committer: OTHER },
+        ]);
+        expectNothingWritten();
+      });
+
+      it("別の作者でコミットした後に設定を元に戻しても、止める", async () => {
+        setRepoConfig(OTHER);
+        const bad = commitWithRepoConfig("feature.txt");
+        setRepoConfig(WORKER);
+
+        const result = await run(false);
+        expect(result.authorMismatches.map((entry) => entry.commit)).toEqual([
+          bad,
+        ]);
+        expectNothingWritten();
+      });
+
+      it("正しい作者でコミットした後に設定を書き換えても、通る", async () => {
+        const commit = commitWithRepoConfig("feature.txt");
+        setRepoConfig(OTHER);
+
+        const result = await run(false);
+        expect(result).toMatchObject({
+          status: "published",
+          headCommit: commit,
+        });
+        expect(remoteHead()).toBe(commit);
+      });
+
+      it("設定はそのままで、環境変数で作者を変えたコミットは、止める", async () => {
+        fs.writeFileSync(path.join(paths.repoDir, "feature.txt"), "feature\n");
+        plainGit(paths.repoDir, "add", "--", "feature.txt");
+        execFileSync("git", ["commit", "--quiet", "-m", "feature"], {
+          cwd: paths.repoDir,
+          env: {
+            PATH: process.env.PATH ?? "",
+            GIT_CONFIG_NOSYSTEM: "1",
+            GIT_CONFIG_GLOBAL: "/dev/null",
+            GIT_AUTHOR_NAME: OTHER.name,
+            GIT_AUTHOR_EMAIL: OTHER.email,
+            GIT_COMMITTER_NAME: OTHER.name,
+            GIT_COMMITTER_EMAIL: OTHER.email,
+          },
+        });
+
+        const result = await run(false);
+        expect(result.status).toBe("author_mismatch");
+        expect(result.authorMismatches).toMatchObject([
+          { author: OTHER, committer: OTHER },
+        ]);
+        expectNothingWritten();
+      });
+    });
+
+    it("読めたコミットの数が合わなければ、失敗する", async () => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      await importCommits(git, paths);
+      const list = (expectedCount: number) =>
+        listCommitIdentities(git, {
+          mirrorDir: paths.mirrorDir,
+          branch: BRANCH,
+          defaultBranch: "main",
+          expectedCount,
+        });
+
+      expect(await list(1)).toMatchObject([
+        { author: WORKER, committer: WORKER },
+      ]);
+      await expect(list(2)).rejects.toThrow("コミットの作者を読めません");
     });
   });
 

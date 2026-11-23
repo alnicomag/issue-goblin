@@ -4,15 +4,21 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+/** `plainGit` でコミットしたときの、作者とコミッター。 */
+export const PLAIN_IDENTITY = {
+  name: "Example",
+  email: "example@example.invalid",
+} as const;
+
 /** 守りを付けない素のgit。仮のリポジトリの用意と、結果の確認に使う。 */
 export function plainGit(cwd: string, ...args: string[]): string {
   return execFileSync(
     "git",
     [
       "-c",
-      "user.name=Example",
+      `user.name=${PLAIN_IDENTITY.name}`,
       "-c",
-      "user.email=example@example.invalid",
+      `user.email=${PLAIN_IDENTITY.email}`,
       "-c",
       "init.defaultBranch=main",
       ...args,
