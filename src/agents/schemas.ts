@@ -8,12 +8,32 @@ import { z } from "zod";
 /**
  * ワーカーが返せる状態。
  *
- * - `done`: 頼まれたことを終えた。
+ * - `done`: 頼まれたことを終えた(review では、合格)。
+ * - `rework`: 修正が要る。要約に指摘を書く。返せるのは review だけである。
  * - `question`: 人間に聞かないと進められない。要約に質問を書く。
  * - `failed`: 終えられなかった。要約に理由を書く。
  */
-export const WORKER_STATUSES = ["done", "question", "failed"] as const;
+export const WORKER_STATUSES = [
+  "done",
+  "rework",
+  "question",
+  "failed",
+] as const;
 export type WorkerStatus = (typeof WORKER_STATUSES)[number];
+
+/** どの指示書でも返せる状態。 */
+const COMMON_STATUSES = ["done", "question", "failed"] as const;
+
+/** 差し戻し(`rework`)を返せる指示書。 */
+const REWORK_PROMPTS: readonly string[] = ["review"];
+
+/**
+ * 指示書ごとの、返せる状態。指示書に書く状態の一覧は、これと一致させる
+ * (食い違っていないことは、テストで確かめる)。
+ */
+export function allowedStatuses(prompt: string): readonly WorkerStatus[] {
+  return REWORK_PROMPTS.includes(prompt) ? WORKER_STATUSES : COMMON_STATUSES;
+}
 
 /** ワーカーが返す結果。 */
 export const WorkerOutputSchema = z.strictObject({
@@ -23,18 +43,20 @@ export const WorkerOutputSchema = z.strictObject({
 export type WorkerOutput = z.infer<typeof WorkerOutputSchema>;
 
 /**
- * `--json-schema` に渡す、結果の形。`WorkerOutputSchema` と同じ内容にする
- * (食い違っていないことは、テストで確かめる)。
+ * `--json-schema` に渡す、結果の形。`WorkerOutputSchema` と同じ内容で、
+ * 状態だけを、その指示書で返せるものに絞る(食い違っていないことは、テストで確かめる)。
  */
-export const WORKER_OUTPUT_JSON_SCHEMA = {
-  type: "object",
-  properties: {
-    status: { type: "string", enum: [...WORKER_STATUSES] },
-    summary: { type: "string", minLength: 1 },
-  },
-  required: ["status", "summary"],
-  additionalProperties: false,
-} as const;
+export function workerOutputJsonSchema(statuses: readonly WorkerStatus[]) {
+  return {
+    type: "object",
+    properties: {
+      status: { type: "string", enum: [...statuses] },
+      summary: { type: "string", minLength: 1 },
+    },
+    required: ["status", "summary"],
+    additionalProperties: false,
+  } as const;
+}
 
 /**
  * `claude -p --output-format json` が標準出力に書く、1件のJSON。

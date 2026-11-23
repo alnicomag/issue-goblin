@@ -38,3 +38,45 @@ export function loadPrompt(promptsDir: string, name: string): string {
   }
   return text;
 }
+
+/** 指示書の中の、値を差し込む場所。`{{名前}}` と書く。 */
+const PLACEHOLDER = /\{\{([a-z][a-z0-9_]*)\}\}/g;
+
+/** 指示書に書かれている、差し込む場所の名前(重複なし、出てくる順)。 */
+export function promptPlaceholders(template: string): string[] {
+  return [
+    ...new Set([...template.matchAll(PLACEHOLDER)].map((m) => m[1])),
+  ].filter((name) => name !== undefined);
+}
+
+/**
+ * 指示書に値を差し込む純粋関数。
+ *
+ * - 指示書にある名前の値が渡されていなければ、失敗する(空文字は、渡したものとして扱う)。
+ * - 指示書にない名前の値が渡されていても、失敗する(名前の打ち間違いに気づくため)。
+ * - 置き換えは1回だけ行う。値の中に `{{名前}}` があっても、展開しない
+ *   (値はイシューの本文など、外から来た文章だからである)。
+ */
+export function renderPrompt(
+  template: string,
+  values: Readonly<Record<string, string>>,
+): string {
+  const names = promptPlaceholders(template);
+  const missing = names.filter((name) => !Object.hasOwn(values, name));
+  if (missing.length > 0) {
+    throw new Error(`指示書に差し込む値が欠けています: ${missing.join(", ")}`);
+  }
+  const unknown = Object.keys(values).filter((name) => !names.includes(name));
+  if (unknown.length > 0) {
+    throw new Error(
+      `指示書にない名前の値が渡されました: ${unknown.join(", ")}`,
+    );
+  }
+  return template.replace(PLACEHOLDER, (_, name: string) => {
+    const value = values[name];
+    if (value === undefined) {
+      throw new Error(`指示書に差し込む値が欠けています: ${name}`);
+    }
+    return value;
+  });
+}

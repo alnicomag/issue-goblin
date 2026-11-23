@@ -64,7 +64,7 @@ async function main(): Promise<void> {
     issue: ISSUE,
     step: "check",
     prompt: "check",
-    input: "",
+    values: {},
     timeoutSec: 300,
     maxTurns: 10,
   };

@@ -4,9 +4,10 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import { z } from "zod";
 import {
-  WORKER_OUTPUT_JSON_SCHEMA,
+  allowedStatuses,
   WORKER_STATUSES,
   WorkerOutputSchema,
+  workerOutputJsonSchema,
 } from "../src/agents/schemas.ts";
 import {
   buildClaudeArgv,
@@ -23,7 +24,8 @@ import {
   type RunResult,
 } from "../src/launcher/request.ts";
 
-const LIMITS = { timeoutSec: 600 };
+const LIMITS = { timeoutSec: 600, statuses: WORKER_STATUSES };
+const PLAN_STATUSES = allowedStatuses("plan");
 
 /** `claude -p --output-format json` の出力に似せたもの。 */
 function claudeJson(overrides: Record<string, unknown> = {}): string {
@@ -56,14 +58,35 @@ function run(overrides: Partial<RunResult> = {}): RunResult {
 describe("ワーカーの結果の形式", () => {
   it("--json-schema に渡す形が、zodのスキーマと食い違っていない", () => {
     const generated = z.toJSONSchema(WorkerOutputSchema);
-    expect(generated.required).toEqual(WORKER_OUTPUT_JSON_SCHEMA.required);
+    const schema = workerOutputJsonSchema(WORKER_STATUSES);
+    expect(generated.required).toEqual(schema.required);
     expect(generated.additionalProperties).toBe(false);
     expect(Object.keys(generated.properties ?? {})).toEqual(
-      Object.keys(WORKER_OUTPUT_JSON_SCHEMA.properties),
+      Object.keys(schema.properties),
     );
-    expect(WORKER_OUTPUT_JSON_SCHEMA.properties.status.enum).toEqual([
-      ...WORKER_STATUSES,
+    expect(schema.properties.status.enum).toEqual([...WORKER_STATUSES]);
+  });
+
+  it("差し戻しを返せるのは、review だけである", () => {
+    expect(allowedStatuses("review")).toEqual([
+      "done",
+      "rework",
+      "question",
+      "failed",
     ]);
+    for (const prompt of ["plan", "implement", "check"]) {
+      expect(allowedStatuses(prompt), prompt).toEqual([
+        "done",
+        "question",
+        "failed",
+      ]);
+    }
+  });
+
+  it("--json-schema に渡す状態を、その指示書で返せるものに絞る", () => {
+    expect(
+      workerOutputJsonSchema(PLAN_STATUSES).properties.status.enum,
+    ).toEqual(["done", "question", "failed"]);
   });
 });
 
@@ -134,7 +157,7 @@ describe("interpretRun", () => {
     const outcome = interpretRun(
       run({
         stdout: claudeJson({
-          structured_output: { status: "rework", summary: "要約" },
+          structured_output: { status: "approved", summary: "要約" },
         }),
       }),
       LIMITS,
@@ -142,6 +165,21 @@ describe("interpretRun", () => {
     expect(outcome.status).toBe("failed");
     expect(outcome.summary).toContain("ワーカーの結果の形式が不正です");
     expect(outcome.summary).toContain("status");
+  });
+
+  it("その指示書で返せない状態は、failed になり、要約を理由に残す", () => {
+    const outcome = interpretRun(
+      run({
+        stdout: claudeJson({
+          structured_output: { status: "rework", summary: "直してください" },
+        }),
+      }),
+      { timeoutSec: 600, statuses: PLAN_STATUSES },
+    );
+    expect(outcome.status).toBe("failed");
+    expect(outcome.summary).toContain("返せない状態(rework)");
+    expect(outcome.summary).toContain("直してください");
+    expect(outcome.costUsd).toBe(0.25);
   });
 
   it("空の要約と、余計な項目は、failed になる", () => {
@@ -286,14 +324,14 @@ describe("maskSecrets", () => {
 });
 
 describe("buildClaudeArgv", () => {
-  const argv = buildClaudeArgv({ maxTurns: 40 });
+  const argv = buildClaudeArgv({ maxTurns: 40, statuses: PLAN_STATUSES });
   const flagValue = (flag: string) => argv[argv.indexOf(flag) + 1];
 
   it("ヘッドレスで、決まった形式の結果を求める", () => {
     expect(argv.slice(0, 2)).toEqual(["claude", "-p"]);
     expect(flagValue("--output-format")).toBe("json");
     expect(JSON.parse(flagValue("--json-schema") ?? "")).toEqual(
-      WORKER_OUTPUT_JSON_SCHEMA,
+      workerOutputJsonSchema(PLAN_STATUSES),
     );
     expect(flagValue("--max-turns")).toBe("40");
   });
@@ -325,7 +363,7 @@ describe("createClaudeWorker", () => {
     issue: 12,
     step: "plan",
     prompt: "plan",
-    input: "イシューの本文",
+    values: { issue: "イシューの本文" },
     timeoutSec: 600,
     maxTurns: 40,
   };
@@ -339,7 +377,10 @@ describe("createClaudeWorker", () => {
     const promptsDir = path.join(root, "prompts");
     const logsDir = path.join(root, "logs");
     fs.mkdirSync(promptsDir);
-    fs.writeFileSync(path.join(promptsDir, "plan.md"), "計画を書くこと。\n");
+    fs.writeFileSync(
+      path.join(promptsDir, "plan.md"),
+      "計画を書くこと。\n\n{{issue}}\n",
+    );
     const requests: RunRequestInput[] = [];
     const launcher: WorkerLauncher = {
       async run(request) {
@@ -370,13 +411,15 @@ describe("createClaudeWorker", () => {
     expect((await fake.invoke(CALL)).status).toBe("question");
   });
 
-  it("指示書をファイルから読み、入力と合わせて標準入力で渡す", async () => {
+  it("指示書をファイルから読み、値を差し込んで標準入力で渡す", async () => {
     const { worker, requests } = setup();
     const result = await worker.invoke(CALL);
     expect(result.status).toBe("done");
     expect(requests).toHaveLength(1);
-    expect(requests[0]?.stdin).toBe("計画を書くこと。\n\nイシューの本文");
-    expect(requests[0]?.argv).toEqual(buildClaudeArgv({ maxTurns: 40 }));
+    expect(requests[0]?.stdin).toBe("計画を書くこと。\n\nイシューの本文\n");
+    expect(requests[0]?.argv).toEqual(
+      buildClaudeArgv({ maxTurns: 40, statuses: PLAN_STATUSES }),
+    );
     expect(requests[0]?.timeout_sec).toBe(600);
   });
 
@@ -476,11 +519,51 @@ describe("createClaudeWorker", () => {
     expect(fs.existsSync(result.logPath)).toBe(true);
   });
 
+  it("review は rework を返せるが、plan が返すと failed になる", async () => {
+    const rework = () =>
+      run({
+        stdout: claudeJson({
+          structured_output: {
+            status: "rework",
+            summary: "テストが足りません",
+          },
+        }),
+      });
+    const { worker, requests, promptsDir } = setup(rework);
+    fs.writeFileSync(path.join(promptsDir, "review.md"), "判定: {{issue}}\n");
+
+    const review = await worker.invoke({
+      ...CALL,
+      step: "review",
+      prompt: "review",
+    });
+    expect(review.status).toBe("rework");
+    expect(review.summary).toBe("テストが足りません");
+    expect(requests[0]?.argv).toEqual(
+      buildClaudeArgv({ maxTurns: 40, statuses: allowedStatuses("review") }),
+    );
+
+    const plan = await worker.invoke(CALL);
+    expect(plan.status).toBe("failed");
+    expect(plan.summary).toContain("返せない状態(rework)");
+  });
+
   it("指示書がなければ、起動係を呼ばずに失敗する", async () => {
     const { worker, requests } = setup();
-    await expect(worker.invoke({ ...CALL, prompt: "review" })).rejects.toThrow(
+    await expect(worker.invoke({ ...CALL, prompt: "absent" })).rejects.toThrow(
       "指示書を読めません",
     );
+    expect(requests).toHaveLength(0);
+  });
+
+  it("差し込む値が欠けていれば、起動係を呼ばずに失敗する", async () => {
+    const { worker, requests } = setup();
+    await expect(worker.invoke({ ...CALL, values: {} })).rejects.toThrow(
+      "指示書に差し込む値が欠けています: issue",
+    );
+    await expect(
+      worker.invoke({ ...CALL, values: { issue: "本文", isue: "本文" } }),
+    ).rejects.toThrow("指示書にない名前の値が渡されました: isue");
     expect(requests).toHaveLength(0);
   });
 

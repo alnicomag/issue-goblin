@@ -16,12 +16,13 @@ import {
 } from "../launcher/request.ts";
 import { type Clock, systemClock } from "../office/clock.ts";
 import { formatZodError } from "../office/config.ts";
-import { loadPrompt } from "./prompts.ts";
+import { loadPrompt, renderPrompt } from "./prompts.ts";
 import {
+  allowedStatuses,
   ClaudeResultSchema,
-  WORKER_OUTPUT_JSON_SCHEMA,
   WorkerOutputSchema,
   type WorkerStatus,
+  workerOutputJsonSchema,
 } from "./schemas.ts";
 
 /** 失敗の理由に載せる、標準エラーや発言の長さの上限(文字数)。 */
@@ -68,12 +69,12 @@ function withDetail(message: string, detail: string | undefined): string {
 /**
  * 起動係が返した実行結果を、ワーカーの結果として解釈する純粋関数。
  *
- * 形式に合わない出力、時間切れ、ターン数の上限は、理由の分かる要約を付けて `failed` にする。
- * 例外は投げない。
+ * 形式に合わない出力、返せない状態、時間切れ、ターン数の上限は、理由の分かる要約を付けて
+ * `failed` にする。例外は投げない。
  */
 export function interpretRun(
   run: RunResult,
-  limits: { timeoutSec: number },
+  limits: { timeoutSec: number; statuses: readonly WorkerStatus[] },
 ): WorkerOutcome {
   const failed = (
     summary: string,
@@ -170,6 +171,15 @@ export function interpretRun(
       known,
     );
   }
+  if (!limits.statuses.includes(output.data.status)) {
+    return failed(
+      withDetail(
+        `ワーカーが、この指示書では返せない状態(${output.data.status})を返しました`,
+        output.data.summary,
+      ),
+      known,
+    );
+  }
   return {
     ...known,
     status: output.data.status,
@@ -186,8 +196,11 @@ export interface WorkerCall {
   readonly step: string;
   /** 指示書の名前。`prompts/<名前>.md` を読む。 */
   readonly prompt: string;
-  /** 指示書の後ろに続けて渡す入力(イシューの本文、差分など)。 */
-  readonly input: string;
+  /**
+   * 指示書に差し込む値(イシューの本文、差分など)。名前は、指示書の `{{名前}}` に対応する。
+   * 指示書にある名前が欠けていても、指示書にない名前があっても、呼び出しの前に失敗する。
+   */
+  readonly values: Readonly<Record<string, string>>;
   /** この秒数を過ぎたら、起動係がコンテナごと止める。 */
   readonly timeoutSec: number;
   /** ターン数の上限。 */
@@ -206,7 +219,7 @@ export interface WorkerInvoker {
    *
    * ワーカーの側で起きた失敗(時間切れ、形式に合わない出力、起動係に届かないなど)は、
    * 例外ではなく `failed` として返る。例外になるのは、呼び出しの内容そのものが
-   * 不正な場合(指示書がない、上限が範囲の外など)と、ログを書けない場合だけである。
+   * 不正な場合(指示書がない、差し込む値が欠けている、上限が範囲の外など)と、ログを書けない場合だけである。
    */
   invoke(call: WorkerCall): Promise<WorkerInvocation>;
 }
@@ -218,7 +231,7 @@ const WorkerCallSchema = z.strictObject({
     .string()
     .regex(/^[a-z0-9][a-z0-9-]*$/, "英小文字、数字、ハイフンだけを使えます"),
   prompt: z.string(),
-  input: z.string(),
+  values: z.record(z.string(), z.string()),
   timeoutSec: z.number().int().min(1).max(MAX_TIMEOUT_SEC),
   maxTurns: z.number().int().min(1),
 });
@@ -238,7 +251,7 @@ export const DISALLOWED_TOOLS = [
 
 /**
  * ワーカーのコンテナの中で実行するコマンドを組み立てる純粋関数。
- * 指示書と入力は、引数ではなく標準入力で渡す。
+ * 指示書(値を差し込んだもの)は、引数ではなく標準入力で渡す。
  *
  * - `--setting-sources project`: プロジェクト設定だけを読む。ユーザー設定は読まない。
  * - `--strict-mcp-config`: `--mcp-config` を渡さないので、MCPは1つも読み込まれない。
@@ -247,14 +260,17 @@ export const DISALLOWED_TOOLS = [
  * - `--max-turns`: ヘルプには載っていないが、固定した版で効くことを確かめてある。
  * - `--bare` は使わない(サブスクリプションのトークンと `CLAUDE.md` を読まなくなる)。
  */
-export function buildClaudeArgv(options: { maxTurns: number }): string[] {
+export function buildClaudeArgv(options: {
+  maxTurns: number;
+  statuses: readonly WorkerStatus[];
+}): string[] {
   return [
     "claude",
     "-p",
     "--output-format",
     "json",
     "--json-schema",
-    JSON.stringify(WORKER_OUTPUT_JSON_SCHEMA),
+    JSON.stringify(workerOutputJsonSchema(options.statuses)),
     "--max-turns",
     String(options.maxTurns),
     "--setting-sources",
@@ -323,13 +339,18 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
         deps.logsDir,
         issueDirFor(call.repo, call.issue),
       );
-      const instructions = loadPrompt(deps.promptsDir, call.prompt);
+      const instructions = renderPrompt(
+        loadPrompt(deps.promptsDir, call.prompt),
+        call.values,
+      );
+
+      const statuses = allowedStatuses(call.prompt);
 
       const request: RunRequestInput = {
         repo: call.repo,
         issue: call.issue,
-        argv: buildClaudeArgv({ maxTurns: call.maxTurns }),
-        stdin: `${instructions.trimEnd()}\n\n${call.input}`,
+        argv: buildClaudeArgv({ maxTurns: call.maxTurns, statuses }),
+        stdin: instructions,
         claude_token: true,
         timeout_sec: call.timeoutSec,
       };
@@ -339,7 +360,10 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
       let outcome: WorkerOutcome;
       try {
         run = await deps.launcher.run(request);
-        outcome = interpretRun(run, { timeoutSec: call.timeoutSec });
+        outcome = interpretRun(run, {
+          timeoutSec: call.timeoutSec,
+          statuses,
+        });
       } catch (error) {
         // 依頼を拒否された場合と、起動係に届かない場合。
         const message = error instanceof Error ? error.message : String(error);
@@ -353,7 +377,7 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
       }
       const finishedAt = clock.now();
 
-      // 標準入力(指示書と入力)は、大きさだけを残す。
+      // 標準入力(値を差し込んだ指示書)は、大きさだけを残す。
       const header = {
         repo: call.repo,
         issue: call.issue,
