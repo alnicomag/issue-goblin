@@ -6,6 +6,7 @@ import {
   cancelRun,
   countFailedRuns,
   countRunsStartedSince,
+  countRunsStartedToday,
   findResumableRuns,
   finishStep,
   getRun,
@@ -680,6 +681,27 @@ describe("実行とステップの記録", () => {
       expect(countRunsStartedSince(db, "2026-01-02T00:00:00.000Z")).toBe(3);
       expect(countRunsStartedSince(db, "2026-01-03T00:00:00.000Z")).toBe(2);
       expect(countRunsStartedSince(db, "2026-01-03T00:00:00.001Z")).toBe(0);
+    });
+
+    it("UTCの1日に開始した実行を数える。日付の境目より前の実行は数えない", () => {
+      clock.set("2026-01-02T23:59:59.999Z");
+      const first = startRun(db, clock, target);
+      cancelRun(db, clock, first.id);
+      expect(countRunsStartedToday(db, clock.now())).toBe(1);
+
+      clock.set("2026-01-03T00:00:00.000Z");
+      expect(countRunsStartedToday(db, clock.now())).toBe(0);
+      startRun(db, clock, target);
+      clock.set("2026-01-03T12:00:00.000Z");
+      startRun(db, clock, { repo: "owner/other", issueNumber: 1 });
+
+      expect(countRunsStartedToday(db, clock.now())).toBe(2);
+      expect(
+        countRunsStartedToday(db, new Date("2026-01-03T23:59:59.999Z")),
+      ).toBe(2);
+      expect(
+        countRunsStartedToday(db, new Date("2026-01-04T00:00:00.000Z")),
+      ).toBe(0);
     });
 
     it("イシューの最新の実行を返す。なければ null", () => {

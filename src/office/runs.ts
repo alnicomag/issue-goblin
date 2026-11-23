@@ -7,6 +7,7 @@
 import { z } from "zod";
 import { type Clock, isoNow } from "./clock.ts";
 import type { Db } from "./db.ts";
+import { utcDayStart } from "./intake.ts";
 import {
   type NextAction,
   nextAction,
@@ -197,6 +198,14 @@ export function countRunsStartedSince(db: Db, since: string): number {
     .prepare("SELECT COUNT(*) AS n FROM runs WHERE started_at >= ?")
     .get(since) as { n: number };
   return row.n;
+}
+
+/**
+ * `now` を含むUTCの1日に開始した実行の数。
+ * 1日の上限(`daily_run_limit`)と比べる数で、着手のときも、状況表示も、これを使う。
+ */
+export function countRunsStartedToday(db: Db, now: Date): number {
+  return countRunsStartedSince(db, utcDayStart(now));
 }
 
 /**
