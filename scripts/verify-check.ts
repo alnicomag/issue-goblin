@@ -14,6 +14,7 @@ import { createLauncherClient } from "../src/launcher/client.ts";
 import { systemClock } from "../src/office/clock.ts";
 import { DEFAULT_CONFIG_PATH, loadConfig } from "../src/office/config.ts";
 import { type Db, migrate, openDb } from "../src/office/db.ts";
+import { createGit } from "../src/office/git.ts";
 import { FactoryYmlSchema } from "../src/office/product.ts";
 import { runVerify } from "../src/office/verify.ts";
 import { cleanupWorkspace, workspacePaths } from "../src/office/workspace.ts";
@@ -88,9 +89,34 @@ async function main(): Promise<void> {
   };
   const input = { repo, issue: ISSUE, timeoutSec: 120 };
 
-  fs.mkdirSync(`${paths.repoDir}/.git`, { recursive: true });
+  // 確認用のcloneを作る。ワーカーが触る前なので、事務局の側でgitを実行してよい(prepare と同じ)。
+  // verify は、コミットされていない内容が残っていると止まるので、使うファイルはコミットしておく。
+  const git = createGit();
+  cleanupWorkspace({ dirs, repo, issue: ISSUE });
+  fs.mkdirSync(paths.repoDir, { recursive: true });
   fs.mkdirSync(paths.homeDir, { recursive: true });
+  await git.run(["init", "--quiet", "--initial-branch=check", "--", "."], {
+    cwd: paths.repoDir,
+  });
   fs.writeFileSync(`${paths.repoDir}/leak.txt`, `${FAKE_TOKEN}\n`);
+  // setup が書くファイルは、依存の置き場所と同じく、無視対象にする。
+  fs.writeFileSync(`${paths.repoDir}/.gitignore`, "prepared.txt\n");
+  await git.run(["add", "--", "leak.txt", ".gitignore"], {
+    cwd: paths.repoDir,
+  });
+  await git.run(
+    [
+      "-c",
+      "user.name=Example",
+      "-c",
+      "user.email=example@example.invalid",
+      "commit",
+      "--quiet",
+      "-m",
+      "check",
+    ],
+    { cwd: paths.repoDir },
+  );
   const logs: string[] = [];
 
   try {
@@ -188,6 +214,31 @@ async function main(): Promise<void> {
       "ログは、作業場所の外にある",
       failed.logPath,
     );
+
+    console.log("\n# コミットされていない内容が残っている場合");
+    setCommands(db, repo, {
+      setup: "echo ran > ran-setup.txt",
+      test: "true",
+      lint: "true",
+    });
+    fs.writeFileSync(`${paths.repoDir}/untracked.txt`, "left\n");
+    fs.appendFileSync(`${paths.repoDir}/leak.txt`, "changed\n");
+    const dirty = await runVerify(deps, input);
+    logs.push(dirty.logPath);
+    report(
+      dirty.outcome === "rework" &&
+        dirty.commands.every((command) => command.status === "skipped") &&
+        !fs.existsSync(`${paths.repoDir}/ran-setup.txt`),
+      "コミットされていない内容が残っていると、コマンドを1つも実行せずに差し戻す",
+      JSON.stringify(dirty.commands),
+    );
+    report(
+      [...dirty.uncommittedPaths].sort().join() === "leak.txt,untracked.txt",
+      "残っているパス(変更と、追跡していないファイル)が結果に含まれ、無視対象は含まれない",
+      JSON.stringify(dirty.uncommittedPaths),
+    );
+    fs.rmSync(`${paths.repoDir}/untracked.txt`);
+    fs.writeFileSync(`${paths.repoDir}/leak.txt`, `${FAKE_TOKEN}\n`);
 
     console.log("\n# 時間切れになる場合");
     setCommands(db, repo, {

@@ -222,6 +222,9 @@ const VerifyOutputSchema = z.object({
       outputTail: z.string().default(""),
     }),
   ),
+  /** 作業場所に残っていた、コミットされていないパス。以前の記録にはない。 */
+  uncommittedPaths: z.array(z.string()).optional(),
+  uncommittedCount: z.number().optional(),
 });
 type VerifyOutput = z.infer<typeof VerifyOutputSchema>;
 
@@ -247,6 +250,13 @@ export function formatVerify(verify: VerifyOutput | null): string {
   for (const command of verify.commands) {
     const code = command.exitCode === null ? "なし" : String(command.exitCode);
     lines.push(`- ${command.name}: ${command.status}(終了コード: ${code})`);
+  }
+  const paths = verify.uncommittedPaths ?? [];
+  if (paths.length > 0) {
+    lines.push("", "### コミットされていないパス", "");
+    for (const entry of paths) lines.push(`- ${entry}`);
+    const rest = (verify.uncommittedCount ?? paths.length) - paths.length;
+    if (rest > 0) lines.push(`- (ほか ${rest} 件)`);
   }
   for (const command of verify.commands) {
     if (command.outputTail.trim() === "") continue;
@@ -408,6 +418,8 @@ async function executeStep(
           passed: result.passed,
           failedCommands: result.failedCommands,
           commands: result.commands,
+          uncommittedPaths: result.uncommittedPaths,
+          uncommittedCount: result.uncommittedCount,
         },
         logPath: result.logPath,
       };

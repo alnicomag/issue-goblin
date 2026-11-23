@@ -124,8 +124,11 @@ export class FakeLauncher implements WorkerLauncher {
     });
   }
 
+  /** 実行した検査コマンド(作業場所の状態の確認は含まない)。 */
   get commands(): string[] {
-    return this.requests.map((request) => request.argv[2] ?? "");
+    return this.requests
+      .filter((request) => request.argv[0] === "sh")
+      .map((request) => request.argv[2] ?? "");
   }
 }
 
