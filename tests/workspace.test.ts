@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { parseConfig } from "../src/office/config.ts";
 import { createGit, type Git, type GitRunOptions } from "../src/office/git.ts";
 import {
   branchFor,
@@ -10,6 +11,7 @@ import {
   type WorkspaceDirs,
   workspacePaths,
 } from "../src/office/workspace.ts";
+import { ACCEPTED_COMMIT_AUTHORS } from "./commit-author-examples.ts";
 import {
   commitFile,
   makeRepo,
@@ -303,6 +305,80 @@ describe("作業場所", () => {
       expect(unconfiguredGit(repoDir, "config", "--local", "user.email")).toBe(
         "other@example.invalid",
       );
+    });
+
+    it("設定の検証を通った作者は、gitがそのままコミットに書く", async () => {
+      const config = (author: unknown) =>
+        parseConfig(
+          [
+            "db_path: /data/factory.db",
+            "repos_dir: /data/repos",
+            "work_dir: /work",
+            "repos:",
+            "  - repo: owner/name",
+            "    token_env: GITHUB_TOKEN_EXAMPLE",
+            `commit_author: ${JSON.stringify(author)}`,
+            "",
+          ].join("\n"),
+        );
+      for (const [index, example] of ACCEPTED_COMMIT_AUTHORS.entries()) {
+        const author = config(example).commit_author;
+        const { repoDir } = await prepareWorkspace(
+          { git },
+          {
+            dirs,
+            repo: REPO,
+            issue: 100 + index,
+            source: { url: source },
+            author,
+          },
+        );
+        // 作者を渡さずにコミットする。作者は、作業場所のgit設定で決まる。
+        unconfiguredGit(
+          repoDir,
+          "commit",
+          "--quiet",
+          "--allow-empty",
+          "-m",
+          "x",
+        );
+        const written = unconfiguredGit(
+          repoDir,
+          "log",
+          "-1",
+          "--format=%an%x00%ae%x00%cn%x00%ce",
+        ).split("\0");
+        expect(written, JSON.stringify(example)).toEqual([
+          author.name,
+          author.email,
+          author.name,
+          author.email,
+        ]);
+      }
+    });
+
+    it("gitが書き換える作者は、設定の検証で断られる", () => {
+      // 検証を通ってしまうと、コミットの作者が設定と食い違い、publish の作者の検査で止まる。
+      unconfiguredGit(source, "config", "user.name", "Bot,");
+      unconfiguredGit(source, "config", "user.email", "bot@example.invalid;");
+      unconfiguredGit(source, "commit", "--quiet", "--allow-empty", "-m", "x");
+      expect(unconfiguredGit(source, "log", "-1", "--format=%an <%ae>")).toBe(
+        "Bot <bot@example.invalid>",
+      );
+      expect(() =>
+        parseConfig(
+          [
+            "db_path: /data/factory.db",
+            "repos_dir: /data/repos",
+            "work_dir: /work",
+            "repos:",
+            "  - repo: owner/name",
+            "    token_env: GITHUB_TOKEN_EXAMPLE",
+            'commit_author: { name: "Bot,", email: "bot@example.invalid;" }',
+            "",
+          ].join("\n"),
+        ),
+      ).toThrow("commit_author");
     });
 
     it("やり直しても、すでにある作業場所のgit設定を変えない", async () => {

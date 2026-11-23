@@ -6,6 +6,7 @@ import {
   resolveToken,
   workerImageFor,
 } from "../src/office/config.ts";
+import { ACCEPTED_COMMIT_AUTHORS } from "./commit-author-examples.ts";
 
 const VALID = `
 dry_run: false
@@ -56,6 +57,56 @@ describe("ファクトリー側の設定", () => {
     ).toEqual({
       name: "Example Bot",
       email: "factory-worker@example.invalid",
+    });
+  });
+
+  describe("gitがコミットに書くときに変えてしまう作者", () => {
+    /** gitが、名前とメールアドレスの前後から落とす文字。 */
+    const DROPPED = [" ", "\t", "\u0001", ".", ",", ":", ";", '"', "'", "\\"];
+    const withAuthor = (field: "name" | "email", value: string) =>
+      // JSONの文字列は、YAMLの二重引用符の文字列としても読める。
+      `${VALID}commit_author:\n  ${field}: ${JSON.stringify(value)}\n`;
+
+    it("名前の先頭か末尾に、空白やgitが落とす記号があれば、通さない", () => {
+      for (const dropped of DROPPED) {
+        for (const name of [`Bot${dropped}`, `${dropped}Bot`]) {
+          expect(
+            () => parseConfig(withAuthor("name", name)),
+            JSON.stringify(name),
+          ).toThrow(/commit_author\.name.*先頭と末尾/);
+        }
+      }
+    });
+
+    it("メールアドレスの先頭か末尾に、gitが落とす文字があれば、通さない", () => {
+      for (const dropped of DROPPED) {
+        for (const email of [
+          `bot@example.invalid${dropped}`,
+          `${dropped}bot@example.invalid`,
+        ]) {
+          expect(
+            () => parseConfig(withAuthor("email", email)),
+            JSON.stringify(email),
+          ).toThrow("commit_author.email");
+        }
+      }
+    });
+
+    it("途中にこれらの文字がある名前とメールアドレスは、そのまま通る", () => {
+      for (const author of ACCEPTED_COMMIT_AUTHORS) {
+        expect(
+          parseConfig(`${VALID}commit_author: ${JSON.stringify(author)}\n`)
+            .commit_author,
+        ).toEqual(author);
+      }
+    });
+
+    it("既定値は通る", () => {
+      const { commit_author } = parseConfig(VALID);
+      expect(
+        parseConfig(`${VALID}commit_author: ${JSON.stringify(commit_author)}\n`)
+          .commit_author,
+      ).toEqual(commit_author);
     });
   });
 

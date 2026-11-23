@@ -36,8 +36,33 @@ const DEFAULT_AUTHOR_NAME = "factory-worker";
 const DEFAULT_AUTHOR_EMAIL = "factory-worker@example.invalid";
 
 /**
+ * gitが、コミットに書くときに、名前とメールアドレスの先頭と末尾から落とす記号。
+ * `.` を落とすかはgitの版で違う(2.39 は落とし、2.43 は落とさない)ので、落とすものとして扱う。
+ */
+const GIT_DROPPED_SYMBOLS = ".,:;\"'\\";
+
+/** gitが、先頭や末尾にあると落とす文字か。空白と制御文字(文字コード32以下)も落とす。 */
+function isDroppedByGit(char: string | undefined): boolean {
+  return (
+    char !== undefined &&
+    (char.charCodeAt(0) <= 32 || GIT_DROPPED_SYMBOLS.includes(char))
+  );
+}
+
+/** gitが、変えずにコミットに書く値か(先頭と末尾に、gitが落とす文字がない)。 */
+function isKeptByGit(value: string): boolean {
+  return !isDroppedByGit(value.at(0)) && !isDroppedByGit(value.at(-1));
+}
+
+const DROPPED_BY_GIT_MESSAGE =
+  "先頭と末尾に、空白、制御文字、記号(. , : ; \" ' \\)は使えません(gitがコミットに書くときに落とすので、コミットの作者が設定と一致しなくなります)";
+
+/**
  * ワーカーのコミットの作者。作業場所のcloneのgit設定に書く。
  * gitが作者の区切りに使う文字(`<`、`>`、改行)は通さない。
+ *
+ * gitがコミットに書くときに変えてしまう値も通さない。publish は、コミットに書かれた作者が
+ * この設定と完全に一致することを確かめるので、変わってしまうと、正しいコミットも通らなくなる。
  */
 const CommitAuthorSchema = z.strictObject({
   name: z
@@ -46,6 +71,7 @@ const CommitAuthorSchema = z.strictObject({
       /^[^<>\r\n]*[^<>\s][^<>\r\n]*$/,
       "空ではない名前を書いてください(<、>、改行は使えません)",
     )
+    .refine(isKeptByGit, DROPPED_BY_GIT_MESSAGE)
     .default(DEFAULT_AUTHOR_NAME),
   email: z
     .string()
@@ -53,6 +79,7 @@ const CommitAuthorSchema = z.strictObject({
       /^[^<>@\s]+@[^<>@\s]+$/,
       "メールアドレスを書いてください(<、>、空白は使えません)",
     )
+    .refine(isKeptByGit, DROPPED_BY_GIT_MESSAGE)
     .default(DEFAULT_AUTHOR_EMAIL),
 });
 
