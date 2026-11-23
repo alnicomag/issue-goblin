@@ -194,7 +194,7 @@ export async function updateMirror(
 }
 
 /** 作業場所のcloneに、ブランチがあるか。読むだけで、何も変えない。 */
-async function hasBranch(
+export async function hasBranch(
   git: Git,
   repoDir: string,
   branch: string,
