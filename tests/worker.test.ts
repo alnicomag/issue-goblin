@@ -325,7 +325,7 @@ describe("createClaudeWorker", () => {
     issue: 12,
     step: "plan",
     prompt: "plan",
-    input: "イシューの本文",
+    values: { issue: "イシューの本文" },
     timeoutSec: 600,
     maxTurns: 40,
   };
@@ -339,7 +339,10 @@ describe("createClaudeWorker", () => {
     const promptsDir = path.join(root, "prompts");
     const logsDir = path.join(root, "logs");
     fs.mkdirSync(promptsDir);
-    fs.writeFileSync(path.join(promptsDir, "plan.md"), "計画を書くこと。\n");
+    fs.writeFileSync(
+      path.join(promptsDir, "plan.md"),
+      "計画を書くこと。\n\n{{issue}}\n",
+    );
     const requests: RunRequestInput[] = [];
     const launcher: WorkerLauncher = {
       async run(request) {
@@ -370,12 +373,12 @@ describe("createClaudeWorker", () => {
     expect((await fake.invoke(CALL)).status).toBe("question");
   });
 
-  it("指示書をファイルから読み、入力と合わせて標準入力で渡す", async () => {
+  it("指示書をファイルから読み、値を差し込んで標準入力で渡す", async () => {
     const { worker, requests } = setup();
     const result = await worker.invoke(CALL);
     expect(result.status).toBe("done");
     expect(requests).toHaveLength(1);
-    expect(requests[0]?.stdin).toBe("計画を書くこと。\n\nイシューの本文");
+    expect(requests[0]?.stdin).toBe("計画を書くこと。\n\nイシューの本文\n");
     expect(requests[0]?.argv).toEqual(buildClaudeArgv({ maxTurns: 40 }));
     expect(requests[0]?.timeout_sec).toBe(600);
   });
@@ -481,6 +484,17 @@ describe("createClaudeWorker", () => {
     await expect(worker.invoke({ ...CALL, prompt: "review" })).rejects.toThrow(
       "指示書を読めません",
     );
+    expect(requests).toHaveLength(0);
+  });
+
+  it("差し込む値が欠けていれば、起動係を呼ばずに失敗する", async () => {
+    const { worker, requests } = setup();
+    await expect(worker.invoke({ ...CALL, values: {} })).rejects.toThrow(
+      "指示書に差し込む値が欠けています: issue",
+    );
+    await expect(
+      worker.invoke({ ...CALL, values: { issue: "本文", isue: "本文" } }),
+    ).rejects.toThrow("指示書にない名前の値が渡されました: isue");
     expect(requests).toHaveLength(0);
   });
 
