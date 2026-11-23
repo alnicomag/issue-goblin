@@ -211,6 +211,21 @@ function summaryOf(step: Step | undefined): string {
   return typeof summary === "string" ? summary : "";
 }
 
+/**
+ * `done` で終わった最後のステップの要約。PRの本文に載せる。なければ null。
+ * 差し戻しがあった実行では、最後のやり直しのものになる。
+ */
+export function lastDoneSummary(
+  steps: readonly Step[],
+  name: StepName,
+): string | null {
+  const step = steps.findLast(
+    (candidate) => candidate.name === name && candidate.status === "done",
+  );
+  const summary = summaryOf(step);
+  return summary.trim() === "" ? null : summary;
+}
+
 const VerifyOutputSchema = z.object({
   passed: z.boolean(),
   summary: z.string(),
@@ -487,6 +502,8 @@ async function executeStep(
           source: deps.sourceFor(repo),
           author: deps.commitAuthor,
           verify: lastVerify(steps),
+          implementSummary: lastDoneSummary(steps, "implement"),
+          reviewSummary: lastDoneSummary(steps, "review"),
         },
       );
       if (result.prNumber !== null) {

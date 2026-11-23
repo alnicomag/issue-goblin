@@ -6,6 +6,7 @@ import {
   feedbackFor,
   formatIssue,
   formatVerify,
+  lastDoneSummary,
 } from "../src/office/runner.ts";
 import { getRun, listSteps, startRun } from "../src/office/runs.ts";
 import { workspacePaths } from "../src/office/workspace.ts";
@@ -184,6 +185,76 @@ describe("ステップの実行", () => {
     expect(run.status).toBe("failed");
     expect(run.nextRetryAt).not.toBeNull();
     expect(h.fake.pullRequests).toEqual([]);
+  });
+
+  describe("PRの本文に載せる要約", () => {
+    const prBody = () => h.fake.pullRequests[0]?.body ?? "";
+
+    it("implement と review の要約を、PRの本文に載せる", async () => {
+      const runId = start();
+      expect(await advance(runId)).toEqual({ kind: "waiting_close" });
+      expect(h.fake.pullRequests).toHaveLength(1);
+      expect(prBody()).toContain(
+        "## 実装の要約(ワーカーの申告)\n\nimplement の結果\n",
+      );
+      expect(prBody()).toContain(
+        "## レビューの結果(ワーカーの申告)\n\nreview の結果\n",
+      );
+      // plan の要約は載せない。
+      expect(prBody()).not.toContain("plan の結果");
+    });
+
+    it("差し戻しがあった実行では、最後の implement と review の要約を載せる", async () => {
+      let implemented = 0;
+      h.worker.scripts.set("implement", (call) => {
+        implemented += 1;
+        h.worker.commit(call.repo, call.issue);
+        return { status: "done", summary: `IMPLEMENT ROUND ${implemented}` };
+      });
+      h.worker.answer(
+        "review",
+        { status: "rework", summary: "REVIEW ROUND 1: FIX THIS" },
+        { status: "done", summary: "REVIEW ROUND 2: PASSED" },
+      );
+      const runId = start();
+      expect(await advance(runId)).toEqual({ kind: "waiting_close" });
+      expect(stepsOf(runId)).toEqual([
+        "prepare:done",
+        "plan:done",
+        "implement:done",
+        "verify:done",
+        "review:rework",
+        "implement:done",
+        "verify:done",
+        "review:done",
+        "publish:done",
+      ]);
+      expect(h.fake.pullRequests).toHaveLength(1);
+      expect(prBody()).toContain("IMPLEMENT ROUND 2");
+      expect(prBody()).toContain("REVIEW ROUND 2: PASSED");
+      expect(prBody()).not.toContain("IMPLEMENT ROUND 1");
+      expect(prBody()).not.toContain("REVIEW ROUND 1");
+    });
+
+    it("lastDoneSummary は、done で終わった最後のステップの要約を返す。なければ null", async () => {
+      h.worker.answer(
+        "review",
+        { status: "rework", summary: "FIX" },
+        { status: "done", summary: "PASSED" },
+      );
+      const runId = start();
+      await advance(runId);
+      const steps = listSteps(h.db, runId);
+      expect(lastDoneSummary(steps, "review")).toBe("PASSED");
+      expect(lastDoneSummary(steps, "implement")).toBe("implement の結果");
+      expect(
+        lastDoneSummary(
+          steps.filter((step) => step.status !== "done"),
+          "review",
+        ),
+      ).toBeNull();
+      expect(lastDoneSummary([], "implement")).toBeNull();
+    });
   });
 
   it("ステップの中の例外は、そのステップの失敗として記録する", async () => {
