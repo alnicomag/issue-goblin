@@ -1,0 +1,776 @@
+import fs from "node:fs";
+import path from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { type Db, migrate, openDb } from "../src/office/db.ts";
+import { createGit, type Git } from "../src/office/git.ts";
+import { FACTORY_MARKER } from "../src/office/github.ts";
+import type { LogFields, Logger } from "../src/office/log.ts";
+import { parseFactoryYml } from "../src/office/product.ts";
+import {
+  buildPrBody,
+  buildPrTitle,
+  importCommits,
+  inspectChanges,
+  type PublishVerifySummary,
+  publish,
+} from "../src/office/publish.ts";
+import {
+  prepareWorkspace,
+  updateMirror,
+  type WorkspaceDirs,
+  type WorkspacePaths,
+  workspacePaths,
+} from "../src/office/workspace.ts";
+import { FakeGitHub, VALID_FACTORY_YML } from "./fake-github.ts";
+import {
+  commitFile,
+  makeRepo,
+  makeTempDir,
+  plainGit,
+  plantHooks,
+} from "./git-fixtures.ts";
+
+const REPO = "owner/name";
+const ISSUE = 7;
+const BRANCH = "agent/issue-7";
+const AUTHOR = { name: "Example Worker", email: "worker@example.invalid" };
+
+describe("取り込みと差分の検査", () => {
+  let tmp: string;
+  let source: string;
+  let dirs: WorkspaceDirs;
+  let paths: WorkspacePaths;
+  let marker: string;
+  const git = createGit();
+
+  const fired = (): string[] =>
+    fs.existsSync(marker)
+      ? [...new Set(fs.readFileSync(marker, "utf8").trim().split("\n"))].sort()
+      : [];
+
+  const mirrorHead = () =>
+    plainGit(paths.mirrorDir, "rev-parse", `refs/heads/${BRANCH}`);
+
+  const inspect = () =>
+    inspectChanges(git, {
+      mirrorDir: paths.mirrorDir,
+      branch: BRANCH,
+      defaultBranch: "main",
+    });
+
+  beforeEach(async () => {
+    tmp = makeTempDir();
+    marker = path.join(tmp, "hook-fired");
+    source = makeRepo(path.join(tmp, "source"));
+    dirs = {
+      reposDir: path.join(tmp, "data", "repos"),
+      workDir: path.join(tmp, "work"),
+    };
+    paths = workspacePaths(dirs, REPO, ISSUE);
+    await prepareWorkspace(
+      { git },
+      {
+        dirs,
+        repo: REPO,
+        issue: ISSUE,
+        source: { url: source },
+        author: AUTHOR,
+      },
+    );
+  });
+  afterEach(() => {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  it("ワーカーのコミットをミラーに取り込み、先頭のコミットを返す", async () => {
+    const commit = commitFile(paths.repoDir, "feature.txt", "feature\n");
+
+    expect(await importCommits(git, paths)).toBe(commit);
+    expect(mirrorHead()).toBe(commit);
+    // やり直しても同じ。
+    expect(await importCommits(git, paths)).toBe(commit);
+    // 作業場所のパスを、ミラーに残さない。
+    const leaked = fs
+      .readdirSync(paths.mirrorDir, { withFileTypes: true, recursive: true })
+      .filter((entry) => entry.isFile())
+      .map((entry) => path.join(entry.parentPath, entry.name))
+      .filter((file) => fs.readFileSync(file).includes(dirs.workDir));
+    expect(leaked).toEqual([]);
+    expect(plainGit(paths.mirrorDir, "remote")).toBe("");
+  });
+
+  it("履歴が書き換えられていても、作業場所の今の状態を取り込む", async () => {
+    commitFile(paths.repoDir, "feature.txt", "feature\n");
+    await importCommits(git, paths);
+    plainGit(paths.repoDir, "commit", "--quiet", "--amend", "-m", "rewritten");
+    const rewritten = plainGit(paths.repoDir, "rev-parse", "HEAD");
+
+    expect(await importCommits(git, paths)).toBe(rewritten);
+    expect(mirrorHead()).toBe(rewritten);
+  });
+
+  it("作業場所にブランチがなければ、null を返す", async () => {
+    plainGit(paths.repoDir, "checkout", "--quiet", "--detach");
+    plainGit(paths.repoDir, "branch", "--quiet", "-D", BRANCH);
+    expect(await importCommits(git, paths)).toBeNull();
+  });
+
+  it("作業場所やミラーがなければ、失敗する", async () => {
+    const missing = workspacePaths(dirs, REPO, 99);
+    await expect(importCommits(git, missing)).rejects.toThrow(
+      "作業場所がgitのリポジトリではありません",
+    );
+    fs.rmSync(paths.mirrorDir, { recursive: true });
+    await expect(importCommits(git, paths)).rejects.toThrow(
+      "ミラーがありません",
+    );
+  });
+
+  describe("細工された作業場所", () => {
+    it("作業場所の側のフックとgit設定が、取り込みと検査で効かない", async () => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      const planted = path.join(tmp, "planted");
+      plantHooks(path.join(paths.repoDir, ".git", "hooks"), marker);
+      plantHooks(planted, marker);
+      const script = (name: string) => {
+        const file = path.join(planted, name);
+        fs.writeFileSync(file, `#!/bin/sh\necho ${name} >> '${marker}'\n`, {
+          mode: 0o755,
+        });
+        return file;
+      };
+      for (const [key, value] of [
+        ["core.fsmonitor", path.join(planted, "fsmonitor")],
+        ["uploadpack.packObjectsHook", script("pack-objects-hook")],
+        ["credential.helper", `!${script("credential-helper")}`],
+        ["core.sshCommand", script("ssh-command")],
+        ["core.pager", script("pager")],
+        ["core.editor", script("editor")],
+        ["diff.external", script("diff-external")],
+        ["remote.origin.url", `ext::${script("remote-ext")}`],
+        ["url.ext::false.insteadOf", paths.mirrorDir],
+      ] as const) {
+        plainGit(paths.repoDir, "config", key, value);
+      }
+
+      // 仕込みが生きていることを、守りを付けないgitで先に確かめる(テストが空振りしていないこと)。
+      plainGit(paths.repoDir, "status", "--porcelain");
+      plainGit(
+        paths.repoDir,
+        "commit",
+        "--quiet",
+        "--allow-empty",
+        "--amend",
+        "--no-edit",
+      );
+      expect(fired()).toEqual(
+        expect.arrayContaining(["fsmonitor", "pre-commit", "post-commit"]),
+      );
+      fs.rmSync(marker);
+      const amended = plainGit(paths.repoDir, "rev-parse", "HEAD");
+
+      expect(await importCommits(git, paths)).toBe(amended);
+      const changes = await inspect();
+
+      expect(fired()).toEqual([]);
+      expect(mirrorHead()).toBe(amended);
+      expect(changes.paths).toEqual(["feature.txt"]);
+      // 作業場所の設定は、ミラーに写らない。
+      const mirrorConfig = fs.readFileSync(
+        path.join(paths.mirrorDir, "config"),
+        "utf8",
+      );
+      expect(mirrorConfig).not.toContain("planted");
+      expect(mirrorConfig).not.toContain("ext::");
+    });
+
+    it("`.git` がリンクや別の場所を指すファイルなら、たどらずに失敗する", async () => {
+      const other = makeRepo(path.join(tmp, "other"));
+      plainGit(other, "checkout", "--quiet", "-b", BRANCH);
+      commitFile(other, "planted.txt", "planted\n");
+      const dotGit = path.join(paths.repoDir, ".git");
+
+      fs.renameSync(dotGit, path.join(tmp, "moved.git"));
+      fs.symlinkSync(path.join(other, ".git"), dotGit);
+      await expect(importCommits(git, paths)).rejects.toThrow(
+        "作業場所がgitのリポジトリではありません",
+      );
+
+      fs.rmSync(dotGit);
+      fs.writeFileSync(dotGit, `gitdir: ${path.join(other, ".git")}\n`);
+      await expect(importCommits(git, paths)).rejects.toThrow(
+        "作業場所がgitのリポジトリではありません",
+      );
+      expect(plainGit(paths.mirrorDir, "for-each-ref", "refs/heads/")).toBe("");
+    });
+
+    it("`repo` がリンクなら、たどらずに失敗する", async () => {
+      const other = makeRepo(path.join(tmp, "other"));
+      fs.renameSync(paths.repoDir, path.join(tmp, "moved"));
+      fs.symlinkSync(other, paths.repoDir);
+      await expect(importCommits(git, paths)).rejects.toThrow(
+        "作業場所がgitのリポジトリではありません",
+      );
+    });
+  });
+
+  describe("差分", () => {
+    it("コミットがなければ、数は0で、パスは空", async () => {
+      const head = await importCommits(git, paths);
+      const changes = await inspect();
+      expect(changes).toEqual({
+        headCommit: head,
+        mergeBase: head,
+        commitCount: 0,
+        paths: [],
+      });
+    });
+
+    it("変更、追加、削除したパスを返す。改名は元と先の両方を返す", async () => {
+      const base = plainGit(paths.repoDir, "rev-parse", "HEAD");
+      fs.mkdirSync(path.join(paths.repoDir, "docs"));
+      commitFile(paths.repoDir, "docs/名前 with space.md", "text\n");
+      commitFile(paths.repoDir, "added.txt", "added\n");
+      plainGit(paths.repoDir, "mv", "README.txt", "RENAMED.txt");
+      plainGit(paths.repoDir, "commit", "--quiet", "-m", "rename");
+      const head = await importCommits(git, paths);
+
+      const changes = await inspect();
+      expect(changes).toMatchObject({
+        headCommit: head,
+        mergeBase: base,
+        commitCount: 3,
+      });
+      expect([...changes.paths].sort()).toEqual([
+        "README.txt",
+        "RENAMED.txt",
+        "added.txt",
+        "docs/名前 with space.md",
+      ]);
+    });
+
+    it("打ち消し合うコミットは、コミットはあるが、パスは空", async () => {
+      commitFile(paths.repoDir, "temp.txt", "temp\n");
+      plainGit(paths.repoDir, "rm", "--quiet", "temp.txt");
+      plainGit(paths.repoDir, "commit", "--quiet", "-m", "remove");
+      await importCommits(git, paths);
+
+      const changes = await inspect();
+      expect(changes.commitCount).toBe(2);
+      expect(changes.paths).toEqual([]);
+    });
+
+    it("既定ブランチが先に進んでいても、作業用のブランチの変更だけを返す", async () => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      commitFile(source, "upstream.txt", "upstream\n");
+      await updateMirror(git, paths.mirrorDir, { url: source });
+      await importCommits(git, paths);
+
+      const changes = await inspect();
+      expect(changes.commitCount).toBe(1);
+      expect(changes.paths).toEqual(["feature.txt"]);
+    });
+
+    it("既定ブランチと履歴がつながっていなければ、失敗する", async () => {
+      plainGit(paths.repoDir, "checkout", "--quiet", "--orphan", "unrelated");
+      commitFile(paths.repoDir, "unrelated.txt", "unrelated\n");
+      plainGit(paths.repoDir, "branch", "--quiet", "--force", BRANCH);
+      await importCommits(git, paths);
+
+      await expect(inspect()).rejects.toThrow("履歴がつながっていません");
+    });
+  });
+});
+
+describe("PRの内容", () => {
+  const verify: PublishVerifySummary = {
+    passed: true,
+    commands: [
+      { name: "setup", status: "passed", exitCode: 0 },
+      { name: "test", status: "passed", exitCode: 0 },
+      { name: "lint", status: "passed", exitCode: 0 },
+    ],
+  };
+
+  it("対応イシュー、検証結果、未検証の範囲を書き、目印を付ける", () => {
+    const body = buildPrBody({
+      issue: 7,
+      verify,
+      unverified: ["example of an unverifiable area", "another\narea"],
+    });
+    expect(body.split("\n")[0]).toBe("Closes #7");
+    expect(body).toContain("すべて通りました");
+    expect(body).toContain("| `setup` | 合格 | 0 |");
+    expect(body).toContain("| `lint` | 合格 | 0 |");
+    expect(body).toContain("## 未検証の範囲");
+    expect(body).toContain("- example of an unverifiable area");
+    // 改行で箇条書きを崩させない。
+    expect(body).toContain("- another area");
+    expect(body.trimEnd().endsWith(FACTORY_MARKER)).toBe(true);
+  });
+
+  it("通らなかった検査と、実行しなかった検査が分かる", () => {
+    const body = buildPrBody({
+      issue: 7,
+      verify: {
+        passed: false,
+        commands: [
+          { name: "setup", status: "passed", exitCode: 0 },
+          { name: "test", status: "failed", exitCode: 2 },
+          { name: "lint", status: "timed_out", exitCode: null },
+        ],
+      },
+      unverified: [],
+    });
+    expect(body).toContain("通らなかったものがあります");
+    expect(body).toContain("| `test` | 不合格 | 2 |");
+    expect(body).toContain("| `lint` | 時間切れ | - |");
+    expect(body).toContain("## 未検証の範囲\n\nなし");
+  });
+
+  it("検証結果がなければ、ないと書く", () => {
+    const body = buildPrBody({ issue: 7, verify: null, unverified: [] });
+    expect(body).toContain("検証結果の記録がありません");
+  });
+
+  it("タイトルは、イシューのタイトルを1行にしたもの。空なら番号から作る", () => {
+    expect(buildPrTitle(7, "  Add a\nfeature ")).toBe("Add a feature");
+    expect(buildPrTitle(7, " \n")).toBe("Issue #7");
+  });
+});
+
+describe("publish", () => {
+  const TOKEN = "dummy-token-value";
+  const VERIFY: PublishVerifySummary = {
+    passed: true,
+    commands: [{ name: "test", status: "passed", exitCode: 0 }],
+  };
+
+  let tmp: string;
+  let source: string;
+  let dirs: WorkspaceDirs;
+  let paths: WorkspacePaths;
+  let db: Db;
+  let fake: FakeGitHub;
+  let logs: { level: string; event: string; fields: LogFields }[];
+  let logger: Logger;
+  let gitCalls: (readonly string[])[];
+  let git: Git;
+
+  const run = (dryRun: boolean, issueTitle = "Example issue") =>
+    publish(
+      { db, git, write: { api: fake, dryRun, logger }, dirs },
+      {
+        repo: REPO,
+        issue: ISSUE,
+        issueTitle,
+        source: { url: source, token: TOKEN },
+        verify: VERIFY,
+      },
+    );
+
+  /** push 先(GitHubの代わり)にある、作業用のブランチの先頭。なければ null。 */
+  const remoteHead = (): string | null => {
+    const out = plainGit(
+      source,
+      "for-each-ref",
+      "--format=%(objectname)",
+      `refs/heads/${BRANCH}`,
+    );
+    return out === "" ? null : out;
+  };
+
+  const pushCalls = () => gitCalls.filter((args) => args.includes("push"));
+  const skippedActions = () =>
+    logs
+      .filter((line) => line.event === "github.write_skipped")
+      .map((line) => line.fields.action);
+
+  const setFactoryYml = (text: string) => {
+    const parsed = parseFactoryYml(text);
+    if (!parsed.ok) throw new Error(parsed.errors);
+    db.prepare("UPDATE repos SET factory_yml = ? WHERE repo = ?").run(
+      JSON.stringify(parsed.value),
+      REPO,
+    );
+  };
+
+  beforeEach(async () => {
+    tmp = makeTempDir();
+    source = makeRepo(path.join(tmp, "source"));
+    dirs = {
+      reposDir: path.join(tmp, "data", "repos"),
+      workDir: path.join(tmp, "work"),
+    };
+    paths = workspacePaths(dirs, REPO, ISSUE);
+    db = openDb(path.join(tmp, "data", "factory.db"));
+    migrate(db, { clock: { now: () => new Date("2026-03-01T01:00:00.000Z") } });
+    db.prepare(
+      "INSERT INTO repos (repo, factory_yml, factory_yml_sha) VALUES (?, NULL, ?)",
+    ).run(REPO, "sha-1");
+    setFactoryYml(VALID_FACTORY_YML);
+    fake = new FakeGitHub();
+    logs = [];
+    const push =
+      (level: string) =>
+      (event: string, fields: LogFields = {}) => {
+        logs.push({ level, event, fields });
+      };
+    logger = { info: push("info"), warn: push("warn"), error: push("error") };
+    const real = createGit();
+    gitCalls = [];
+    git = {
+      run(args, options) {
+        gitCalls.push(args);
+        return real.run(args, options);
+      },
+    };
+    await prepareWorkspace(
+      { git: real },
+      {
+        dirs,
+        repo: REPO,
+        issue: ISSUE,
+        source: { url: source },
+        author: AUTHOR,
+      },
+    );
+  });
+  afterEach(() => {
+    db.close();
+    fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  /** push もPRの書き込みも、行われていないこと。 */
+  const expectNothingWritten = () => {
+    expect(pushCalls()).toEqual([]);
+    expect(remoteHead()).toBeNull();
+    expect(fake.writes).toEqual([]);
+    expect(fake.pullRequests).toEqual([]);
+  };
+
+  it("検査を通った変更を push し、PRを作る", async () => {
+    const commit = commitFile(paths.repoDir, "feature.txt", "feature\n");
+
+    const result = await run(false);
+
+    expect(result).toMatchObject({
+      status: "published",
+      outcome: "done",
+      awaitingApproval: false,
+      branch: BRANCH,
+      baseBranch: "main",
+      headCommit: commit,
+      changedPaths: ["feature.txt"],
+      forbidden: [],
+      protected: [],
+      prNumber: 100,
+      prCreated: true,
+    });
+    expect(remoteHead()).toBe(commit);
+    expect(fake.pullRequests).toHaveLength(1);
+    expect(fake.pullRequests[0]).toMatchObject({
+      head: BRANCH,
+      base: "main",
+      title: "Example issue",
+    });
+    const body = fake.pullRequests[0]?.body ?? "";
+    expect(body).toContain("Closes #7");
+    expect(body).toContain("| `test` | 合格 | 0 |");
+    expect(body).toContain("- example of an unverifiable area");
+    expect(body).toContain(FACTORY_MARKER);
+  });
+
+  it("push するのは作業用のブランチだけで、既定ブランチは変わらない(マージしない)", async () => {
+    const mainBefore = plainGit(source, "rev-parse", "refs/heads/main");
+    commitFile(paths.repoDir, "feature.txt", "feature\n");
+
+    await run(false);
+
+    expect(pushCalls()).toHaveLength(1);
+    expect(pushCalls()[0]?.at(-1)).toBe(
+      `refs/heads/${BRANCH}:refs/heads/${BRANCH}`,
+    );
+    expect(plainGit(source, "rev-parse", "refs/heads/main")).toBe(mainBefore);
+    expect(
+      plainGit(source, "for-each-ref", "--format=%(refname)").split("\n"),
+    ).toEqual([`refs/heads/${BRANCH}`, "refs/heads/main"]);
+    expect(fake.writes.map((call) => call.method)).toEqual([
+      "createPullRequest",
+    ]);
+  });
+
+  describe("やり直し", () => {
+    it("同じブランチのPRがすでにあれば更新し、2つ作らない", async () => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      const first = await run(false);
+      const second = await run(false, "Renamed issue");
+
+      expect(first.prCreated).toBe(true);
+      expect(second).toMatchObject({
+        status: "published",
+        outcome: "done",
+        prNumber: first.prNumber,
+        prCreated: false,
+      });
+      expect(fake.pullRequests).toHaveLength(1);
+      expect(fake.pullRequests[0]?.title).toBe("Renamed issue");
+      expect(fake.writes.map((call) => call.method)).toEqual([
+        "createPullRequest",
+        "updatePullRequest",
+      ]);
+    });
+
+    it("差し戻しでコミットが増えたり、履歴が変わったりしても、同じPRのまま push し直す", async () => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      await run(false);
+
+      plainGit(paths.repoDir, "commit", "--quiet", "--amend", "-m", "redo");
+      const added = commitFile(paths.repoDir, "more.txt", "more\n");
+      const result = await run(false);
+
+      expect(result).toMatchObject({ status: "published", prCreated: false });
+      expect([...result.changedPaths].sort()).toEqual([
+        "feature.txt",
+        "more.txt",
+      ]);
+      expect(remoteHead()).toBe(added);
+      expect(fake.pullRequests).toHaveLength(1);
+    });
+
+    it("push の後、PRを作る前に落ちた場合も、次の呼び出しでPRを1つ作る", async () => {
+      const commit = commitFile(paths.repoDir, "feature.txt", "feature\n");
+      fake.failWritesWith = new Error("temporary failure");
+      await expect(run(false)).rejects.toThrow("temporary failure");
+      expect(remoteHead()).toBe(commit);
+      expect(fake.pullRequests).toEqual([]);
+
+      fake.failWritesWith = null;
+      const result = await run(false);
+      expect(result).toMatchObject({ status: "published", prCreated: true });
+      expect(fake.pullRequests).toHaveLength(1);
+    });
+  });
+
+  describe("PRを作らずに失敗として扱う場合", () => {
+    it("コミットがない", async () => {
+      const result = await run(false);
+      expect(result).toMatchObject({
+        status: "no_commits",
+        outcome: "failed",
+        awaitingApproval: false,
+        prNumber: null,
+      });
+      expectNothingWritten();
+    });
+
+    it("ブランチがない", async () => {
+      plainGit(paths.repoDir, "checkout", "--quiet", "--detach");
+      plainGit(paths.repoDir, "branch", "--quiet", "-D", BRANCH);
+      const result = await run(false);
+      expect(result).toMatchObject({
+        status: "no_commits",
+        outcome: "failed",
+        headCommit: null,
+      });
+      expectNothingWritten();
+    });
+
+    it("コミットはあるが、差分が空", async () => {
+      commitFile(paths.repoDir, "temp.txt", "temp\n");
+      plainGit(paths.repoDir, "rm", "--quiet", "temp.txt");
+      plainGit(paths.repoDir, "commit", "--quiet", "-m", "remove");
+
+      const result = await run(false);
+      expect(result).toMatchObject({ status: "empty_diff", outcome: "failed" });
+      expectNothingWritten();
+    });
+
+    it("paths.forbidden に当たる変更がある", async () => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      fs.mkdirSync(path.join(paths.repoDir, "generated"));
+      commitFile(paths.repoDir, "generated/out.txt", "out\n");
+
+      const result = await run(false);
+      expect(result).toMatchObject({
+        status: "forbidden",
+        outcome: "failed",
+        awaitingApproval: false,
+        forbidden: [{ path: "generated/out.txt", pattern: "generated/**" }],
+        protected: [],
+      });
+      expect(result.summary).toContain("generated/out.txt");
+      expectNothingWritten();
+    });
+
+    it("改名で禁止のパスから持ち出した場合も、止める", async () => {
+      fs.mkdirSync(path.join(source, "generated"));
+      commitFile(source, "generated/out.txt", "a long enough content\n");
+      fs.rmSync(paths.issueDir, { recursive: true });
+      await prepareWorkspace(
+        { git },
+        {
+          dirs,
+          repo: REPO,
+          issue: ISSUE,
+          source: { url: source },
+          author: AUTHOR,
+        },
+      );
+      gitCalls.length = 0;
+      plainGit(paths.repoDir, "mv", "generated/out.txt", "moved.txt");
+      plainGit(paths.repoDir, "commit", "--quiet", "-m", "move");
+
+      const result = await run(false);
+      expect(result.status).toBe("forbidden");
+      expect(result.forbidden.map((hit) => hit.path)).toEqual([
+        "generated/out.txt",
+      ]);
+      expectNothingWritten();
+    });
+  });
+
+  it("paths.protected に当たる変更は、push せずに、人間の承認待ちとして返す", async () => {
+    commitFile(paths.repoDir, "feature.txt", "feature\n");
+    fs.mkdirSync(path.join(paths.repoDir, "docs"));
+    commitFile(paths.repoDir, "docs/guide.md", "guide\n");
+
+    const result = await run(false);
+    expect(result).toMatchObject({
+      status: "needs_approval",
+      outcome: "failed",
+      awaitingApproval: true,
+      forbidden: [],
+      protected: [{ path: "docs/guide.md", pattern: "docs/**" }],
+    });
+    expect(result.summary).toContain("人間の承認待ち");
+    expectNothingWritten();
+    expect(logs.at(-1)).toMatchObject({
+      level: "warn",
+      event: "publish.stopped",
+      fields: { status: "needs_approval" },
+    });
+  });
+
+  it("規則は、作業場所の factory.yml ではなく、保存済みのものから読む", async () => {
+    // ワーカーが、作業場所の factory.yml で規則を外そうとする。
+    commitFile(
+      paths.repoDir,
+      "factory.yml",
+      VALID_FACTORY_YML.replace("- generated/**", "- nothing/**"),
+    );
+    fs.mkdirSync(path.join(paths.repoDir, "generated"));
+    commitFile(paths.repoDir, "generated/out.txt", "out\n");
+
+    const result = await run(false);
+    expect(result.status).toBe("forbidden");
+    expectNothingWritten();
+  });
+
+  describe("dry_run が true のとき", () => {
+    it("push もPRの作成も行わず、予定だったことをログに出す", async () => {
+      const commit = commitFile(paths.repoDir, "feature.txt", "feature\n");
+
+      const result = await run(true);
+
+      expect(result).toMatchObject({
+        status: "dry_run",
+        outcome: "done",
+        headCommit: commit,
+        changedPaths: ["feature.txt"],
+        prNumber: null,
+        prCreated: false,
+      });
+      expectNothingWritten();
+      expect(skippedActions()).toEqual(["push", "create_pull_request"]);
+      expect(logs.some((line) => line.event === "github.write")).toBe(false);
+    });
+
+    it("既存のPRがあっても更新せず、予定だったことをログに出す", async () => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      fake.pullRequests.push({
+        number: 55,
+        open: true,
+        head: BRANCH,
+        base: "main",
+        title: "Old",
+        body: "old",
+      });
+
+      const result = await run(true);
+
+      expect(result).toMatchObject({
+        status: "dry_run",
+        prNumber: 55,
+        prCreated: false,
+      });
+      expect(pushCalls()).toEqual([]);
+      expect(fake.writes).toEqual([]);
+      expect(fake.pullRequests[0]).toMatchObject({ title: "Old", body: "old" });
+      expect(skippedActions()).toEqual(["push", "update_pull_request"]);
+    });
+
+    it("検査で止まる変更は、dry_run でも同じ結果になる", async () => {
+      fs.mkdirSync(path.join(paths.repoDir, "docs"));
+      commitFile(paths.repoDir, "docs/guide.md", "guide\n");
+      const result = await run(true);
+      expect(result.status).toBe("needs_approval");
+      expect(skippedActions()).toEqual([]);
+    });
+  });
+
+  describe("検査そのものを行えない場合", () => {
+    it("factory.yml が保存されていなければ、gitを実行せずに失敗する", async () => {
+      db.prepare("UPDATE repos SET factory_yml = NULL WHERE repo = ?").run(
+        REPO,
+      );
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      await expect(run(false)).rejects.toThrow("factory.yml が不正です");
+      expect(gitCalls).toEqual([]);
+      expectNothingWritten();
+    });
+
+    it("読めないパターンがあれば、gitを実行せずに失敗する", async () => {
+      setFactoryYml(VALID_FACTORY_YML.replace("- docs/**", "- docs/[a-z]*.md"));
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      await expect(run(false)).rejects.toThrow("パスのパターンを読めません");
+      expect(gitCalls).toEqual([]);
+      expectNothingWritten();
+    });
+
+    it("作業場所がなければ、失敗する", async () => {
+      fs.rmSync(paths.issueDir, { recursive: true });
+      await expect(run(false)).rejects.toThrow(
+        "作業場所がgitのリポジトリではありません",
+      );
+      expectNothingWritten();
+    });
+  });
+
+  it("トークンが、gitの設定、引数、ログ、DB、作業場所、ミラーに残らない", async () => {
+    commitFile(paths.repoDir, "feature.txt", "feature\n");
+    const result = await run(false);
+    expect(result.status).toBe("published");
+    await run(false);
+    db.pragma("wal_checkpoint(TRUNCATE)");
+
+    const encoded = Buffer.from(`x-access-token:${TOKEN}`).toString("base64");
+    for (const secret of [TOKEN, encoded]) {
+      const files = fs
+        .readdirSync(tmp, { withFileTypes: true, recursive: true })
+        .filter((entry) => entry.isFile())
+        .map((entry) => path.join(entry.parentPath, entry.name));
+      expect(files.length).toBeGreaterThan(10);
+      expect(
+        files.filter((file) => fs.readFileSync(file).includes(secret)),
+      ).toEqual([]);
+      expect(JSON.stringify(gitCalls)).not.toContain(secret);
+      expect(JSON.stringify(logs)).not.toContain(secret);
+      expect(JSON.stringify(result)).not.toContain(secret);
+      expect(JSON.stringify(fake.calls)).not.toContain(secret);
+    }
+    // ミラーにも作業場所にも、リモートを登録しない。
+    expect(plainGit(paths.mirrorDir, "remote")).toBe("");
+    expect(plainGit(paths.repoDir, "remote")).toBe("");
+  });
+});
