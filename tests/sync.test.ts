@@ -338,6 +338,62 @@ describe("同期", () => {
     expect(events().map((e) => e.type)).toEqual(["issue.created"]);
   });
 
+  it("agent:approved の有無を保存し、変わったら更新する", async () => {
+    fake.putIssue({ number: 1, labels: ["state:needs-info"], updatedAt: T1 });
+    await sync();
+    expect(issueRow(1)).toMatchObject({ approved: 0 });
+
+    fake.putIssue({
+      number: 1,
+      labels: ["state:needs-info", "agent:approved"],
+      updatedAt: T2,
+    });
+    await sync();
+    expect(issueRow(1)).toMatchObject({ approved: 1 });
+
+    fake.putIssue({ number: 1, labels: ["state:needs-info"], updatedAt: T3 });
+    await sync();
+    expect(issueRow(1)).toMatchObject({ approved: 0 });
+    // 状態は変わっていないので、イベントは増えない。
+    expect(events().map((e) => e.type)).toEqual(["issue.created"]);
+  });
+
+  it("新規のイシューに付いている agent:approved も保存する", async () => {
+    fake.putIssue({
+      number: 1,
+      labels: ["state:ready", "agent:approved"],
+      updatedAt: T1,
+    });
+    await sync();
+    expect(issueRow(1)).toMatchObject({ approved: 1 });
+  });
+
+  it("更新時刻が進んでいない内容からは、agent:approved を読まない", async () => {
+    fake.putIssue({
+      number: 1,
+      labels: ["state:needs-info", "agent:approved"],
+      updatedAt: T2,
+    });
+    await sync();
+    // 事務局がラベルを外し、写しも合わせた。
+    db.prepare("UPDATE issues SET approved = 0").run();
+
+    // GitHubが、外す前の内容をもう一度返す(全件の取り直しでも同じ)。
+    await sync();
+    await sync({ full: [REPO] });
+    expect(issueRow(1)).toMatchObject({ approved: 0 });
+
+    // ほかの項目が変わっていても、更新時刻が進んでいなければ読まない。
+    fake.putIssue({
+      number: 1,
+      title: "Renamed",
+      labels: ["state:needs-info", "agent:approved"],
+      updatedAt: T2,
+    });
+    await sync();
+    expect(issueRow(1)).toMatchObject({ title: "Renamed", approved: 0 });
+  });
+
   it("起票者が空のまま残っている行は、全件の取り直しで埋まる", async () => {
     fake.putIssue({ number: 1, author: "example-login", updatedAt: T1 });
     await sync();
