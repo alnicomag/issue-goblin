@@ -1,12 +1,12 @@
 import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
+import { ACCEPTED_COMMIT_AUTHORS } from "../scripts/commit-author-examples.ts";
 import {
   parseConfig,
   resolveToken,
   workerImageFor,
 } from "../src/office/config.ts";
-import { ACCEPTED_COMMIT_AUTHORS } from "./commit-author-examples.ts";
 
 const VALID = `
 dry_run: false

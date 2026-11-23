@@ -1,4 +1,9 @@
-/** 設定の検証を通る、コミットの作者の例。gitが、そのままコミットに書くもの。 */
+/**
+ * 設定の検証を通る、コミットの作者の例。gitが、そのままコミットに書くもの。
+ *
+ * 自動テスト(`tests/`)と、ワーカーのイメージのgitでの確認(`scripts/author-check.ts`)の
+ * 両方が、ここから読む。確認は事務局のコンテナの中で動くので、イメージに入る `scripts/` に置く。
+ */
 export const ACCEPTED_COMMIT_AUTHORS: readonly {
   readonly name: string;
   readonly email: string;
