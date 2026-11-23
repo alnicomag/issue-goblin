@@ -7,13 +7,21 @@
 # 実際のClaudeのトークンを使い、小さな呼び出しを3回行う(サブスクリプションの枠を少し使う)。
 # トークンは、起動係の環境変数のファイルから起動係にだけ渡す。GitHubのトークンには仮の値を使う。
 #
-# 使い方: scripts/check-worker.sh
+# 使い方: scripts/check-worker.sh [確認のスクリプト]
+#   確認のスクリプト     事務局のコンテナの中で実行する確認(既定: scripts/worker-check.ts)。
+#                        指示書の確認(scripts/check-prompts.sh)が、同じ環境の立て方を使う。
 #   CHECK_PROJECT        確認用の環境の名前(既定: factory-worker-check)
 #   CHECK_LAUNCHER_ENV   起動係の環境変数のファイル(既定: .env.launcher)
 #   CHECK_KEEP=1         終わっても環境を消さない(ログを読みたいとき)
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+
+CHECK_SCRIPT="${1:-scripts/worker-check.ts}"
+if [ ! -f "$CHECK_SCRIPT" ]; then
+  echo "確認のスクリプトがありません: $CHECK_SCRIPT" >&2
+  exit 1
+fi
 
 PROJECT="${CHECK_PROJECT:-factory-worker-check}"
 LAUNCHER_ENV="$(realpath "${CHECK_LAUNCHER_ENV:-.env.launcher}")"
@@ -102,7 +110,7 @@ result=0
 
 echo "# ワーカーを呼び出して調べる"
 echo
-compose run --rm --no-deps -T office node scripts/worker-check.ts 2>&1 || result=1
+compose run --rm --no-deps -T office node "$CHECK_SCRIPT" 2>&1 || result=1
 
 echo
 echo "# 実行の後の状態"
