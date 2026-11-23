@@ -1,5 +1,11 @@
 import fs from "node:fs";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createClaudeWorker } from "../src/agents/worker.ts";
+import {
+  LauncherAbortedError,
+  type WorkerLauncher,
+} from "../src/launcher/client.ts";
 import { FACTORY_MARKER } from "../src/office/github.ts";
 import {
   advanceRun,
@@ -354,6 +360,81 @@ describe("ステップの実行", () => {
         }
       });
     }
+
+    it("ワーカーの呼び出しを中断すると、再開したステップから、中断した呼び出しのログを辿れる", async () => {
+      const controller = new AbortController();
+      // 本物の呼び出しと、事務局の停止で依頼が中断される起動係。
+      const launcher: WorkerLauncher = {
+        run(request, options) {
+          if (request.argv[0] !== "claude") return h.launcher.run(request);
+          controller.abort();
+          expect(options?.signal?.aborted).toBe(true);
+          return Promise.reject(new LauncherAbortedError());
+        },
+      };
+      const runId = start();
+      expect(
+        await advanceRun(
+          {
+            ...h.runner,
+            launcher,
+            createWorker: (stoppable) =>
+              createClaudeWorker({
+                launcher: stoppable,
+                promptsDir: path.resolve("prompts"),
+                logsDir: h.runner.logsDir,
+                clock: h.clock,
+              }),
+          },
+          runId,
+          controller.signal,
+        ),
+      ).toEqual({ kind: "aborted" });
+
+      // 結果は記録せず、ログの場所だけを残す。
+      const stopped = listSteps(h.db, runId).at(-1);
+      expect(stopped).toMatchObject({
+        name: "plan",
+        status: "running",
+        output: null,
+        finishedAt: null,
+      });
+      const interrupted = stopped?.interruptedLogPaths ?? [];
+      expect(interrupted).toHaveLength(1);
+      const log = fs.readFileSync(interrupted[0] ?? "", "utf8");
+      expect(log).toContain('"status": "interrupted"');
+      expect(log).not.toContain("起動できませんでした");
+
+      // 事務局を起動し直した後。
+      expect(await advance(runId)).toEqual({ kind: "waiting_close" });
+      const plan = listSteps(h.db, runId).find((step) => step.name === "plan");
+      expect(plan?.status).toBe("done");
+      expect(plan?.interruptedLogPaths).toEqual(interrupted);
+      const row = h.db
+        .prepare(
+          "SELECT log_path FROM steps WHERE run_id = ? AND name = 'plan'",
+        )
+        .get(runId) as { log_path: string };
+      expect(row.log_path).toBe("/nonexistent/plan-1.log");
+      expect(row.log_path).not.toBe(interrupted[0]);
+    });
+
+    it("中断でない結果は、止められた後に返ってきても、中断のログとして残さない", async () => {
+      const controller = new AbortController();
+      h.worker.scripts.set("plan", () => {
+        controller.abort();
+        return undefined;
+      });
+      const runId = start();
+      expect(await advance(runId, controller.signal)).toEqual({
+        kind: "aborted",
+      });
+      expect(listSteps(h.db, runId).at(-1)).toMatchObject({
+        name: "plan",
+        status: "running",
+        interruptedLogPaths: [],
+      });
+    });
 
     it("implement の途中の状態が残った作業場所で再開すると、作業場所には手を付けずに、同じ指示書でやり直す", async () => {
       const { repoDir } = workspacePaths(h.dirs, REPO, ISSUE);

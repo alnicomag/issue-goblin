@@ -67,6 +67,27 @@ const StepRowSchema = z
     name: z.enum(STEP_NAMES),
     status: z.enum(STEP_STATUSES),
     output: z.string().nullable(),
+    interrupted_log_paths: z
+      .string()
+      .nullable()
+      .transform((text, context): string[] => {
+        if (text === null) return [];
+        let raw: unknown;
+        try {
+          raw = JSON.parse(text);
+        } catch {
+          raw = undefined;
+        }
+        const paths = z.array(z.string()).safeParse(raw);
+        if (!paths.success) {
+          context.addIssue({
+            code: "custom",
+            message: "パスの配列(JSON)ではありません",
+          });
+          return z.NEVER;
+        }
+        return paths.data;
+      }),
     started_at: z.string(),
     finished_at: z.string().nullable(),
   })
@@ -77,6 +98,8 @@ const StepRowSchema = z
     status: row.status,
     /** チェックポイントの内容(JSONの文字列)。 */
     output: row.output,
+    /** 事務局の停止で中断した呼び出しの、ログの場所(古い順)。 */
+    interruptedLogPaths: row.interrupted_log_paths,
     startedAt: row.started_at,
     finishedAt: row.finished_at,
   }));
@@ -85,7 +108,7 @@ export type Step = z.infer<typeof StepRowSchema>;
 const RUN_COLUMNS =
   "id, repo, issue_number, attempt, status, current_step, started_at, finished_at, next_retry_at";
 const STEP_COLUMNS =
-  "id, run_id, name, status, output, started_at, finished_at";
+  "id, run_id, name, status, output, interrupted_log_paths, started_at, finished_at";
 
 function parseRun(row: unknown): Run {
   const result = RunRowSchema.safeParse(row);
@@ -380,6 +403,33 @@ export function startStep(
       return started;
     })
     .immediate();
+}
+
+/**
+ * 中断した呼び出しのログの場所を、実行中のステップに足す。
+ *
+ * ステップの状態と結果は変えない(実行中のまま残り、次の起動でやり直す)。
+ * 同じ場所がすでにあれば、何もしない。
+ */
+export function recordInterruptedLog(
+  db: Db,
+  runId: number,
+  step: StepName,
+  logPath: string,
+): void {
+  db.transaction(() => {
+    const last = listSteps(db, runId).at(-1);
+    if (last === undefined || last.name !== step || last.status !== "running") {
+      throw new Error(
+        `実行 ${runId} のステップ ${step} は実行中ではありません。中断のログを記録できません`,
+      );
+    }
+    if (last.interruptedLogPaths.includes(logPath)) return;
+    db.prepare("UPDATE steps SET interrupted_log_paths = ? WHERE id = ?").run(
+      JSON.stringify([...last.interruptedLogPaths, logPath]),
+      last.id,
+    );
+  }).immediate();
 }
 
 export interface StepFinish {
