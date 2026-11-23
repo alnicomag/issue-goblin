@@ -408,7 +408,7 @@ export function buildPrBody(input: {
  * - `no_commits`: ワーカーのコミットがない(ブランチがない場合を含む)。
  * - `author_mismatch`: 作者かコミッターが `commit_author` と一致しないコミットがある。push していない。
  * - `empty_diff`: コミットはあるが、既定ブランチとの差分が空。
- * - `forbidden`: `paths.forbidden` に当たる変更がある。push していない。
+ * - `forbidden`: `paths.forbidden` に当たる変更がある。push しておらず、人間の対応待ち。
  * - `needs_approval`: `paths.protected` に当たる変更がある。push しておらず、人間の承認待ち。
  */
 export type PublishStatus =
@@ -423,8 +423,11 @@ export type PublishStatus =
 /** publish の結果。チェックポイント(`steps.output`)に残せる形にしてある。 */
 export interface PublishResult {
   readonly status: PublishStatus;
-  /** ステップの結果。`published` と `dry_run` だけが `done`。 */
-  readonly outcome: "done" | "failed";
+  /**
+   * ステップの結果。`published` と `dry_run` は `done`。
+   * `forbidden` と `needs_approval` は `held`(人間の対応待ち。再試行しない)。ほかは `failed`。
+   */
+  readonly outcome: "done" | "failed" | "held";
   /** 人間の承認があれば進められる状態か(`needs_approval` のときだけ true)。 */
   readonly awaitingApproval: boolean;
   readonly summary: string;
@@ -538,7 +541,10 @@ export async function publish(
   ): PublishResult => {
     const result: PublishResult = {
       status,
-      outcome: "failed",
+      outcome:
+        status === "forbidden" || status === "needs_approval"
+          ? "held"
+          : "failed",
       awaitingApproval: status === "needs_approval",
       summary,
       branch,

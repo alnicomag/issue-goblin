@@ -286,6 +286,34 @@ describe("実行とステップの記録", () => {
       });
     });
 
+    it("publish が人間の対応待ちで止まると、実行が held で終わり、試行に数えず、待機も付かない", () => {
+      const run = startRun(db, clock, target);
+      for (const step of [
+        "prepare",
+        "plan",
+        "implement",
+        "verify",
+        "review",
+      ] as const) {
+        record(run.id, step);
+      }
+      expect(
+        record(run.id, "publish", "held", { status: "needs_approval" }),
+      ).toEqual({ kind: "finish", status: "held" });
+      expect(getRun(db, run.id)).toMatchObject({
+        status: "held",
+        nextRetryAt: null,
+      });
+      expect(listSteps(db, run.id).at(-1)).toMatchObject({
+        name: "publish",
+        status: "held",
+      });
+      expect(countFailedRuns(db, target.repo, target.issueNumber)).toBe(0);
+      expect(nextAttempt(db, target.repo, target.issueNumber)).toBe(1);
+      expect(retryNotBefore(db, target.repo, target.issueNumber)).toBeNull();
+      expect(findResumableRuns(db)).toEqual([]);
+    });
+
     it("差し戻しは implement に戻り、3回目で実行が失敗になる", () => {
       const run = startRun(db, clock, target);
       record(run.id, "prepare");

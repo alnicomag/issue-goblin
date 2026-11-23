@@ -289,6 +289,48 @@ describe("ステップの実行", () => {
     expect(h.fake.writes).toEqual([]);
   });
 
+  it.each([
+    {
+      file: "docs/guide.md",
+      status: "needs_approval",
+      hits: { protected: [{ path: "docs/guide.md", pattern: "docs/**" }] },
+    },
+    {
+      file: "generated/out.txt",
+      status: "forbidden",
+      hits: {
+        forbidden: [{ path: "generated/out.txt", pattern: "generated/**" }],
+      },
+    },
+  ])(
+    "$status で止まると、実行は held で終わり、当たったパスが記録に残る",
+    async ({ file, status, hits }) => {
+      let head = "";
+      h.worker.scripts.set("implement", (call) => {
+        head = h.worker.commitPath(call.repo, call.issue, file);
+        return { status: "done", summary: "touched a guarded path" };
+      });
+      const runId = start();
+      expect(await advance(runId)).toEqual({
+        kind: "finished",
+        status: "held",
+      });
+      expect(stepsOf(runId).at(-1)).toBe("publish:held");
+      expect(outputOf(runId, "publish")).toMatchObject({
+        status,
+        headCommit: head,
+        forbidden: [],
+        protected: [],
+        ...hits,
+      });
+      expect(getRun(h.db, runId)).toMatchObject({
+        status: "held",
+        nextRetryAt: null,
+      });
+      expect(h.fake.writes).toEqual([]);
+    },
+  );
+
   it("dry_run なら、publish は書き込まずに終わる", async () => {
     h.dryRun = true;
     const runId = start();

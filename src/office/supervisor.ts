@@ -81,6 +81,93 @@ export function questionComment(runId: number, question: string): string {
   ].join("\n");
 }
 
+/** 人間の対応待ちのコメントに付ける目印。同じ実行の知らせを、重ねて書かないために使う。 */
+export function heldMarker(runId: number): string {
+  return `<!-- factory:held run=${runId} -->`;
+}
+
+/** 人間の対応待ちのコメントに挙げるパスの数の上限。残りは件数だけを書く。 */
+export const HELD_COMMENT_PATH_LIMIT = 50;
+
+const PathHitSchema = z.object({ path: z.string(), pattern: z.string() });
+
+/** publish が人間の対応待ちで止まったときの、チェックポイントの内容。 */
+const HeldOutputSchema = z.object({
+  status: z.enum(["needs_approval", "forbidden"]),
+  headCommit: z.string().nullable(),
+  forbidden: z.array(PathHitSchema),
+  protected: z.array(PathHitSchema),
+});
+export type HeldOutput = z.infer<typeof HeldOutputSchema>;
+
+/**
+ * パスやパターンを、コメントのコードの中に書ける形にする。
+ *
+ * パスはワーカーが決められる文字列なので、コードの外に抜け出す書き方(バッククォート、改行)と、
+ * 目印に見える書き方(HTMLコメントの始まり)を崩す。コードの中なので、メンションは通知にならない。
+ */
+function inlineCode(text: string): string {
+  const safe = text
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: 制御文字を空白に置き換える
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replaceAll("`", "'")
+    .replaceAll("<!--", "＜!--");
+  return `\`${safe}\``;
+}
+
+const HELD_EXPLANATIONS = {
+  needs_approval: {
+    what: "人間の承認が要るパス(`paths.protected`)に触れる変更があります。",
+    next: "承認を受け取ってPRにする仕組みは、まだありません。保護対象のパスを避ける方針をコメントするか、人間が作業を引き取ってください。",
+  },
+  forbidden: {
+    what: "ワーカーが変更してはいけないパス(`paths.forbidden`)に触れる変更があります。",
+    next: "禁止のパスを避ける方針をコメントするか、人間が作業を引き取ってください。",
+  },
+} as const;
+
+/**
+ * 人間の対応待ちのコメントの本文。純粋関数で、同じ入力からは同じ本文になる。
+ * `output` が null なら、記録から内容を読めなかったことを書く。
+ */
+export function heldComment(runId: number, output: HeldOutput | null): string {
+  const lines = [
+    "PRを作る前の検査で止まりました。push もPRの作成もしていません。人間の対応を待ちます。自動では再試行しません。",
+    "",
+  ];
+  if (output === null) {
+    lines.push(
+      "(止まった理由を記録から読めませんでした。実行のログを確認してください)",
+    );
+  } else {
+    const explanation = HELD_EXPLANATIONS[output.status];
+    const hits =
+      output.status === "forbidden" ? output.forbidden : output.protected;
+    lines.push(
+      `- 結果: \`${output.status}\``,
+      `- 理由: ${explanation.what}`,
+      `- コミット: ${output.headCommit === null ? "(なし)" : inlineCode(output.headCommit)}`,
+      "",
+      `当たったパス(${hits.length} 件):`,
+      "",
+    );
+    for (const hit of hits.slice(0, HELD_COMMENT_PATH_LIMIT)) {
+      lines.push(
+        `- ${inlineCode(hit.path)}(パターン: ${inlineCode(hit.pattern)})`,
+      );
+    }
+    const rest = hits.length - HELD_COMMENT_PATH_LIMIT;
+    if (rest > 0) lines.push(`- (ほか ${rest} 件)`);
+    lines.push(
+      "",
+      explanation.next,
+      "イシューへのコメントは、次の実行のワーカーに渡ります。`state:ready` に戻すと、新しい実行として着手します。変更が同じなら、同じところで止まります。",
+    );
+  }
+  lines.push("", heldMarker(runId));
+  return lines.join("\n");
+}
+
 const PrioritySchema = z.enum(["p0", "p1", "p2", "p3"]).nullable();
 
 interface ReadyRow {
@@ -164,9 +251,26 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     }
   }
 
+  /**
+   * 目印つきのコメントを、まだなければ書く。
+   * コメントした後、状態を変える前に止まった場合に、同じコメントを重ねて書かないためである。
+   */
+  async function commentOnce(
+    run: Run,
+    marker: string,
+    body: string,
+  ): Promise<void> {
+    const write = runner.writeFor(run.repo);
+    const comments = await write.api.listCommentsOnIssue(
+      run.repo,
+      run.issueNumber,
+    );
+    if (comments.some((comment) => comment.body.includes(marker))) return;
+    await addIssueComment(write, run.repo, run.issueNumber, body);
+  }
+
   /** 質問をコメントして、`needs-info` に進める。 */
   async function ask(run: Run): Promise<void> {
-    const write = runner.writeFor(run.repo);
     const asked = listSteps(db, run.id).findLast(
       (step) => step.status === "question",
     );
@@ -178,21 +282,38 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         ? summary
         : "(質問の内容を記録から読めませんでした。実行のログを確認してください)";
 
-    // コメントした後、状態を変える前に止まった場合に、同じ質問を重ねて書かない。
-    const marker = questionMarker(run.id);
-    const comments = await write.api.listCommentsOnIssue(
-      run.repo,
-      run.issueNumber,
+    await commentOnce(
+      run,
+      questionMarker(run.id),
+      questionComment(run.id, question),
     );
-    if (!comments.some((comment) => comment.body.includes(marker))) {
-      await addIssueComment(
-        write,
-        run.repo,
-        run.issueNumber,
-        questionComment(run.id, question),
-      );
-    }
     await transition(run, "needs-info", "ワーカーが質問を返しました");
+  }
+
+  /** publish が止まった理由をコメントして、`needs-info` に進める。 */
+  async function hold(run: Run): Promise<void> {
+    const stopped = listSteps(db, run.id).findLast(
+      (step) => step.name === "publish" && step.status === "held",
+    );
+    const parsed = HeldOutputSchema.safeParse(
+      stopped?.output == null ? null : JSON.parse(stopped.output),
+    );
+    if (!parsed.success) {
+      logger.warn("run.held_record_unreadable", {
+        ...fieldsOf(run),
+        ...errorFields(parsed.error),
+      });
+    }
+    await commentOnce(
+      run,
+      heldMarker(run.id),
+      heldComment(run.id, parsed.success ? parsed.data : null),
+    );
+    await transition(
+      run,
+      "needs-info",
+      "publish が人間の対応待ちで止まりました",
+    );
   }
 
   async function perform(
@@ -226,6 +347,9 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         return;
       case "ask":
         await ask(run);
+        return;
+      case "hold":
+        await hold(run);
         return;
       case "retry":
         await transition(run, "ready", "失敗しました。待機後に再試行します");

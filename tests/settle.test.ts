@@ -16,7 +16,9 @@ const running = (
   nextStep: NonNullable<SettleInput["run"]>["nextStep"],
   started = true,
 ) => ({ status: "running" as const, nextStep, started });
-const finished = (status: "done" | "question" | "failed" | "cancelled") => ({
+const finished = (
+  status: "done" | "question" | "failed" | "held" | "cancelled",
+) => ({
   status,
   nextStep: null,
   started: true,
@@ -103,6 +105,11 @@ describe("記録から決まる後処理", () => {
       expect(decide({ run: finished("question") })).toBe("ask");
     });
 
+    it("人間の対応待ちで終わっていれば、理由を知らせて待つ。試行の数には左右されない", () => {
+      expect(decide({ run: finished("held") })).toBe("hold");
+      expect(decide({ run: finished("held"), failedCount: 3 })).toBe("hold");
+    });
+
     it("失敗で、試行に余裕があれば、ready に戻す", () => {
       expect(decide({ run: finished("failed"), failedCount: 1 })).toBe("retry");
       expect(decide({ run: finished("failed"), failedCount: 2 })).toBe("retry");
@@ -133,7 +140,7 @@ describe("記録から決まる後処理", () => {
 
     it("in-progress でなければ、何もしない(2回目以降は変わらない)", () => {
       for (const issueState of ["ready", "needs-info", "failed", "in-review"]) {
-        for (const status of ["question", "failed"] as const) {
+        for (const status of ["question", "failed", "held"] as const) {
           expect(
             decide({ issueState, run: finished(status), failedCount: 3 }),
             `${issueState} ${status}`,

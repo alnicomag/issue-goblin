@@ -94,6 +94,18 @@ export class FakeWorker implements WorkerInvoker {
     return unconfiguredGit(repoDir, "rev-parse", "HEAD");
   }
 
+  /** 作業場所に、パス `file` のファイルを足すコミットを作る。 */
+  commitPath(repo: string, issue: number, file: string): string {
+    const { repoDir } = workspacePaths(this.dirs, repo, issue);
+    const target = path.join(repoDir, file);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    this.commits += 1;
+    fs.writeFileSync(target, `content ${this.commits} of ${file}\n`);
+    unconfiguredGit(repoDir, "add", "--", file);
+    unconfiguredGit(repoDir, "commit", "--quiet", "-m", `add ${file}`);
+    return unconfiguredGit(repoDir, "rev-parse", "HEAD");
+  }
+
   private defaultAnswer(call: WorkerCall): WorkerAnswer {
     if (call.prompt === "implement") {
       this.commit(call.repo, call.issue);

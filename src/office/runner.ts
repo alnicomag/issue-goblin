@@ -521,6 +521,9 @@ async function executeStep(
           status: result.status,
           awaitingApproval: result.awaitingApproval,
           headCommit: result.headCommit,
+          // 人間の対応待ちで止まったとき、イシューへのコメントに載せる。
+          forbidden: result.forbidden,
+          protected: result.protected,
           prNumber: result.prNumber,
           prUrl: result.prUrl,
         },

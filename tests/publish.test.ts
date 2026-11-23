@@ -868,7 +868,7 @@ describe("publish", () => {
       const result = await run(false);
       expect(result).toMatchObject({
         status: "forbidden",
-        outcome: "failed",
+        outcome: "held",
         awaitingApproval: false,
         forbidden: [{ path: "generated/out.txt", pattern: "generated/**" }],
         protected: [],
@@ -1093,7 +1093,7 @@ describe("publish", () => {
     const result = await run(false);
     expect(result).toMatchObject({
       status: "needs_approval",
-      outcome: "failed",
+      outcome: "held",
       awaitingApproval: true,
       forbidden: [],
       protected: [{ path: "docs/guide.md", pattern: "docs/**" }],

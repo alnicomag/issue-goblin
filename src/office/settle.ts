@@ -35,6 +35,7 @@ export interface SettleInput {
  * - `cancel`: 実行を取り消す。人間が状態を変えたので、GitHubに合わせる。
  * - `to_review`: PRができたので、`in-review` に進める。
  * - `ask`: 質問をコメントして、`needs-info` に進める。
+ * - `hold`: publish が人間の対応待ちで止まったので、理由をコメントして、`needs-info` に進める。
  * - `retry`: 失敗したが試行に余裕があるので、`ready` に戻す。
  * - `give_up`: 試行の上限に達したので、`failed` に進める。
  */
@@ -45,6 +46,7 @@ export type SettleAction =
   | "cancel"
   | "to_review"
   | "ask"
+  | "hold"
   | "retry"
   | "give_up";
 
@@ -79,6 +81,8 @@ export function decideSettlement(input: SettleInput): SettleAction {
         throw new Error(`試行の上限が不正です: ${String(input.maxAttempts)}`);
       }
       return input.failedCount >= input.maxAttempts ? "give_up" : "retry";
+    case "held":
+      return "hold";
     case "done":
     case "cancelled":
       return "none";
