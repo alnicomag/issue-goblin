@@ -39,10 +39,15 @@ export interface PathCheck {
 
 const UNSUPPORTED_CHARS = /[[\]{}\\]/;
 
+/** パターンが、対応していない書き方であることを表すエラー。 */
+class GlobPatternError extends Error {
+  override readonly name = "GlobPatternError";
+}
+
 /** パターンを区切りで分ける。対応していない書き方なら失敗する。 */
 function patternSegments(pattern: string): string[] {
   const fail = (reason: string): never => {
-    throw new Error(
+    throw new GlobPatternError(
       `パスのパターンを読めません: ${JSON.stringify(pattern)}(${reason})`,
     );
   };
@@ -110,6 +115,23 @@ function matchSegments(
   const part = parts[n];
   if (part === undefined || !matchSegment(segment, part)) return false;
   return matchSegments(pattern, p + 1, parts, n + 1);
+}
+
+/**
+ * パターンを読めるかを確かめる。読めれば `null`、読めなければ、その理由のメッセージを返す。
+ *
+ * 照合(`matchGlob`、`checkPaths`)と同じ読み方を使うので、ここで読めるパターンは照合でも読め、
+ * ここで読めないパターンは、照合でも同じメッセージで失敗する。
+ * `factory.yml` の検証は、これを使って、着手の前に読めないパターンを見つける。
+ */
+export function globPatternError(pattern: string): string | null {
+  try {
+    patternSegments(pattern);
+    return null;
+  } catch (error) {
+    if (error instanceof GlobPatternError) return error.message;
+    throw error;
+  }
 }
 
 /**

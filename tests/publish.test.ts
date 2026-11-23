@@ -951,7 +951,16 @@ describe("publish", () => {
     });
 
     it("読めないパターンがあれば、gitを実行せずに失敗する", async () => {
-      setFactoryYml(VALID_FACTORY_YML.replace("- docs/**", "- docs/[a-z]*.md"));
+      // 同期の検証は読めないパターンを保存しないので、検証が入る前に保存された内容を模して、直接書く。
+      const parsed = parseFactoryYml(VALID_FACTORY_YML);
+      if (!parsed.ok) throw new Error(parsed.errors);
+      db.prepare("UPDATE repos SET factory_yml = ? WHERE repo = ?").run(
+        JSON.stringify({
+          ...parsed.value,
+          paths: { protected: ["docs/[a-z]*.md"], forbidden: [] },
+        }),
+        REPO,
+      );
       commitFile(paths.repoDir, "feature.txt", "feature\n");
       await expect(run(false)).rejects.toThrow("パスのパターンを読めません");
       expect(gitCalls).toEqual([]);

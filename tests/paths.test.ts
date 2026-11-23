@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { checkPaths, matchGlob } from "../src/office/paths.ts";
+import {
+  checkPaths,
+  globPatternError,
+  matchGlob,
+} from "../src/office/paths.ts";
 
 describe("パスのパターン(matchGlob)", () => {
   const cases: [pattern: string, path: string, expected: boolean][] = [
@@ -76,7 +80,7 @@ describe("パスのパターン(matchGlob)", () => {
     expect(matchGlob(pattern, path)).toBe(expected);
   });
 
-  it.each([
+  const unsupported: [pattern: string, reason: string][] = [
     ["", "空"],
     ["/abs/path", "相対パス"],
     ["!docs/**", "否定"],
@@ -88,11 +92,39 @@ describe("パスのパターン(matchGlob)", () => {
     ["docs//a.md", "区切り"],
     ["../outside", ". と .."],
     ["docs/./a.md", ". と .."],
-  ])("対応していない書き方 %j は、失敗する", (pattern, reason) => {
-    expect(() => matchGlob(pattern, "docs/a.md")).toThrow(
-      "パスのパターンを読めません",
+  ];
+
+  it.each(unsupported)(
+    "対応していない書き方 %j は、失敗する",
+    (pattern, reason) => {
+      expect(() => matchGlob(pattern, "docs/a.md")).toThrow(
+        "パスのパターンを読めません",
+      );
+      expect(() => matchGlob(pattern, "docs/a.md")).toThrow(reason);
+    },
+  );
+
+  describe("読めるかの判定(globPatternError)", () => {
+    it.each(cases)("%s は読める", (pattern) => {
+      expect(globPatternError(pattern)).toBeNull();
+    });
+
+    it.each(unsupported)(
+      "%j は、照合と同じ理由で読めない",
+      (pattern, reason) => {
+        const message = globPatternError(pattern);
+        expect(message).toContain("パスのパターンを読めません");
+        expect(message).toContain(JSON.stringify(pattern));
+        expect(message).toContain(reason);
+        // 照合が投げるメッセージと、同じものを返す。
+        expect(() => matchGlob(pattern, "docs/a.md")).toThrow(
+          message as string,
+        );
+        expect(() =>
+          checkPaths([], { forbidden: [pattern], protected: [] }),
+        ).toThrow(message as string);
+      },
     );
-    expect(() => matchGlob(pattern, "docs/a.md")).toThrow(reason);
   });
 });
 
