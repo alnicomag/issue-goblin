@@ -15,12 +15,7 @@
 import { z } from "zod";
 import { isoNow } from "./clock.ts";
 import { addIssueComment } from "./github.ts";
-import {
-  type IntakeIssue,
-  type IntakeRepo,
-  planIntake,
-  utcDayStart,
-} from "./intake.ts";
+import { type IntakeIssue, type IntakeRepo, planIntake } from "./intake.ts";
 import type { RepoLocks } from "./locks.ts";
 import { errorFields } from "./log.ts";
 import { readStoredFactoryYml } from "./product.ts";
@@ -28,7 +23,7 @@ import { advanceRun, type RunnerDeps } from "./runner.ts";
 import {
   cancelRun,
   countFailedRuns,
-  countRunsStartedSince,
+  countRunsStartedToday,
   findResumableRuns,
   latestRun,
   listSteps,
@@ -383,7 +378,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       issues,
       repos: intakeRepos,
       dailyLimit: deps.dailyRunLimit,
-      startedToday: countRunsStartedSince(db, utcDayStart(now)),
+      startedToday: countRunsStartedToday(db, now),
       now,
     });
     if (plan.skipped.length > 0) {

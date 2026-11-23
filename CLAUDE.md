@@ -42,7 +42,7 @@ pnpm install --frozen-lockfile
 pnpm run typecheck
 pnpm run lint
 pnpm test
-pnpm run status       # 状態別のイシュー数、未処理のイベント数、最終同期時刻
+pnpm run status       # 状態別のイシュー数、未処理のイベント数、最終同期時刻、進行中の実行、当日の実行数
 scripts/check-isolation.sh   # ワーカーの隔離を、確認用の環境を立てて確かめる(Dockerが要る)
 ```
 
