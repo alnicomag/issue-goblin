@@ -1,3 +1,5 @@
+import fs from "node:fs";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FACTORY_MARKER } from "../src/office/github.ts";
 import {
@@ -14,8 +16,10 @@ import {
   questionMarker,
   type Supervisor,
 } from "../src/office/supervisor.ts";
+import { workspacePaths } from "../src/office/workspace.ts";
 import { createHarness, type Harness, REPO } from "./factory-harness.ts";
 import { VALID_FACTORY_YML } from "./fake-github.ts";
+import { plainGit, unconfiguredGit } from "./git-fixtures.ts";
 
 interface RunRow {
   id: number;
@@ -1333,5 +1337,353 @@ describe("実行の管理", () => {
       ]);
       expect(h.labels(1)).toEqual(["state:in-progress"]);
     });
+  });
+
+  describe("作業場所の後片付け", () => {
+    const question = { status: "question", summary: "どちらですか" } as const;
+    const paths = (issue: number) => workspacePaths(h.dirs, REPO, issue);
+    const exists = (issue: number) => fs.existsSync(paths(issue).issueDir);
+    /** 作業場所の、作業用のブランチの先頭。 */
+    const branchHead = (issue: number) =>
+      unconfiguredGit(
+        paths(issue).repoDir,
+        "rev-parse",
+        `agent/issue-${issue}`,
+      );
+    /** 作業場所のcloneに、そのコミットがあるか。 */
+    const hasCommit = (issue: number, commit: string) => {
+      try {
+        unconfiguredGit(paths(issue).repoDir, "cat-file", "-e", commit);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    /** 試行の上限まで失敗させて、failed にする。作業場所には、コミットを1つ残す。 */
+    const failToLimit = async (): Promise<string> => {
+      h.worker.answer("plan", fail, fail, fail);
+      h.putIssue(1);
+      for (let i = 0; i < 3; i += 1) {
+        await tick();
+        await tick();
+        wait(31);
+      }
+      expect(h.labels(1)).toEqual(["state:failed"]);
+      return h.worker.commit(REPO, 1);
+    };
+    /** 次の plan が呼ばれた時点の、作業用のブランチの先頭を控える。 */
+    const headAtNextPlan = () => {
+      const seen: string[] = [];
+      h.worker.scripts.set("plan", (call) => {
+        seen.push(branchHead(call.issue));
+        return undefined;
+      });
+      return seen;
+    };
+
+    describe("クローズされたイシュー", () => {
+      it("質問で終わったままクローズされたら、作業場所が消える", async () => {
+        h.worker.answer("plan", question);
+        h.putIssue(1);
+        await tick();
+        await tick();
+        expect(h.state(1)).toBe("needs-info");
+        expect(exists(1)).toBe(true);
+
+        h.putIssue(1, { labels: ["state:needs-info"], open: false });
+        await tick();
+
+        expect(exists(1)).toBe(false);
+        expect(runs()).toMatchObject([{ status: "question" }]);
+        expect(logged("workspace.removed").map((line) => line.fields)).toEqual([
+          { repo: REPO, issue: 1, reason: "closed" },
+        ]);
+      });
+
+      it("試行の上限に達して failed になったままクローズされたら、作業場所が消える", async () => {
+        await failToLimit();
+        expect(exists(1)).toBe(true);
+
+        h.putIssue(1, { labels: ["state:failed"], open: false });
+        await tick();
+
+        expect(exists(1)).toBe(false);
+      });
+
+      it("実行中にクローズされたら、実行を止め終えてから消す", async () => {
+        const hold = gate();
+        h.worker.scripts.set("implement", async () => {
+          await hold.wait();
+          return undefined;
+        });
+        h.putIssue(1);
+        await tickNoWait();
+        await hold.entered;
+
+        h.putIssue(1, { labels: ["state:in-progress"], open: false });
+        await tickNoWait();
+        // 取り消したが、ワーカーはまだ止まっていない。
+        expect(runs()).toMatchObject([{ status: "cancelled" }]);
+        expect(exists(1)).toBe(true);
+        await tickNoWait();
+        expect(exists(1)).toBe(true);
+
+        hold.open();
+        await supervisor.idle();
+        await tick();
+        expect(exists(1)).toBe(false);
+        expect(h.fake.pullRequests).toEqual([]);
+      });
+    });
+
+    describe("failed から戻されたイシュー", () => {
+      it("人間が戻した後の実行は、前の実行のコミットを含まない作業場所から始まる", async () => {
+        const old = await failToLimit();
+        expect(branchHead(1)).toBe(old);
+        const seen = headAtNextPlan();
+
+        h.putIssue(1, { labels: ["state:ready"] });
+        await tick();
+
+        expect(seen).toEqual([plainGit(h.source, "rev-parse", "HEAD")]);
+        expect(hasCommit(1, old)).toBe(false);
+        expect(runs().at(-1)).toMatchObject({ attempt: 1 });
+        expect(logged("workspace.removed").map((line) => line.fields)).toEqual([
+          { repo: REPO, issue: 1, reason: "returned_from_failed" },
+        ]);
+      });
+
+      it("戻した先が ready でなくても消す。戻した後の実行の作業場所は、消さない", async () => {
+        await failToLimit();
+        h.putIssue(1, { labels: ["state:triage"] });
+        await tick();
+        expect(exists(1)).toBe(false);
+
+        // 戻した後の実行が質問で終わる。その作業場所は、何度回しても残る。
+        h.worker.answer("plan", question);
+        h.putIssue(1, { labels: ["state:ready"] });
+        await tick();
+        await tick();
+        expect(h.state(1)).toBe("needs-info");
+        expect(exists(1)).toBe(true);
+        await tick();
+        await tick();
+        expect(exists(1)).toBe(true);
+        expect(logged("workspace.removed")).toHaveLength(1);
+      });
+
+      it("failed のままなら、残す", async () => {
+        const old = await failToLimit();
+        await tick();
+        await tick();
+        expect(branchHead(1)).toBe(old);
+      });
+    });
+
+    describe("残す場合", () => {
+      it("失敗の後の再試行では、作業場所が残り、前の実行のコミットから始まる", async () => {
+        h.worker.answer("plan", fail);
+        h.putIssue(1);
+        await tick();
+        await tick();
+        expect(h.state(1)).toBe("ready");
+        const old = h.worker.commit(REPO, 1);
+        await tick();
+        expect(branchHead(1)).toBe(old);
+
+        const seen = headAtNextPlan();
+        wait(6);
+        await tick();
+        expect(runs()).toMatchObject([
+          { attempt: 1, status: "failed" },
+          { attempt: 2 },
+        ]);
+        expect(seen).toEqual([old]);
+        expect(logged("workspace.removed")).toEqual([]);
+      });
+
+      it("実行中の実行があるイシューの作業場所は、消さない", async () => {
+        const hold = gate();
+        h.worker.scripts.set("implement", async () => {
+          await hold.wait();
+          return undefined;
+        });
+        h.putIssue(1);
+        await tickNoWait();
+        await hold.entered;
+        await tickNoWait();
+        await tickNoWait();
+        expect(runs()).toMatchObject([{ status: "running" }]);
+        expect(exists(1)).toBe(true);
+
+        // PRを作って、クローズを待っている間も残す。
+        hold.open();
+        await supervisor.idle();
+        await tick();
+        await tick();
+        expect(h.state(1)).toBe("in-review");
+        expect(runs()).toMatchObject([{ status: "running" }]);
+        expect(exists(1)).toBe(true);
+        expect(logged("workspace.removed")).toEqual([]);
+      });
+
+      it("起動し直した後も、実行中の実行があるイシューの作業場所は、消さない", async () => {
+        const hold = gate();
+        h.worker.scripts.set("implement", async () => {
+          await hold.wait();
+          return undefined;
+        });
+        h.putIssue(1);
+        await tickNoWait();
+        await hold.entered;
+        const stopping = supervisor.stop(1000);
+        hold.open();
+        await stopping;
+
+        // dry_run でなければ再開する。再開の前でも、記録が実行中なら残す。
+        h.dryRun = true;
+        supervisor = h.newSupervisor();
+        h.dryRun = false;
+        await tick();
+        expect(runs()).toMatchObject([{ status: "running" }]);
+        expect(exists(1)).toBe(true);
+      });
+
+      it("質問で終わった後と、人間の対応待ちの後は、残す", async () => {
+        h.worker.answer("plan", question);
+        h.putIssue(1);
+        await tick();
+        await tick();
+        await tick();
+        expect(h.state(1)).toBe("needs-info");
+        expect(exists(1)).toBe(true);
+      });
+
+      it("人間のラベル変更で取り消された後は、残す", async () => {
+        const hold = gate();
+        h.worker.scripts.set("implement", async () => {
+          await hold.wait();
+          return undefined;
+        });
+        h.putIssue(1);
+        await tickNoWait();
+        await hold.entered;
+        const old = h.worker.commit(REPO, 1);
+
+        h.putIssue(1, { labels: ["state:triage"] });
+        await tickNoWait();
+        hold.open();
+        await supervisor.idle();
+        await tick();
+        await tick();
+
+        expect(runs()).toMatchObject([{ status: "cancelled" }]);
+        expect(exists(1)).toBe(true);
+        expect(hasCommit(1, old)).toBe(true);
+        expect(logged("workspace.removed")).toEqual([]);
+      });
+
+      it("DBにないイシューの作業場所と、事務局が作る名前でないものには、触れない", async () => {
+        h.putIssue(1);
+        await tick();
+        const parent = path.dirname(paths(1).issueDir);
+        fs.mkdirSync(path.join(parent, "issue-99"));
+        fs.mkdirSync(path.join(parent, "notes"));
+
+        await tick();
+        await tick();
+
+        expect(fs.readdirSync(parent).sort()).toEqual([
+          "issue-1",
+          "issue-99",
+          "notes",
+        ]);
+      });
+    });
+
+    it("2回行っても、結果が変わらない。ミラーと、ほかのイシューの作業場所には触れない", async () => {
+      h.worker.answer("plan", question, question);
+      h.putIssue(1);
+      h.putIssue(2);
+      for (let i = 0; i < 4; i += 1) await tick();
+      expect([h.state(1), h.state(2)]).toEqual(["needs-info", "needs-info"]);
+      const other = branchHead(2);
+      /** ミラーにある、すべての参照。 */
+      const mirrorHead = () => plainGit(paths(1).mirrorDir, "for-each-ref");
+      const mirror = mirrorHead();
+
+      h.putIssue(1, { labels: ["state:needs-info"], open: false });
+      await tick();
+      const after = {
+        runs: runs(),
+        work: fs.readdirSync(path.dirname(paths(1).issueDir)),
+      };
+      expect(after.work).toEqual(["issue-2"]);
+
+      await tick();
+      await tick();
+
+      expect({
+        runs: runs(),
+        work: fs.readdirSync(path.dirname(paths(1).issueDir)),
+      }).toEqual(after);
+      expect(branchHead(2)).toBe(other);
+      expect(mirror).not.toBe("");
+      expect(mirrorHead()).toBe(mirror);
+      expect(logged("workspace.removed")).toHaveLength(1);
+    });
+
+    it("dry_run の間は、消さない。dry_run でなくなったら消す", async () => {
+      h.worker.answer("plan", question);
+      h.putIssue(1);
+      await tick();
+      await tick();
+      await supervisor.stop(1000);
+
+      h.dryRun = true;
+      supervisor = h.newSupervisor();
+      h.putIssue(1, { labels: ["state:needs-info"], open: false });
+      await tick();
+      await tick();
+      expect(exists(1)).toBe(true);
+
+      await supervisor.stop(1000);
+      h.dryRun = false;
+      supervisor = h.newSupervisor();
+      await tick();
+      expect(exists(1)).toBe(false);
+    });
+
+    // 管理者は、書き込めないディレクトリからも消せるので、失敗を作れない。
+    it.skipIf(process.getuid?.() === 0)(
+      "消すのに失敗したイシューには、そのポーリングでは着手しない。ほかのイシューは進む",
+      async () => {
+        await failToLimit();
+        const seen = headAtNextPlan();
+        const parent = path.dirname(paths(1).issueDir);
+        h.putIssue(1, { labels: ["state:ready"] });
+        h.putIssue(2);
+        fs.chmodSync(parent, 0o555);
+        try {
+          await tick();
+        } finally {
+          fs.chmodSync(parent, 0o755);
+        }
+        expect(exists(1)).toBe(true);
+        expect(runs().filter((run) => run.issue_number === 1)).toHaveLength(3);
+        expect(
+          logged("workspace.sweep_failed").map((line) => line.fields),
+        ).toMatchObject([{ repo: REPO, issue: 1 }]);
+        expect(h.state(1)).toBe("ready");
+
+        // 次のポーリングで消して、着手する。
+        await tick();
+        await tick();
+        await tick();
+        const first = runs().filter((run) => run.issue_number === 1);
+        expect(first).toHaveLength(4);
+        expect(seen[0]).toBe(plainGit(h.source, "rev-parse", "HEAD"));
+      },
+    );
   });
 });

@@ -8,6 +8,7 @@ import {
   branchFor,
   cleanupWorkspace,
   githubSourceUrl,
+  listWorkspaceIssues,
   prepareWorkspace,
   type WorkspaceDirs,
   workspacePaths,
@@ -435,6 +436,72 @@ describe("作業場所", () => {
       expect(unconfiguredGit(repoDir, "config", "--local", "user.name")).toBe(
         AUTHOR.name,
       );
+    });
+  });
+
+  describe("作業場所の一覧", () => {
+    it("作業場所のあるイシューの番号を、若い順に返す", async () => {
+      await prepare(10);
+      await prepare(2);
+      await prepare(1);
+
+      expect(listWorkspaceIssues(dirs, REPO)).toEqual([1, 2, 10]);
+    });
+
+    it("リポジトリの置き場所がまだなければ、空を返す", () => {
+      expect(listWorkspaceIssues(dirs, "owner/never")).toEqual([]);
+    });
+
+    it("事務局が作る名前でないものは、無視する", async () => {
+      const { issueDir } = await prepare(1);
+      const parent = path.dirname(issueDir);
+      for (const name of [
+        "issue-0",
+        "issue-01",
+        "issue-x",
+        "issue-2.bak",
+        "other",
+      ]) {
+        fs.mkdirSync(path.join(parent, name));
+      }
+
+      expect(listWorkspaceIssues(dirs, REPO)).toEqual([1]);
+    });
+
+    it("ほかのリポジトリの作業場所は、含めない", async () => {
+      await prepare(1);
+      fs.mkdirSync(path.join(dirs.workDir, "owner", "other", "issue-7"), {
+        recursive: true,
+      });
+
+      expect(listWorkspaceIssues(dirs, REPO)).toEqual([1]);
+      expect(listWorkspaceIssues(dirs, "owner/other")).toEqual([7]);
+    });
+
+    it("何も変えない", async () => {
+      const { issueDir } = await prepare(1);
+      const before = listFiles(dirs.workDir);
+
+      listWorkspaceIssues(dirs, REPO);
+
+      expect(listFiles(dirs.workDir)).toEqual(before);
+      expect(fs.existsSync(issueDir)).toBe(true);
+    });
+
+    it("置き場所がリンクに差し替えられていたら、たどらずに失敗する", async () => {
+      const { issueDir } = await prepare(1);
+      const parent = path.dirname(issueDir);
+      const moved = path.join(tmp, "moved");
+      fs.renameSync(parent, moved);
+      fs.symlinkSync(moved, parent);
+
+      expect(() => listWorkspaceIssues(dirs, REPO)).toThrow(
+        "ディレクトリではありません",
+      );
+    });
+
+    it("リポジトリ名が不正なら、失敗する", () => {
+      expect(() => listWorkspaceIssues(dirs, "../escape")).toThrow();
     });
   });
 

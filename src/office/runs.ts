@@ -201,6 +201,21 @@ export function resetAttempts(
   return info.changes;
 }
 
+/** イシューのすべての実行を、記録した順に返す。 */
+export function listRunsOfIssue(
+  db: Db,
+  repo: string,
+  issueNumber: number,
+): Run[] {
+  return db
+    .prepare(
+      `SELECT ${RUN_COLUMNS} FROM runs
+       WHERE repo = ? AND issue_number = ? ORDER BY id`,
+    )
+    .all(repo, issueNumber)
+    .map(parseRun);
+}
+
 /** イシューの最新の実行。なければ null。 */
 export function latestRun(
   db: Db,
