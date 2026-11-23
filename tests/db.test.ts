@@ -67,9 +67,9 @@ describe("マイグレーション", () => {
   it("空のDBに適用できる", () => {
     const result = migrate(db, { clock });
 
-    expect(result.applied).toEqual([1, 2, 3]);
+    expect(result.applied).toEqual([1, 2, 3, 4]);
     expect(tableNames(db)).toEqual(EXPECTED_TABLES);
-    expect(currentVersion(db)).toBe(3);
+    expect(currentVersion(db)).toBe(4);
   });
 
   it("実行中の実行とステップの重複を防ぐ索引がある", () => {
@@ -83,6 +83,14 @@ describe("マイグレーション", () => {
       { name: "runs_one_running_per_issue", tbl_name: "runs" },
       { name: "steps_one_running_per_run", tbl_name: "steps" },
     ]);
+  });
+
+  it("steps に、中断した呼び出しのログの場所を残す列がある", () => {
+    migrate(db, { clock });
+    const columns = db.pragma("table_info(steps)") as { name: string }[];
+    expect(columns.map((column) => column.name)).toContain(
+      "interrupted_log_paths",
+    );
   });
 
   it("状態を持つテーブルはリポジトリの列を持つ", () => {
@@ -113,7 +121,7 @@ describe("マイグレーション", () => {
 
     expect(second).toEqual({ applied: [], backupPath: null });
     expect(schemaDump(db)).toEqual(before);
-    expect(currentVersion(db)).toBe(3);
+    expect(currentVersion(db)).toBe(4);
     expect(backups()).toEqual(backupsBefore);
   });
 

@@ -2,7 +2,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createLauncherClient } from "../src/launcher/client.ts";
+import {
+  createLauncherClient,
+  LauncherAbortedError,
+} from "../src/launcher/client.ts";
 import type { ContainerSettings } from "../src/launcher/container.ts";
 import {
   type CommandOptions,
@@ -566,6 +569,7 @@ describe("起動係の窓口", () => {
     controller.abort();
 
     await expect(pending).rejects.toThrow("起動係への依頼を中断しました");
+    await expect(pending).rejects.toBeInstanceOf(LauncherAbortedError);
     await expect
       .poll(() => fake.kills().map((kill) => kill.args))
       .toEqual([["kill", "factory-worker-test-1"]]);
@@ -582,6 +586,9 @@ describe("起動係の窓口", () => {
     await expect(
       client.run(REQUEST, { signal: controller.signal }),
     ).rejects.toThrow("起動係への依頼を中断しました");
+    await expect(
+      client.run(REQUEST, { signal: controller.signal }),
+    ).rejects.toBeInstanceOf(LauncherAbortedError);
     expect(fake.calls).toHaveLength(0);
   });
 

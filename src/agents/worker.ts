@@ -5,7 +5,10 @@
  * ステップを進める側は `WorkerInvoker` だけを見る。テストでは、偽の実装に差し替える。
  */
 import { z } from "zod";
-import type { WorkerLauncher } from "../launcher/client.ts";
+import {
+  LauncherAbortedError,
+  type WorkerLauncher,
+} from "../launcher/client.ts";
 import {
   MAX_TIMEOUT_SEC,
   type RunRequestInput,
@@ -175,6 +178,10 @@ export function interpretRun(
   };
 }
 
+/** 中断した呼び出しの要約。起動の失敗(`ワーカーを起動できませんでした`)とは別の文にする。 */
+export const INTERRUPTED_SUMMARY =
+  "ワーカーの呼び出しを中断しました(事務局の停止)。ワーカーの結果は受け取っていません";
+
 /** 1回の呼び出しの内容。 */
 export interface WorkerCall {
   /** 対象のリポジトリ(owner/name)。設定にある書き方で渡す。 */
@@ -199,6 +206,11 @@ export interface WorkerCall {
 export interface WorkerInvocation extends WorkerOutcome {
   /** この呼び出しのログのファイル。 */
   readonly logPath: string;
+  /**
+   * 呼び出しの途中で、依頼した側が止めた(事務局の停止)。
+   * `status` は `failed` だが、ワーカーが失敗したわけではない。ログには `interrupted` と残る。
+   */
+  readonly interrupted: boolean;
 }
 
 export interface WorkerInvoker {
@@ -206,7 +218,8 @@ export interface WorkerInvoker {
    * ワーカーを1回呼び出し、終わるまで待つ。
    *
    * ワーカーの側で起きた失敗(時間切れ、形式に合わない出力、起動係に届かないなど)は、
-   * 例外ではなく `failed` として返る。例外になるのは、呼び出しの内容そのものが
+   * 例外ではなく `failed` として返る。途中で止められた場合も、例外ではなく `interrupted` を立てて返る。
+   * 例外になるのは、呼び出しの内容そのものが
    * 不正な場合(指示書がない、差し込む値が欠けている、上限が範囲の外など)と、ログを書けない場合だけである。
    */
   invoke(call: WorkerCall): Promise<WorkerInvocation>;
@@ -318,6 +331,7 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
       const startedAt = clock.now();
       let run: RunResult | null = null;
       let outcome: WorkerOutcome;
+      let interrupted = false;
       try {
         run = await deps.launcher.run(request);
         outcome = interpretRun(run, {
@@ -325,11 +339,14 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
           statuses,
         });
       } catch (error) {
-        // 依頼を拒否された場合と、起動係に届かない場合。
+        // 止められた場合と、依頼を拒否された場合と、起動係に届かない場合。
+        interrupted = error instanceof LauncherAbortedError;
         const message = error instanceof Error ? error.message : String(error);
         outcome = {
           status: "failed",
-          summary: maskSecrets(`ワーカーを起動できませんでした: ${message}`),
+          summary: interrupted
+            ? INTERRUPTED_SUMMARY
+            : maskSecrets(`ワーカーを起動できませんでした: ${message}`),
           sessionId: null,
           costUsd: null,
           numTurns: null,
@@ -352,7 +369,8 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
         exit_code: run?.exit_code ?? null,
         timed_out: run?.timed_out ?? null,
         truncated: run?.truncated ?? null,
-        status: outcome.status,
+        // 中断は、ワーカーの失敗と区別して残す。
+        status: interrupted ? "interrupted" : outcome.status,
         summary: outcome.summary,
         session_id: outcome.sessionId,
         cost_usd: outcome.costUsd,
@@ -372,7 +390,7 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
         step: call.step,
         text,
       });
-      return { ...outcome, logPath };
+      return { ...outcome, logPath, interrupted };
     },
   };
 }

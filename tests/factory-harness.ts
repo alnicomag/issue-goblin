@@ -79,6 +79,7 @@ export class FakeWorker implements WorkerInvoker {
       costUsd: 0.01,
       numTurns: 3,
       logPath: `/nonexistent/${call.step}-${this.calls.length}.log`,
+      interrupted: false,
     };
   }
 

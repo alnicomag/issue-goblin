@@ -14,6 +14,7 @@ import {
   listSteps,
   nextAttempt,
   nextStep,
+  recordInterruptedLog,
   recordRunDetails,
   resetAttempts,
   retryNotBefore,
@@ -154,6 +155,98 @@ describe("実行とステップの記録", () => {
           .prepare("SELECT session_id, cost_usd FROM steps WHERE name = 'plan'")
           .get(),
       ).toEqual({ session_id: "session-1", cost_usd: 0.25 });
+    });
+
+    describe("中断した呼び出しのログ", () => {
+      const startPlan = () => {
+        const run = startRun(db, clock, target);
+        record(run.id, "prepare");
+        startStep(db, clock, run.id, "plan");
+        return run;
+      };
+      const planOf = (runId: number) => {
+        const step = listSteps(db, runId).at(-1);
+        if (step === undefined) throw new Error("ステップがありません");
+        return step;
+      };
+
+      it("記録がなければ、空である", () => {
+        const run = startPlan();
+        expect(planOf(run.id).interruptedLogPaths).toEqual([]);
+      });
+
+      it("実行中のステップに、ログの場所を足す。ステップは実行中のまま残る", () => {
+        const run = startPlan();
+        recordInterruptedLog(db, run.id, "plan", "/logs/a.log");
+        recordInterruptedLog(db, run.id, "plan", "/logs/b.log");
+        expect(planOf(run.id)).toMatchObject({
+          name: "plan",
+          status: "running",
+          output: null,
+          finishedAt: null,
+          interruptedLogPaths: ["/logs/a.log", "/logs/b.log"],
+        });
+        expect(nextStep(db, run.id)).toEqual({
+          step: "plan",
+          interrupted: true,
+        });
+      });
+
+      it("同じ場所を2回足しても、重複しない", () => {
+        const run = startPlan();
+        recordInterruptedLog(db, run.id, "plan", "/logs/a.log");
+        recordInterruptedLog(db, run.id, "plan", "/logs/a.log");
+        expect(planOf(run.id).interruptedLogPaths).toEqual(["/logs/a.log"]);
+      });
+
+      it("再開してステップが終わっても残り、log_path は再開した呼び出しを指す", () => {
+        const run = startPlan();
+        recordInterruptedLog(db, run.id, "plan", "/logs/a.log");
+        // 事務局を起動し直した後。同じ行を使う。
+        const resumed = startStep(db, clock, run.id, "plan");
+        expect(resumed.interruptedLogPaths).toEqual(["/logs/a.log"]);
+        finishStep(
+          db,
+          clock,
+          {
+            runId: run.id,
+            step: "plan",
+            outcome: "done",
+            logPath: "/logs/b.log",
+          },
+          options,
+        );
+        expect(
+          db
+            .prepare(
+              "SELECT status, log_path, interrupted_log_paths FROM steps WHERE name = 'plan'",
+            )
+            .get(),
+        ).toEqual({
+          status: "done",
+          log_path: "/logs/b.log",
+          interrupted_log_paths: '["/logs/a.log"]',
+        });
+      });
+
+      it("実行中でないステップには、足せない", () => {
+        const run = startRun(db, clock, target);
+        record(run.id, "prepare");
+        expect(() =>
+          recordInterruptedLog(db, run.id, "prepare", "/logs/a.log"),
+        ).toThrow("実行中ではありません");
+        expect(() =>
+          recordInterruptedLog(db, run.id, "plan", "/logs/a.log"),
+        ).toThrow("実行中ではありません");
+      });
+
+      it("壊れた記録は、原因の分かるエラーにする", () => {
+        const run = startPlan();
+        db.prepare(
+          "UPDATE steps SET interrupted_log_paths = '{}' WHERE name = 'plan'",
+        ).run();
+        expect(() => listSteps(db, run.id)).toThrow("steps の行が想定外");
+      });
     });
 
     it("cleanup まで終わると、実行が完了になる", () => {
