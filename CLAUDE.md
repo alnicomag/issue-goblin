@@ -59,7 +59,7 @@ scripts/check-isolation.sh   # ワーカーの隔離を、確認用の環境を�
 - `config/`: ファクトリー側の設定。実際の設定はGit管理外で、例だけを置く
 - `docker/`: ワーカーのイメージ
 - `scripts/`: 確認用のスクリプト(隔離の確認など)
-- `docs/`: 設計(`design.md`)と、過去の段階の記録(`stage0.md`)
+- `docs/`: 設計(`design.md`)、Dockerに関する用意(`docker.md`)、過去の段階の記録(`stage0.md`)
 - `.claude/skills/`: このリポジトリの開発で使うスキル(`/issue` など)
 - `.github/`: イシューとPRのテンプレート
 - `tests/`: 自動テスト
