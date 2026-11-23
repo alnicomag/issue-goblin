@@ -1,7 +1,11 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { type Db, migrate, openDb } from "../src/office/db.ts";
 import { silentLogger } from "../src/office/log.ts";
-import { parseFactoryYml, syncFactoryYml } from "../src/office/product.ts";
+import {
+  parseFactoryYml,
+  readStoredFactoryYml,
+  syncFactoryYml,
+} from "../src/office/product.ts";
 import { FakeGitHub, VALID_FACTORY_YML } from "./fake-github.ts";
 
 const REPO = "owner/name";
@@ -196,5 +200,57 @@ describe("factory.yml の取得と保存", () => {
       "repo.config_invalid",
       "repo.config_missing",
     ]);
+  });
+});
+
+describe("保存済みの factory.yml の読み出し", () => {
+  let db: Db;
+
+  beforeEach(() => {
+    db = openDb(":memory:");
+    migrate(db, { clock });
+  });
+
+  const insert = (content: string | null, sha: string | null) =>
+    db
+      .prepare(
+        "INSERT INTO repos (repo, factory_yml, factory_yml_sha) VALUES (?, ?, ?)",
+      )
+      .run(REPO, content, sha);
+
+  it("保存してある内容を、検証して返す", () => {
+    const parsed = parseFactoryYml(VALID_FACTORY_YML);
+    if (!parsed.ok) throw new Error(parsed.errors);
+    insert(JSON.stringify(parsed.value), "sha-1");
+    expect(readStoredFactoryYml(db, REPO)).toEqual(parsed.value);
+  });
+
+  it("同期していないリポジトリは、未取得として失敗する", () => {
+    expect(() => readStoredFactoryYml(db, REPO)).toThrow(/owner\/name.*未取得/);
+  });
+
+  it("factory.yml を取得していなければ、未取得として失敗する", () => {
+    insert(null, null);
+    expect(() => readStoredFactoryYml(db, REPO)).toThrow(
+      /factory\.yml は未取得/,
+    );
+  });
+
+  it("factory.yml が検証に通らなかった場合は、不正として失敗する", () => {
+    insert(null, "sha-bad");
+    expect(() => readStoredFactoryYml(db, REPO)).toThrow(
+      /factory\.yml が不正.*sha-bad/,
+    );
+  });
+
+  it("保存してある内容が壊れていれば、項目名の分かるメッセージで失敗する", () => {
+    insert("{", "sha-1");
+    expect(() => readStoredFactoryYml(db, REPO)).toThrow(
+      /JSONとして読めません/,
+    );
+    db.prepare("UPDATE repos SET factory_yml = ?").run(
+      JSON.stringify({ version: 1 }),
+    );
+    expect(() => readStoredFactoryYml(db, REPO)).toThrow(/commands/);
   });
 });

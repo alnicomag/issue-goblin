@@ -160,3 +160,45 @@ function lastConfigEventType(db: Db, repo: string): string | null {
     .get(repo) as { type: string } | undefined;
   return row?.type ?? null;
 }
+
+/**
+ * 保存済みの `factory.yml`(事務局が同期して検証したもの)を読む。
+ *
+ * 作業場所にあるファイルではなく、こちらを使う。作業場所のファイルはワーカーが書き換えられるからである。
+ * 未取得の場合と、不正で保存されていない場合は、原因の分かるメッセージで失敗する。
+ * 保存してある内容も、使う前に検証し直す。
+ */
+export function readStoredFactoryYml(db: Db, repo: string): FactoryYml {
+  const row = db
+    .prepare(
+      "SELECT factory_yml AS content, factory_yml_sha AS sha FROM repos WHERE repo = ?",
+    )
+    .get(repo) as { content: string | null; sha: string | null } | undefined;
+  if (row === undefined) {
+    throw new Error(
+      `リポジトリ ${repo} は未取得です(repos に行がありません。同期が済んでいません)`,
+    );
+  }
+  if (row.content === null) {
+    throw new Error(
+      row.sha === null
+        ? `リポジトリ ${repo} の ${FACTORY_YML_PATH} は未取得です(まだ同期していないか、ファイルがありません)`
+        : `リポジトリ ${repo} の ${FACTORY_YML_PATH} が不正です(検証に通らなかったので、保存されていません。sha: ${row.sha})`,
+    );
+  }
+  let raw: unknown;
+  try {
+    raw = JSON.parse(row.content);
+  } catch {
+    throw new Error(
+      `リポジトリ ${repo} の ${FACTORY_YML_PATH} の保存内容をJSONとして読めません`,
+    );
+  }
+  const result = FactoryYmlSchema.safeParse(raw);
+  if (!result.success) {
+    throw new Error(
+      `リポジトリ ${repo} の ${FACTORY_YML_PATH} の保存内容が不正です:\n${formatZodError(result.error)}`,
+    );
+  }
+  return result.data;
+}
