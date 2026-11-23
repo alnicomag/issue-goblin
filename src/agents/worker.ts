@@ -18,10 +18,11 @@ import { type Clock, systemClock } from "../office/clock.ts";
 import { formatZodError } from "../office/config.ts";
 import { loadPrompt, renderPrompt } from "./prompts.ts";
 import {
+  allowedStatuses,
   ClaudeResultSchema,
-  WORKER_OUTPUT_JSON_SCHEMA,
   WorkerOutputSchema,
   type WorkerStatus,
+  workerOutputJsonSchema,
 } from "./schemas.ts";
 
 /** 失敗の理由に載せる、標準エラーや発言の長さの上限(文字数)。 */
@@ -68,12 +69,12 @@ function withDetail(message: string, detail: string | undefined): string {
 /**
  * 起動係が返した実行結果を、ワーカーの結果として解釈する純粋関数。
  *
- * 形式に合わない出力、時間切れ、ターン数の上限は、理由の分かる要約を付けて `failed` にする。
- * 例外は投げない。
+ * 形式に合わない出力、返せない状態、時間切れ、ターン数の上限は、理由の分かる要約を付けて
+ * `failed` にする。例外は投げない。
  */
 export function interpretRun(
   run: RunResult,
-  limits: { timeoutSec: number },
+  limits: { timeoutSec: number; statuses: readonly WorkerStatus[] },
 ): WorkerOutcome {
   const failed = (
     summary: string,
@@ -170,6 +171,15 @@ export function interpretRun(
       known,
     );
   }
+  if (!limits.statuses.includes(output.data.status)) {
+    return failed(
+      withDetail(
+        `ワーカーが、この指示書では返せない状態(${output.data.status})を返しました`,
+        output.data.summary,
+      ),
+      known,
+    );
+  }
   return {
     ...known,
     status: output.data.status,
@@ -250,14 +260,17 @@ export const DISALLOWED_TOOLS = [
  * - `--max-turns`: ヘルプには載っていないが、固定した版で効くことを確かめてある。
  * - `--bare` は使わない(サブスクリプションのトークンと `CLAUDE.md` を読まなくなる)。
  */
-export function buildClaudeArgv(options: { maxTurns: number }): string[] {
+export function buildClaudeArgv(options: {
+  maxTurns: number;
+  statuses: readonly WorkerStatus[];
+}): string[] {
   return [
     "claude",
     "-p",
     "--output-format",
     "json",
     "--json-schema",
-    JSON.stringify(WORKER_OUTPUT_JSON_SCHEMA),
+    JSON.stringify(workerOutputJsonSchema(options.statuses)),
     "--max-turns",
     String(options.maxTurns),
     "--setting-sources",
@@ -331,10 +344,12 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
         call.values,
       );
 
+      const statuses = allowedStatuses(call.prompt);
+
       const request: RunRequestInput = {
         repo: call.repo,
         issue: call.issue,
-        argv: buildClaudeArgv({ maxTurns: call.maxTurns }),
+        argv: buildClaudeArgv({ maxTurns: call.maxTurns, statuses }),
         stdin: instructions,
         claude_token: true,
         timeout_sec: call.timeoutSec,
@@ -345,7 +360,10 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
       let outcome: WorkerOutcome;
       try {
         run = await deps.launcher.run(request);
-        outcome = interpretRun(run, { timeoutSec: call.timeoutSec });
+        outcome = interpretRun(run, {
+          timeoutSec: call.timeoutSec,
+          statuses,
+        });
       } catch (error) {
         // 依頼を拒否された場合と、起動係に届かない場合。
         const message = error instanceof Error ? error.message : String(error);
