@@ -2,14 +2,21 @@
  * GitHubクライアント。GitHubとの読み書きは、すべてこのファイルを通す。
  *
  * - `GitHubApi` は通信の口。同期の処理にはこれを注入し、テストでは偽の実装に差し替える。
- * - GitHubへの書き込みは、このファイルの書き込み関数(`addLabels`)だけが行う。
+ * - GitHubへの書き込みは、このファイルの書き込み関数(`addLabels`、`pushBranch`、
+ *   `createPullRequest`、`updatePullRequest`、`addIssueComment`)だけが行う。
  *   書き込み関数は必ず `dry_run` を確認し、`true` なら通信せずにログだけを出す。
+ * - push はgitで行うが、GitHubへの書き込みなので、ここに置く。
+ * - `main` へのマージを行う口は、作らない。マージは人間だけが行う。
  */
 import { throttling } from "@octokit/plugin-throttling";
 import { Octokit } from "@octokit/rest";
 import { z } from "zod";
 import { formatZodError } from "./config.ts";
+import type { Git } from "./git.ts";
 import type { Logger } from "./log.ts";
+
+/** エージェントが書いたコメントとPRに付ける目印。人間の書き込みと見分ける。 */
+export const FACTORY_MARKER = "<!-- factory -->";
 
 export interface GitHubIssue {
   readonly number: number;
@@ -31,6 +38,23 @@ export interface GitHubComment {
   readonly updatedAt: string;
   /** プルリクエストに付いたコメントか。 */
   readonly onPullRequest: boolean;
+}
+
+export interface GitHubPullRequest {
+  readonly number: number;
+  readonly url: string;
+}
+
+export interface PullRequestContent {
+  readonly title: string;
+  readonly body: string;
+}
+
+export interface NewPullRequest extends PullRequestContent {
+  /** PRにするブランチ(同じリポジトリの中のもの)。 */
+  readonly head: string;
+  /** 取り込み先のブランチ。 */
+  readonly base: string;
 }
 
 export type GitHubFileResult =
@@ -56,8 +80,30 @@ export interface GitHubApi {
     path: string,
     knownSha: string | null,
   ): Promise<GitHubFileResult>;
+  /** ブランチ `head` から出ている、オープンなPR。なければ null。 */
+  findOpenPullRequest(
+    repo: string,
+    head: string,
+  ): Promise<GitHubPullRequest | null>;
   /** 書き込み。直接呼ばず、必ず下の `addLabels` を通す。 */
   addLabels(repo: string, issueNumber: number, labels: string[]): Promise<void>;
+  /** 書き込み。直接呼ばず、必ず下の `createPullRequest` を通す。 */
+  createPullRequest(
+    repo: string,
+    input: NewPullRequest,
+  ): Promise<GitHubPullRequest>;
+  /** 書き込み。直接呼ばず、必ず下の `updatePullRequest` を通す。 */
+  updatePullRequest(
+    repo: string,
+    number: number,
+    content: PullRequestContent,
+  ): Promise<void>;
+  /** 書き込み。直接呼ばず、必ず下の `addIssueComment` を通す。 */
+  createIssueComment(
+    repo: string,
+    issueNumber: number,
+    body: string,
+  ): Promise<void>;
 }
 
 // ---------------------------------------------------------------------------
@@ -100,6 +146,157 @@ export async function addLabels(
   return true;
 }
 
+/** ファクトリーが push してよいブランチ(`agent/issue-<番号>`)。 */
+const AGENT_BRANCH_PATTERN = /^agent\/issue-[1-9]\d*$/;
+
+export interface PushInput {
+  /** gitの実行。フックを無効にし、事務局の環境変数を引き継がないもの(`git.ts`)を渡す。 */
+  readonly git: Git;
+  /** 事務局専用のミラー。push はここから行う。 */
+  readonly mirrorDir: string;
+  readonly repo: string;
+  /** push 先のURL。トークンを含めない。 */
+  readonly url: string;
+  /** push に使うトークン。gitの実行時にだけ渡し、どこにも保存しない。 */
+  readonly token?: string;
+  readonly branch: string;
+}
+
+/**
+ * ミラーにあるブランチを、同じ名前で push する。
+ *
+ * push できるのは、作業用のブランチ(`agent/issue-<番号>`)だけで、それ以外は失敗させる。
+ * 既定ブランチには、ここからは書き込めない。作業用のブランチはファクトリーだけが使うので、
+ * 差し戻しで履歴が変わっていても通るように、上書きで push する。やり直して安全である。
+ *
+ * `dry_run` が `true` のときは push せず、予定だったことをログに出して `false` を返す。
+ */
+export async function pushBranch(
+  ctx: Pick<WriteContext, "dryRun" | "logger">,
+  input: PushInput,
+): Promise<boolean> {
+  const { repo, branch } = input;
+  if (!AGENT_BRANCH_PATTERN.test(branch)) {
+    throw new Error(
+      `push できるのは作業用のブランチ(agent/issue-<番号>)だけです: ${branch}`,
+    );
+  }
+  if (ctx.dryRun) {
+    ctx.logger.info("github.write_skipped", {
+      reason: "dry_run",
+      action: "push",
+      repo,
+      branch,
+    });
+    return false;
+  }
+  await input.git.run(
+    [
+      "push",
+      "--quiet",
+      "--force",
+      // フックは `git.ts` が毎回無効にしている。ここでも重ねて止める。
+      "--no-verify",
+      "--",
+      input.url,
+      `refs/heads/${branch}:refs/heads/${branch}`,
+    ],
+    {
+      cwd: input.mirrorDir,
+      ...(input.token === undefined
+        ? {}
+        : { auth: { url: input.url, token: input.token } }),
+    },
+  );
+  ctx.logger.info("github.write", { action: "push", repo, branch });
+  return true;
+}
+
+/**
+ * PRを作る。
+ * `dry_run` が `true` のときは通信せず、作る予定だったことをログに出して null を返す。
+ */
+export async function createPullRequest(
+  ctx: WriteContext,
+  repo: string,
+  input: NewPullRequest,
+): Promise<GitHubPullRequest | null> {
+  const fields = {
+    action: "create_pull_request",
+    repo,
+    head: input.head,
+    base: input.base,
+    title: input.title,
+  };
+  if (ctx.dryRun) {
+    ctx.logger.info("github.write_skipped", { reason: "dry_run", ...fields });
+    return null;
+  }
+  const created = await ctx.api.createPullRequest(repo, input);
+  ctx.logger.info("github.write", { ...fields, pr: created.number });
+  return created;
+}
+
+/**
+ * PRのタイトルと本文を更新する。
+ * `dry_run` が `true` のときは通信せず、更新する予定だったことをログに出して `false` を返す。
+ */
+export async function updatePullRequest(
+  ctx: WriteContext,
+  repo: string,
+  number: number,
+  content: PullRequestContent,
+): Promise<boolean> {
+  const fields = {
+    action: "update_pull_request",
+    repo,
+    pr: number,
+    title: content.title,
+  };
+  if (ctx.dryRun) {
+    ctx.logger.info("github.write_skipped", { reason: "dry_run", ...fields });
+    return false;
+  }
+  await ctx.api.updatePullRequest(repo, number, content);
+  ctx.logger.info("github.write", fields);
+  return true;
+}
+
+/** 本文に目印がなければ、末尾に付ける。 */
+export function withFactoryMarker(body: string): string {
+  return body.includes(FACTORY_MARKER)
+    ? body
+    : `${body.trimEnd()}\n\n${FACTORY_MARKER}\n`;
+}
+
+/**
+ * イシューにコメントする。本文には目印(`<!-- factory -->`)を付ける。
+ * `dry_run` が `true` のときは通信せず、書く予定だったことをログに出して `false` を返す。
+ */
+export async function addIssueComment(
+  ctx: WriteContext,
+  repo: string,
+  issueNumber: number,
+  body: string,
+): Promise<boolean> {
+  if (body.trim() === "") {
+    throw new Error("コメントの本文が空です");
+  }
+  const fields = {
+    action: "add_issue_comment",
+    repo,
+    issue: issueNumber,
+    chars: body.length,
+  };
+  if (ctx.dryRun) {
+    ctx.logger.info("github.write_skipped", { reason: "dry_run", ...fields });
+    return false;
+  }
+  await ctx.api.createIssueComment(repo, issueNumber, withFactoryMarker(body));
+  ctx.logger.info("github.write", fields);
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // Octokitによる実装
 // ---------------------------------------------------------------------------
@@ -130,6 +327,11 @@ const CommentSchema = z.object({
   created_at: Timestamp,
   updated_at: Timestamp,
   issue_url: z.string(),
+  html_url: z.string(),
+});
+
+const PullRequestSchema = z.object({
+  number: z.number().int(),
   html_url: z.string(),
 });
 
@@ -322,11 +524,62 @@ export function createOctokitApi(options: {
       }
     },
 
+    async findOpenPullRequest(repo, head) {
+      const target = splitRepo(repo);
+      const response = await octokit.rest.pulls.list({
+        ...target,
+        state: "open",
+        head: `${target.owner}:${head}`,
+        per_page: 1,
+      });
+      const [first] = parseResponse(
+        z.array(PullRequestSchema),
+        response.data,
+        `${repo} のPRの一覧`,
+      );
+      return first === undefined
+        ? null
+        : { number: first.number, url: first.html_url };
+    },
+
     async addLabels(repo, issueNumber, labels) {
       await octokit.rest.issues.addLabels({
         ...splitRepo(repo),
         issue_number: issueNumber,
         labels,
+      });
+    },
+
+    async createPullRequest(repo, input) {
+      const response = await octokit.rest.pulls.create({
+        ...splitRepo(repo),
+        head: input.head,
+        base: input.base,
+        title: input.title,
+        body: input.body,
+      });
+      const created = parseResponse(
+        PullRequestSchema,
+        response.data,
+        `${repo} の作成したPR`,
+      );
+      return { number: created.number, url: created.html_url };
+    },
+
+    async updatePullRequest(repo, number, content) {
+      await octokit.rest.pulls.update({
+        ...splitRepo(repo),
+        pull_number: number,
+        title: content.title,
+        body: content.body,
+      });
+    },
+
+    async createIssueComment(repo, issueNumber, body) {
+      await octokit.rest.issues.createComment({
+        ...splitRepo(repo),
+        issue_number: issueNumber,
+        body,
       });
     },
   };

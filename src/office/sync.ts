@@ -12,6 +12,7 @@ import type { Db } from "./db.ts";
 import { insertEvent } from "./events.ts";
 import {
   addLabels,
+  FACTORY_MARKER,
   type GitHubApi,
   type GitHubComment,
   type GitHubIssue,
@@ -23,8 +24,6 @@ import { type IssueState, isIssueState } from "./transitions.ts";
 
 export const STATE_LABEL_PREFIX = "state:";
 export const TRIAGE_LABEL = "state:triage";
-/** ファクトリー自身が書いたコメントに付ける目印。 */
-export const FACTORY_COMMENT_MARKER = "<!-- factory -->";
 
 const PRIORITIES = ["p0", "p1", "p2", "p3"] as const;
 const SIZES = ["s", "m", "l"] as const;
@@ -405,7 +404,7 @@ function recordComment(
   // プルリクエストは取り込まないので、そこに付いたコメントも記録しない。
   if (comment.onPullRequest) return false;
   // ファクトリー自身のコメント。
-  if (comment.body.includes(FACTORY_COMMENT_MARKER)) return false;
+  if (comment.body.includes(FACTORY_MARKER)) return false;
 
   const already = db
     .prepare(
