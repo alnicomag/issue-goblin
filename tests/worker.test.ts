@@ -13,7 +13,6 @@ import {
   buildClaudeArgv,
   createClaudeWorker,
   interpretRun,
-  maskSecrets,
   type WorkerCall,
   type WorkerInvoker,
 } from "../src/agents/worker.ts";
@@ -23,6 +22,7 @@ import {
   type RunRequestInput,
   type RunResult,
 } from "../src/launcher/request.ts";
+import { maskSecrets } from "../src/office/step-log.ts";
 
 const LIMITS = { timeoutSec: 600, statuses: WORKER_STATUSES };
 const PLAN_STATUSES = allowedStatuses("plan");

@@ -4,11 +4,8 @@
  * 事務局は、指示書と入力を渡し、決まった形式の結果を受け取る。
  * ステップを進める側は `WorkerInvoker` だけを見る。テストでは、偽の実装に差し替える。
  */
-import fs from "node:fs";
-import path from "node:path";
 import { z } from "zod";
 import type { WorkerLauncher } from "../launcher/client.ts";
-import { issueDirFor } from "../launcher/container.ts";
 import {
   MAX_TIMEOUT_SEC,
   type RunRequestInput,
@@ -16,6 +13,7 @@ import {
 } from "../launcher/request.ts";
 import { type Clock, systemClock } from "../office/clock.ts";
 import { formatZodError } from "../office/config.ts";
+import { maskSecrets, stepLogDir, writeStepLog } from "../office/step-log.ts";
 import { loadPrompt, renderPrompt } from "./prompts.ts";
 import {
   allowedStatuses,
@@ -27,16 +25,6 @@ import {
 
 /** 失敗の理由に載せる、標準エラーや発言の長さの上限(文字数)。 */
 const MAX_DETAIL_CHARS = 2000;
-
-/**
- * Claudeのトークンに見える文字列を伏せる。
- *
- * 事務局はトークンの値を持たないので、値の照合ではなく、書き方(`sk-ant-` で始まる)で見つける。
- * ワーカーは自分のトークンを出力に書けるので、ログや記録に残す前に必ず通す。
- */
-export function maskSecrets(text: string): string {
-  return text.replace(/sk-ant-[A-Za-z0-9_-]+/g, "sk-ant-***");
-}
 
 /** 起動係の結果を解釈したもの。 */
 export interface WorkerOutcome {
@@ -283,31 +271,6 @@ export function buildClaudeArgv(options: {
   ];
 }
 
-/** ログのファイル名に使う時刻(例: 20260102T030405.678Z)。 */
-function fileStamp(time: Date): string {
-  return time.toISOString().replace(/[-:]/g, "");
-}
-
-/** ログを新しいファイルに書き、その場所を返す。同じ名前があれば、番号を付ける。 */
-function writeLog(dir: string, name: string, text: string): string {
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  for (let attempt = 1; attempt <= 100; attempt += 1) {
-    const suffix = attempt === 1 ? "" : `-${attempt}`;
-    const file = path.join(dir, `${name}${suffix}.log`);
-    try {
-      fs.writeFileSync(file, text, { flag: "wx", mode: 0o600 });
-      return file;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-        throw new Error(`ワーカーのログを書けません: ${file}`, {
-          cause: error,
-        });
-      }
-    }
-  }
-  throw new Error(`ワーカーのログの名前が重なりすぎています: ${dir}/${name}`);
-}
-
 export interface ClaudeWorkerDeps {
   /** 起動係に依頼する口。 */
   readonly launcher: WorkerLauncher;
@@ -335,10 +298,7 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
         );
       }
       const call = parsed.data;
-      const logDir = path.join(
-        deps.logsDir,
-        issueDirFor(call.repo, call.issue),
-      );
+      const logDir = stepLogDir(deps.logsDir, call.repo, call.issue);
       const instructions = renderPrompt(
         loadPrompt(deps.promptsDir, call.prompt),
         call.values,
@@ -406,11 +366,12 @@ export function createClaudeWorker(deps: ClaudeWorkerDeps): WorkerInvoker {
         run?.stderr ?? "",
         "",
       ].join("\n");
-      const logPath = writeLog(
-        logDir,
-        `${fileStamp(startedAt)}-${call.step}`,
-        maskSecrets(text),
-      );
+      const logPath = writeStepLog({
+        dir: logDir,
+        startedAt,
+        step: call.step,
+        text,
+      });
       return { ...outcome, logPath };
     },
   };
