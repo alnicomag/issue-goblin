@@ -111,7 +111,7 @@ interface StepExecution {
   readonly sessionId?: string | null;
   readonly costUsd?: number | null;
   readonly logPath?: string;
-  /** ワーカーの呼び出しが、事務局の停止で中断された。 */
+  /** ワーカーの呼び出し、または検査コマンドが、事務局の停止で中断された。 */
   readonly interrupted?: boolean;
 }
 
@@ -441,6 +441,7 @@ async function executeStep(
           uncommittedCount: result.uncommittedCount,
         },
         logPath: result.logPath,
+        interrupted: result.interrupted,
       };
     }
 
@@ -540,7 +541,7 @@ async function executeStep(
  * ステップの中で起きた例外は、そのステップの失敗として記録する(実行は `failed` で終わり、待機後に再試行される)。
  *
  * 止められた場合は、結果を記録せずに戻る。実行中だったステップは、次に呼ばれたときにやり直す。
- * ワーカーの呼び出しを中断した場合だけ、そのログの場所を、実行中のステップに残す。
+ * ワーカーの呼び出しか検査コマンドを中断した場合だけ、そのログの場所を、実行中のステップに残す。
  */
 export async function advanceRun(
   deps: RunnerDeps,
@@ -586,7 +587,7 @@ export async function advanceRun(
       };
     }
     // 止められた後の結果は、中断によるものかもしれないので、記録しない。
-    // 中断した呼び出しのログは、再開したステップから辿れるように、場所だけを残す。
+    // 中断した呼び出しや検査のログは、再開したステップから辿れるように、場所だけを残す。
     if (signal.aborted) {
       if (execution.interrupted === true && execution.logPath !== undefined) {
         recordInterruptedLog(db, runId, step, execution.logPath);
