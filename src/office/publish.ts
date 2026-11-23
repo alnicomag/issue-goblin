@@ -27,6 +27,7 @@ import {
 } from "./github.ts";
 import { checkPaths, type PathHit } from "./paths.ts";
 import { readStoredFactoryYml } from "./product.ts";
+import { maskSecrets } from "./step-log.ts";
 import {
   hasBranch,
   type RepoSource,
@@ -233,16 +234,123 @@ export function buildPrTitle(issue: number, issueTitle: string): string {
   return title === "" ? `Issue #${issue}` : title;
 }
 
+/** PRの本文に載せる要約1つの、文字数の上限。越えた分は、省略を明記して切る。 */
+export const SUMMARY_LIMIT = 20_000;
+
+/** 要約を切り詰めたときに、末尾に足す断り書き。 */
+export const SUMMARY_TRUNCATED_NOTE =
+  "(長いので、ここから先を省略しました。全文は事務局の記録にあります)";
+
+/** 要約の記録がないときに、節に書く文。 */
+export const SUMMARY_MISSING_NOTE = "要約の記録がありません。";
+
+/** ワーカーの節の前に置く断り書き。ここから本文の末尾までが、ワーカーの申告である。 */
+export const WORKER_SECTIONS_NOTE =
+  "ここから下は、ワーカー(Claude)の申告です。事務局は、中身を確かめていません。";
+
+/**
+ * 要約の中の記号を置き換える、全角の文字。
+ * 見た目で置き換えたと分かり、GitHubはこれらを記号として扱わない。
+ */
+const FULLWIDTH = {
+  lessThan: "\uFF1C",
+  hash: "\uFF03",
+  colon: "\uFF1A",
+  at: "\uFF20",
+} as const;
+
+/** 閉じていないコードブロックがあれば、閉じるための行を返す。なければ null。 */
+function unclosedFence(text: string): string | null {
+  let open: { char: string; length: number } | null = null;
+  for (const line of text.split("\n")) {
+    const match = /^ {0,3}(`{3,}|~{3,})(.*)$/.exec(line);
+    if (match === null) continue;
+    const marker = match[1] ?? "";
+    const rest = match[2] ?? "";
+    const char = marker.charAt(0);
+    if (open === null) {
+      // バッククォートで始めるときは、同じ行にバッククォートを書けない。
+      if (char === "`" && rest.includes("`")) continue;
+      open = { char, length: marker.length };
+    } else if (
+      char === open.char &&
+      marker.length >= open.length &&
+      rest.trim() === ""
+    ) {
+      open = null;
+    }
+  }
+  return open === null ? null : open.char.repeat(open.length);
+}
+
+/**
+ * ワーカーの要約を、PRの本文に載せられる形にする純粋関数。
+ *
+ * 要約はワーカー(Claude)の出力で、製品のイシューやリポジトリの文章の影響を受ける。
+ * 中身は解釈せず、本文のほかの部分やGitHubの動きに作用する書き方だけを、機械的に崩す。
+ * コードの中かどうかは見分けない(見分けを誤ると、すり抜けになるため)。
+ *
+ * - トークンに見える文字列を伏せる(ログと同じ伏せ方)。
+ * - HTMLコメントの始まり(`<!--`)を、全角の `<` に変える。目印や、閉じないコメントを作らせない。
+ * - イシューを閉じる書き方(`Closes #1` など)の `#` を、全角に変える。URLで書いたものは `:` を全角に変える。
+ * - メンション(`@name`)の `@` を、全角に変える。
+ * - 上限を越えた分を、行の区切りで切り、省略したと書く。
+ * - 閉じていないコードブロックを閉じる。
+ */
+export function sanitizeSummary(summary: string): string {
+  let text = maskSecrets(summary)
+    .replace(/\r\n?/g, "\n")
+    .trim()
+    .replace(/<!--/g, `${FULLWIDTH.lessThan}!--`)
+    .replace(
+      /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(\s*:?\s*)((?:[\w.-]+\/[\w.-]+)?)#(?=\d)/gi,
+      `$1$2$3${FULLWIDTH.hash}`,
+    )
+    .replace(
+      /\b(close[sd]?|fix(?:e[sd])?|resolve[sd]?)(\s*:?\s*)(https?):(?=\/\/)/gi,
+      `$1$2$3${FULLWIDTH.colon}`,
+    )
+    .replace(/(?<![A-Za-z0-9_])@(?=[A-Za-z0-9])/g, FULLWIDTH.at);
+
+  let truncated = false;
+  if (text.length > SUMMARY_LIMIT) {
+    truncated = true;
+    text = text.slice(0, SUMMARY_LIMIT);
+    // 文字の途中(サロゲートペアの前半)で切らない。
+    if (/[\uD800-\uDBFF]$/.test(text)) text = text.slice(0, -1);
+    const lineEnd = text.lastIndexOf("\n");
+    if (lineEnd > 0) text = text.slice(0, lineEnd);
+    text = text.trimEnd();
+  }
+  const fence = unclosedFence(text);
+  if (fence !== null) text = `${text}\n${fence}`;
+  if (truncated) text = `${text}\n\n${SUMMARY_TRUNCATED_NOTE}`;
+  return text;
+}
+
+/** ワーカーの要約の節。要約がなければ、ないと書く。 */
+function summarySection(heading: string, summary: string | null): string[] {
+  const text = summary === null ? "" : sanitizeSummary(summary);
+  return ["", `## ${heading}`, "", text === "" ? SUMMARY_MISSING_NOTE : text];
+}
+
 /**
  * PRの本文を組み立てる純粋関数。
  *
- * 対応イシュー(マージでイシューが閉じる書き方)、検証結果、ワーカーの環境では確かめられない範囲
- * (`verify.unverified`)を書き、末尾に目印を付ける。検査コマンドの出力は載せない。
+ * 前半は、事務局が確かめたことである。対応イシュー(マージでイシューが閉じる書き方)、検証結果、
+ * ワーカーの環境では確かめられない範囲(`verify.unverified`)を書く。検査コマンドの出力は載せない。
+ *
+ * 後半は、ワーカーの申告である。`implement` と `review` の要約を、申告と分かる見出しで載せる。
+ * 要約の中身が本文を崩しても、前半に及ばないように、後ろに置く。末尾に目印を付ける。
  */
 export function buildPrBody(input: {
   issue: number;
   verify: PublishVerifySummary | null;
   unverified: readonly string[];
+  /** 最後の `implement` の要約。記録がなければ null。 */
+  implementSummary: string | null;
+  /** 最後の `review` の要約。記録がなければ null。 */
+  reviewSummary: string | null;
 }): string {
   const lines = [`Closes #${input.issue}`, "", "## 検証結果", ""];
   if (input.verify === null) {
@@ -274,7 +382,17 @@ export function buildPrBody(input: {
       ...input.unverified.map((entry) => `- ${oneLine(entry)}`),
     );
   }
-  lines.push("", FACTORY_MARKER, "");
+  lines.push(
+    "",
+    "---",
+    "",
+    WORKER_SECTIONS_NOTE,
+    ...summarySection("実装の要約(ワーカーの申告)", input.implementSummary),
+    ...summarySection("レビューの結果(ワーカーの申告)", input.reviewSummary),
+    "",
+    FACTORY_MARKER,
+    "",
+  );
   return lines.join("\n");
 }
 
@@ -355,6 +473,10 @@ export interface PublishInput {
   readonly author: Identity;
   /** verify の結果。PRの本文に載せる。記録がなければ null。 */
   readonly verify: PublishVerifySummary | null;
+  /** 最後の `implement` の要約。PRの本文に、ワーカーの申告として載せる。記録がなければ null。 */
+  readonly implementSummary: string | null;
+  /** 最後の `review` の要約。PRの本文に、ワーカーの申告として載せる。記録がなければ null。 */
+  readonly reviewSummary: string | null;
 }
 
 function describeHits(hits: readonly PathHit[]): string {
@@ -519,6 +641,8 @@ export async function publish(
       issue,
       verify: input.verify,
       unverified: factoryYml.verify.unverified,
+      implementSummary: input.implementSummary,
+      reviewSummary: input.reviewSummary,
     }),
   };
   const existing = await write.api.findOpenPullRequest(repo, branch);

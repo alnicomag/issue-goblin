@@ -15,6 +15,11 @@ import {
   listCommitIdentities,
   type PublishVerifySummary,
   publish,
+  SUMMARY_LIMIT,
+  SUMMARY_MISSING_NOTE,
+  SUMMARY_TRUNCATED_NOTE,
+  sanitizeSummary,
+  WORKER_SECTIONS_NOTE,
 } from "../src/office/publish.ts";
 import {
   prepareWorkspace,
@@ -296,11 +301,210 @@ describe("PRの内容", () => {
     ],
   };
 
+  const NO_SUMMARIES = { implementSummary: null, reviewSummary: null };
+  const IMPLEMENT = "### 変更の内容\n\nADDED A FEATURE\n\n### 未検証\n\nなし";
+  const REVIEW =
+    "### 受け入れ条件ごとの判定\n\n| 条件 | 判定 | 根拠 |\n| --- | --- | --- |\n| a | 満たす | JUDGED |\n\n### 提案\n\nなし";
+  const build = (implementSummary: string | null, reviewSummary = REVIEW) =>
+    buildPrBody({
+      issue: 7,
+      verify,
+      unverified: ["example of an unverifiable area"],
+      implementSummary,
+      reviewSummary,
+    });
+  /** 本文の骨組み。`Closes`、節の見出し、目印を、出てくる順に挙げる。 */
+  const skeleton = (body: string) =>
+    body
+      .split("\n")
+      .filter(
+        (line) =>
+          line.startsWith("Closes ") ||
+          line.startsWith("## ") ||
+          line === WORKER_SECTIONS_NOTE ||
+          line === FACTORY_MARKER,
+      );
+  const SKELETON = [
+    "Closes #7",
+    "## 検証結果",
+    "## 未検証の範囲",
+    WORKER_SECTIONS_NOTE,
+    "## 実装の要約(ワーカーの申告)",
+    "## レビューの結果(ワーカーの申告)",
+    FACTORY_MARKER,
+  ];
+
+  describe("ワーカーの要約", () => {
+    it("implement と review の要約を、申告と分かる見出しの節に載せる", () => {
+      const body = build(IMPLEMENT);
+      expect(skeleton(body)).toEqual(SKELETON);
+      expect(body).toContain(`## 実装の要約(ワーカーの申告)\n\n${IMPLEMENT}\n`);
+      expect(body).toContain(
+        `## レビューの結果(ワーカーの申告)\n\n${REVIEW}\n`,
+      );
+    });
+
+    it("事務局が確かめた検査結果の表は、ワーカーの節より前にあり、区切られている", () => {
+      const body = build(IMPLEMENT);
+      const [office, worker] = body.split(`\n---\n\n${WORKER_SECTIONS_NOTE}\n`);
+      expect(office).toContain("| `test` | 合格 | 0 |");
+      expect(office).toContain("- example of an unverifiable area");
+      expect(office).not.toContain("ADDED A FEATURE");
+      expect(worker).toContain("ADDED A FEATURE");
+      expect(worker).toContain("JUDGED");
+      expect(worker).not.toContain("| `test` |");
+    });
+
+    it("要約がなければ、節を残して、ないと書く", () => {
+      for (const missing of [null, "", " \n "]) {
+        const body = buildPrBody({
+          issue: 7,
+          verify,
+          unverified: [],
+          implementSummary: missing,
+          reviewSummary: missing,
+        });
+        expect(skeleton(body)).toEqual(SKELETON);
+        expect(body).toContain(
+          `## 実装の要約(ワーカーの申告)\n\n${SUMMARY_MISSING_NOTE}\n`,
+        );
+        expect(body).toContain(
+          `## レビューの結果(ワーカーの申告)\n\n${SUMMARY_MISSING_NOTE}\n`,
+        );
+      }
+    });
+
+    it("同じ入力なら、同じ本文になる", () => {
+      expect(build(IMPLEMENT)).toBe(build(IMPLEMENT));
+    });
+
+    it("長すぎる要約は、行の区切りで切り、省略したと書く", () => {
+      const line = `${"x".repeat(99)}\n`;
+      const long = line.repeat(500);
+      const section = sanitizeSummary(long);
+      expect(section.endsWith(`\n\n${SUMMARY_TRUNCATED_NOTE}`)).toBe(true);
+      const kept = section.slice(0, -`\n\n${SUMMARY_TRUNCATED_NOTE}`.length);
+      expect(kept.length).toBeLessThanOrEqual(SUMMARY_LIMIT);
+      expect(kept.length).toBeGreaterThan(SUMMARY_LIMIT - 200);
+      // 行の途中では切らない。
+      expect(kept.split("\n").every((entry) => entry.length === 99)).toBe(true);
+      // 2つとも上限いっぱいでも、GitHubの本文の上限(65536文字)に収まる。
+      const body = build(long, long);
+      expect(body.length).toBeLessThan(65_536);
+      expect(skeleton(body)).toEqual(SKELETON);
+    });
+
+    it("上限ちょうどの要約は切らない。改行のない長い要約は、上限で切る", () => {
+      const exact = "y".repeat(SUMMARY_LIMIT);
+      expect(sanitizeSummary(exact)).toBe(exact);
+      expect(sanitizeSummary(`${exact}y`)).toBe(
+        `${exact}\n\n${SUMMARY_TRUNCATED_NOTE}`,
+      );
+      // サロゲートペアの途中では切らない。
+      const emoji = `${"y".repeat(SUMMARY_LIMIT - 1)}\u{1F600}`;
+      expect(sanitizeSummary(emoji)).toBe(
+        `${"y".repeat(SUMMARY_LIMIT - 1)}\n\n${SUMMARY_TRUNCATED_NOTE}`,
+      );
+    });
+
+    it("切ったところがコードブロックの中なら、閉じてから省略を書く", () => {
+      const long = `前置き\n\n\`\`\`\n${"code line\n".repeat(3000)}\`\`\`\n`;
+      const section = sanitizeSummary(long);
+      expect(
+        section.endsWith(`code line\n\`\`\`\n\n${SUMMARY_TRUNCATED_NOTE}`),
+      ).toBe(true);
+    });
+
+    it("閉じていないコードブロックを閉じて、後ろの節と目印を巻き込ませない", () => {
+      expect(sanitizeSummary("a\n```js\ncode")).toBe("a\n```js\ncode\n```");
+      expect(sanitizeSummary("a\n~~~~\ncode\n~~~")).toBe(
+        "a\n~~~~\ncode\n~~~\n~~~~",
+      );
+      // 閉じているものには、何も足さない。
+      for (const closed of [
+        "a\n```js\ncode\n```\nb",
+        "a\n````\n```\n````\nb",
+        "行の中の ``` は数えない",
+      ]) {
+        expect(sanitizeSummary(closed)).toBe(closed);
+      }
+      const body = build("```\nunclosed");
+      expect(body).toContain(
+        "```\nunclosed\n```\n\n## レビューの結果(ワーカーの申告)",
+      );
+    });
+
+    it("要約に目印やHTMLコメントがあっても、本文の目印は末尾の1つだけである", () => {
+      const body = build(
+        `before ${FACTORY_MARKER} after\n<!-- 閉じないコメント`,
+        `${FACTORY_MARKER}\n<!--`,
+      );
+      expect(body.split(FACTORY_MARKER)).toHaveLength(2);
+      expect(body.trimEnd().endsWith(FACTORY_MARKER)).toBe(true);
+      expect(body.match(/<!--/g)).toHaveLength(1);
+      expect(body).toContain("before \uFF1C!-- factory --> after");
+      expect(skeleton(body)).toEqual(SKELETON);
+    });
+
+    it("要約にイシューを閉じる書き方があっても、閉じるのは対応イシューだけである", () => {
+      const body = build(
+        [
+          "Closes #99",
+          "fixes: #100 and Resolved owner/name#101",
+          "closed https://github.com/owner/name/issues/102",
+          "FIX #103",
+          "see #104",
+        ].join("\n"),
+      );
+      const closing =
+        /\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s*:?\s*(?:[\w.-]+\/[\w.-]+)?(?:#\d+|https?:\/\/\S+)/gi;
+      expect(body.match(closing)).toEqual(["Closes #7"]);
+      expect(body.split("\n")[0]).toBe("Closes #7");
+      expect(body).toContain("Closes \uFF0399");
+      expect(body).toContain(
+        "fixes: \uFF03100 and Resolved owner/name\uFF03101",
+      );
+      expect(body).toContain(
+        "closed https\uFF1A//github.com/owner/name/issues/102",
+      );
+      expect(body).toContain("FIX \uFF03103");
+      // 閉じる書き方でない参照は、そのままにする。
+      expect(body).toContain("see #104");
+    });
+
+    it("要約のメンションを、通知が飛ばない形にする", () => {
+      const body = build("cc @someone, (@owner/team) と @a-b。\n@first");
+      expect(body.match(/(?<![A-Za-z0-9_])@[A-Za-z0-9]/g)).toBeNull();
+      expect(body).toContain(
+        "cc \uFF20someone, (\uFF20owner/team) と \uFF20a-b。\n\uFF20first",
+      );
+      // メールアドレスのような、語の途中の @ は変えない。
+      expect(sanitizeSummary("mail a@example.invalid")).toBe(
+        "mail a@example.invalid",
+      );
+    });
+
+    it("トークンの形をした文字列を、ログと同じ伏せ方で伏せる", () => {
+      const body = build(
+        "token sk-ant-oat01-AAAAbbbb_cccc-dddd here",
+        "also sk-ant-api03-ZZZZ",
+      );
+      expect(body).not.toMatch(/sk-ant-(?!\*\*\*)/);
+      expect(body).toContain("token sk-ant-*** here");
+      expect(body).toContain("also sk-ant-***");
+    });
+
+    it("要約の前後の空白と、改行の書き方をそろえる", () => {
+      expect(sanitizeSummary("\n\n a\r\nb\rc \n")).toBe("a\nb\nc");
+    });
+  });
+
   it("対応イシュー、検証結果、未検証の範囲を書き、目印を付ける", () => {
     const body = buildPrBody({
       issue: 7,
       verify,
       unverified: ["example of an unverifiable area", "another\narea"],
+      ...NO_SUMMARIES,
     });
     expect(body.split("\n")[0]).toBe("Closes #7");
     expect(body).toContain("すべて通りました");
@@ -325,6 +529,7 @@ describe("PRの内容", () => {
         ],
       },
       unverified: [],
+      ...NO_SUMMARIES,
     });
     expect(body).toContain("通らなかったものがあります");
     expect(body).toContain("| `test` | 不合格 | 2 |");
@@ -333,7 +538,12 @@ describe("PRの内容", () => {
   });
 
   it("検証結果がなければ、ないと書く", () => {
-    const body = buildPrBody({ issue: 7, verify: null, unverified: [] });
+    const body = buildPrBody({
+      issue: 7,
+      verify: null,
+      unverified: [],
+      ...NO_SUMMARIES,
+    });
     expect(body).toContain("検証結果の記録がありません");
   });
 
@@ -382,6 +592,8 @@ describe("publish", () => {
         source: { url: source, token: TOKEN },
         author: WORKER,
         verify: VERIFY,
+        implementSummary: "IMPLEMENT SUMMARY",
+        reviewSummary: "REVIEW SUMMARY sk-ant-oat01-SECRETsecret",
       },
     );
 
@@ -518,6 +730,13 @@ describe("publish", () => {
     expect(body).toContain("| `test` | 合格 | 0 |");
     expect(body).toContain("- example of an unverifiable area");
     expect(body).toContain(FACTORY_MARKER);
+    expect(body).toContain(
+      "## 実装の要約(ワーカーの申告)\n\nIMPLEMENT SUMMARY\n",
+    );
+    expect(body).toContain(
+      "## レビューの結果(ワーカーの申告)\n\nREVIEW SUMMARY sk-ant-***\n",
+    );
+    expect(JSON.stringify(fake.calls)).not.toContain("SECRETsecret");
   });
 
   it("push するのは作業用のブランチだけで、既定ブランチは変わらない(マージしない)", async () => {
@@ -554,6 +773,15 @@ describe("publish", () => {
       });
       expect(fake.pullRequests).toHaveLength(1);
       expect(fake.pullRequests[0]?.title).toBe("Renamed issue");
+      // 同じ入力でやり直すと、本文は同じ内容になる。
+      const [created, updated] = fake.writes;
+      expect(
+        updated?.method === "updatePullRequest" ? updated.content.body : null,
+      ).toBe(
+        created?.method === "createPullRequest"
+          ? created.input.body
+          : undefined,
+      );
       expect(fake.writes.map((call) => call.method)).toEqual([
         "createPullRequest",
         "updatePullRequest",
@@ -589,6 +817,13 @@ describe("publish", () => {
       expect(result).toMatchObject({ status: "published", prCreated: true });
       expect(fake.pullRequests).toHaveLength(1);
     });
+  });
+
+  it("dry_run なら、要約があっても、GitHubへの書き込みを1回も行わない", async () => {
+    commitFile(paths.repoDir, "feature.txt", "feature\n");
+    const result = await run(true);
+    expect(result).toMatchObject({ status: "dry_run", outcome: "done" });
+    expectNothingWritten();
   });
 
   describe("PRを作らずに失敗として扱う場合", () => {
