@@ -322,6 +322,34 @@ export async function prepareWorkspace(
 }
 
 /**
+ * リポジトリの作業場所があるイシューの番号を、若い順に返す。読むだけで、何も変えない。
+ *
+ * 拾うのは、事務局が作る名前(`issue-<番号>`)だけで、それ以外の名前は無視する。
+ * シンボリックリンクはたどらない。リポジトリの置き場所がまだなければ、空を返す。
+ */
+export function listWorkspaceIssues(
+  dirs: WorkspaceDirs,
+  repo: string,
+): number[] {
+  const repoWorkDir = path.dirname(workspacePaths(dirs, repo, 1).issueDir);
+  const kind = kindOf(repoWorkDir);
+  if (kind === "missing") return [];
+  if (kind !== "directory") {
+    throw new Error(
+      `作業場所の置き場所がディレクトリではありません: ${repoWorkDir}`,
+    );
+  }
+  const issues: number[] = [];
+  for (const name of fs.readdirSync(repoWorkDir)) {
+    const match = /^issue-([1-9]\d*)$/.exec(name);
+    if (match === null) continue;
+    const issue = Number(match[1]);
+    if (Number.isSafeInteger(issue)) issues.push(issue);
+  }
+  return issues.sort((a, b) => a - b);
+}
+
+/**
  * イシューの作業場所を消す。すでになくても失敗しない。
  *
  * gitは実行しない。シンボリックリンクはたどらずに、リンクそのものを消す。
