@@ -11,6 +11,7 @@
  * `dry_run` の間は、着手も、実行を進めることも、状態の変更もしない。
  * ラベルを書けないと、GitHubから見えないところで作業が進むことになるからである。
  * 人間が状態を変えた実行の取り消しと、試行回数のリセットは、DBだけの操作なので行う。
+ * 作業場所の後片付けは、実行の cleanup と同じく、`dry_run` の間は行わない。
  */
 import { z } from "zod";
 import { isoNow } from "./clock.ts";
@@ -29,6 +30,7 @@ import {
   findResumableRuns,
   heldPublishStep,
   latestRun,
+  listRunsOfIssue,
   listSteps,
   type Run,
   recordApproval,
@@ -41,6 +43,8 @@ import { decideSettlement, type SettleAction } from "./settle.ts";
 import { AGENT_APPROVED_LABEL, type Priority } from "./sync.ts";
 import { applyTransition, type TransitionDeps } from "./transition-apply.ts";
 import type { IssueState } from "./transitions.ts";
+import { cleanupWorkspace, listWorkspaceIssues } from "./workspace.ts";
+import { decideSweep } from "./workspace-sweep.ts";
 
 export interface SupervisorDeps {
   readonly runner: RunnerDeps;
@@ -547,8 +551,72 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     }
   }
 
-  /** `ready` のイシューから、着手するものを決めて、着手する。 */
-  async function intake(repos: readonly string[]): Promise<void> {
+  /**
+   * 実行の cleanup に届かなかった作業場所を、片付ける。
+   *
+   * 実際にある作業場所を並べ、消すか残すかを、記録だけから決める(`workspace-sweep.ts`)。
+   * 何度行っても、結果は変わらない。gitは実行せず、ミラーには触れない。
+   *
+   * 片付けられなかったイシューを返す。`all` は、作業場所を並べられなかった場合。
+   * 前の作業場所のまま次の実行を始めないように、呼び出し側は、そのイシューに着手しない。
+   */
+  function sweepWorkspaces(repo: string): Set<number> | "all" {
+    let issues: number[];
+    try {
+      issues = listWorkspaceIssues(runner.dirs, repo);
+    } catch (error) {
+      logger.error("workspace.sweep_failed", { repo, ...errorFields(error) });
+      return "all";
+    }
+    const failed = new Set<number>();
+    for (const issue of issues) {
+      try {
+        const row = db
+          .prepare("SELECT state FROM issues WHERE repo = ? AND number = ?")
+          .get(repo, issue) as { state: string } | undefined;
+        const returned = db
+          .prepare(
+            `SELECT MAX(created_at) AS at FROM events
+             WHERE type IN ('issue.state_changed', 'issue.closed')
+               AND json_extract(payload, '$.from') = 'failed'
+               AND repo = ? AND issue_number = ?`,
+          )
+          .get(repo, issue) as { at: string | null };
+        const issueRuns = listRunsOfIssue(db, repo, issue);
+        const decision = decideSweep({
+          issueState: row?.state ?? null,
+          runs: issueRuns,
+          active: issueRuns.some((run) => tasks.has(run.id)),
+          returnedFromFailedAt: returned.at,
+        });
+        if (decision === "keep") continue;
+        cleanupWorkspace({ dirs: runner.dirs, repo, issue });
+        logger.info("workspace.removed", {
+          repo,
+          issue,
+          reason:
+            decision === "remove_closed" ? "closed" : "returned_from_failed",
+        });
+      } catch (error) {
+        failed.add(issue);
+        logger.error("workspace.sweep_failed", {
+          repo,
+          issue,
+          ...errorFields(error),
+        });
+      }
+    }
+    return failed;
+  }
+
+  /**
+   * `ready` のイシューから、着手するものを決めて、着手する。
+   * `unswept` にあるイシュー(作業場所を片付けられなかったもの)には、着手しない。
+   */
+  async function intake(
+    repos: readonly string[],
+    unswept: ReadonlyMap<string, Set<number> | "all">,
+  ): Promise<void> {
     const running = findResumableRuns(db);
     const intakeRepos: IntakeRepo[] = [];
     for (const repo of repos) {
@@ -584,6 +652,15 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
               entry.run.repo === repo && entry.run.issueNumber === row.number,
           )
         ) {
+          continue;
+        }
+        const blocked = unswept.get(repo);
+        if (blocked === "all" || blocked?.has(row.number) === true) {
+          logger.warn("intake.issue_skipped", {
+            repo,
+            issue: row.number,
+            reason: "作業場所を片付けられなかったので、今回は着手しません",
+          });
           continue;
         }
         issues.push({
@@ -651,7 +728,13 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         }
       }
       if (dryRun || stopping) return;
-      await intake(repos);
+      // 着手の前に片付ける。人間が failed から戻したイシューの次の実行が、最新から始まるようにする。
+      const unswept = new Map<string, Set<number> | "all">();
+      for (const repo of repos) {
+        const failed = sweepWorkspaces(repo);
+        if (failed === "all" || failed.size > 0) unswept.set(repo, failed);
+      }
+      await intake(repos, unswept);
     },
 
     async stop(graceMs) {
