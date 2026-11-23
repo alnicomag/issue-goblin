@@ -15,7 +15,10 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import type { WorkerLauncher } from "../launcher/client.ts";
+import {
+  LauncherAbortedError,
+  type WorkerLauncher,
+} from "../launcher/client.ts";
 import { MAX_TIMEOUT_SEC, type RunResult } from "../launcher/request.ts";
 import { type Clock, systemClock } from "./clock.ts";
 import type { Db } from "./db.ts";
@@ -67,9 +70,16 @@ export interface VerifyCommandResult {
    * - `failed`: 0以外の終了コードで終わった。
    * - `timed_out`: 時間の上限に達したので、コンテナごと止めた。
    * - `not_run`: 起動係がコマンドを実行できなかった(依頼の拒否、起動係に届かない)。
+   * - `interrupted`: 実行の途中で、依頼した側が止めた(事務局の停止)。結果は受け取っていない。
    * - `skipped`: 先のコマンドの結果を受けて、実行しなかった。
    */
-  readonly status: "passed" | "failed" | "timed_out" | "not_run" | "skipped";
+  readonly status:
+    | "passed"
+    | "failed"
+    | "timed_out"
+    | "not_run"
+    | "interrupted"
+    | "skipped";
   /** 終了コード。実行しなかった場合と、シグナルで終わった場合は null。 */
   readonly exitCode: number | null;
   /** 所要時間(ミリ秒)。コンテナの起動と片付けを含む。実行しなかった場合は null。 */
@@ -109,7 +119,16 @@ export interface VerifyResult {
   readonly uncommittedCount: number;
   /** この実行のログのファイル。 */
   readonly logPath: string;
+  /**
+   * 途中で、依頼した側が止めた(事務局の停止)。
+   * `outcome` は `failed` だが、検査が失敗したわけではない。ログには `interrupted` と残る。
+   */
+  readonly interrupted: boolean;
 }
+
+/** 中断した検査の要約。実行できなかった場合や、確かめられなかった場合とは別の文にする。 */
+export const INTERRUPTED_SUMMARY =
+  "検査を中断しました(事務局の停止)。結果は受け取っていません";
 
 /** コンテナの中で実行するコマンドを組み立てる純粋関数。 */
 export function buildVerifyArgv(command: string): string[] {
@@ -137,9 +156,11 @@ export function parseStatusPaths(stdout: string): string[] {
  * - `clean`: コミットされていない内容がない。
  * - `dirty`: コミットしていない変更か、追跡していないファイルがある。
  * - `unknown`: 確かめられなかった。
+ * - `interrupted`: 確かめている途中で、依頼した側が止めた(事務局の停止)。
  */
 export type WorkspaceStatus =
   | { readonly status: "clean" }
+  | { readonly status: "interrupted" }
   | { readonly status: "dirty"; readonly paths: readonly string[] }
   | { readonly status: "unknown"; readonly reason: string };
 
@@ -203,7 +224,7 @@ function outputTail(text: string): string {
  *
  * setup が通らなければ、残りは実行しない(準備のできていない場所での結果は当てにならない)。
  * test が通らなくても、lint は実行する(1回の差し戻しで、両方の指摘を渡すため)。
- * コマンドを実行できなかった場合は、その先も実行しない。
+ * コマンドを実行できなかった場合と、中断した場合は、その先も実行しない。
  */
 export function shouldRun(previous: readonly VerifyCommandResult[]): boolean {
   return previous.every(
@@ -219,6 +240,14 @@ export function judgeVerify(
   commands: readonly VerifyCommandResult[],
   timeoutSec: number,
 ): Pick<VerifyResult, "outcome" | "passed" | "summary" | "failedCommands"> {
+  if (commands.some((result) => result.status === "interrupted")) {
+    return {
+      outcome: "failed",
+      passed: false,
+      summary: INTERRUPTED_SUMMARY,
+      failedCommands: [],
+    };
+  }
   const notRun = commands.find((result) => result.status === "not_run");
   if (notRun !== undefined) {
     return {
@@ -261,6 +290,14 @@ export function judgeVerify(
 export function judgeWorkspace(
   workspace: Exclude<WorkspaceStatus, { status: "clean" }>,
 ): Pick<VerifyResult, "outcome" | "passed" | "summary" | "failedCommands"> {
+  if (workspace.status === "interrupted") {
+    return {
+      outcome: "failed",
+      passed: false,
+      summary: INTERRUPTED_SUMMARY,
+      failedCommands: [],
+    };
+  }
   if (workspace.status === "unknown") {
     return {
       outcome: "failed",
@@ -327,6 +364,7 @@ function logText(
  * 1つも実行せずに `rework` を返す。確かめられなかった場合は `failed` を返す。
  *
  * コマンドの失敗と時間切れは、例外ではなく結果(`rework`)として返る。
+ * 途中で止められた場合も、例外ではなく `interrupted` を立てて返る。
  * 例外になるのは、実行を始められない場合(`factory.yml` が未取得または不正、作業場所がない、
  * 時間の上限が範囲の外)と、ログを書けない場合だけで、そのときコマンドは1つも実行しない。
  *
@@ -373,8 +411,13 @@ export async function runVerify(
       run: { ...run, stdout: run.stdout.replaceAll("\0", "\n") },
     });
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    workspace = { status: "unknown", reason: outputTail(message) };
+    // 止められた場合は、確かめられなかった場合(依頼の拒否、起動係に届かない)と分ける。
+    if (error instanceof LauncherAbortedError) {
+      workspace = { status: "interrupted" };
+    } else {
+      const message = error instanceof Error ? error.message : String(error);
+      workspace = { status: "unknown", reason: outputTail(message) };
+    }
     outputs.push({ name: "status", run: null });
   }
 
@@ -406,16 +449,17 @@ export async function runVerify(
       results.push(interpretCommand(name, command, run, durationMs));
       outputs.push({ name, run });
     } catch (error) {
-      // 依頼を拒否された場合と、起動係に届かない場合。
+      // 止められた場合と、依頼を拒否された場合と、起動係に届かない場合。
+      const interrupted = error instanceof LauncherAbortedError;
       const message = error instanceof Error ? error.message : String(error);
       results.push({
         name,
         command,
-        status: "not_run",
+        status: interrupted ? "interrupted" : "not_run",
         exitCode: null,
         durationMs: null,
         truncated: false,
-        outputTail: outputTail(message),
+        outputTail: interrupted ? "" : outputTail(message),
       });
       outputs.push({ name, run: null });
     }
@@ -432,6 +476,9 @@ export async function runVerify(
     workspace.status === "clean"
       ? judgeVerify(results, timeoutSec)
       : judgeWorkspace(workspace);
+  const interrupted =
+    workspace.status === "interrupted" ||
+    results.some((result) => result.status === "interrupted");
   const header = {
     repo,
     issue,
@@ -439,7 +486,8 @@ export async function runVerify(
     started_at: startedAt.toISOString(),
     finished_at: finishedAt.toISOString(),
     timeout_sec: timeoutSec,
-    outcome: judged.outcome,
+    // 中断は、検査の失敗と区別して残す。
+    outcome: interrupted ? "interrupted" : judged.outcome,
     summary: judged.summary,
     workspace: {
       status: workspace.status,
@@ -466,5 +514,6 @@ export async function runVerify(
     uncommittedPaths,
     uncommittedCount,
     logPath,
+    interrupted,
   };
 }

@@ -3,7 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { WorkerLauncher } from "../src/launcher/client.ts";
+import {
+  LauncherAbortedError,
+  type WorkerLauncher,
+} from "../src/launcher/client.ts";
 import {
   parseRunRequest,
   type RunRequestInput,
@@ -418,6 +421,106 @@ describe("検査コマンドの実行(verify)", () => {
     expect(result.summary).toContain("起動係に届きません");
     expect(launcher.commands).toEqual(["example-setup", "example-test"]);
     expect(fs.existsSync(result.logPath)).toBe(true);
+  });
+
+  describe("中断", () => {
+    it("検査コマンドの途中で中断すると、実行できなかった場合とは別に、中断として残る", async () => {
+      launcher.answers.set("example-test", new LauncherAbortedError());
+      const result = await runVerify(deps, INPUT);
+      expect(result).toMatchObject({
+        interrupted: true,
+        passed: false,
+        failedCommands: [],
+      });
+      expect(result.summary).toContain("中断しました");
+      expect(result.summary).not.toContain("実行できませんでした");
+      expect(result.commands.map((command) => command.status)).toEqual([
+        "passed",
+        "interrupted",
+        "skipped",
+      ]);
+      expect(launcher.commands).toEqual(["example-setup", "example-test"]);
+
+      const log = fs.readFileSync(result.logPath, "utf8");
+      expect(log).toContain('"outcome": "interrupted"');
+      expect(log).toContain('"status": "interrupted"');
+      expect(log).not.toContain("実行できませんでした");
+      expect(log).not.toContain("not_run");
+    });
+
+    it("状態の確認の途中で中断すると、確かめられなかった場合とは別に、中断として残る", async () => {
+      launcher.status = new LauncherAbortedError();
+      const result = await runVerify(deps, INPUT);
+      expect(result).toMatchObject({
+        interrupted: true,
+        passed: false,
+        uncommittedPaths: [],
+      });
+      expect(result.summary).toContain("中断しました");
+      expect(result.summary).not.toContain("確かめられません");
+      expect(result.commands.map((command) => command.status)).toEqual([
+        "skipped",
+        "skipped",
+        "skipped",
+      ]);
+      expect(launcher.commands).toEqual([]);
+
+      const log = fs.readFileSync(result.logPath, "utf8");
+      expect(log).toContain('"outcome": "interrupted"');
+      expect(log).not.toContain("確かめられません");
+      expect(log).not.toContain('"status": "unknown"');
+    });
+
+    it("起動係に届かない場合と、依頼を拒否された場合は、中断にならない", async () => {
+      launcher.answers.set(
+        "example-test",
+        new Error("起動係が依頼を拒否しました: 設定にないリポジトリです"),
+      );
+      const refused = await runVerify(deps, INPUT);
+      expect(refused.interrupted).toBe(false);
+      expect(refused.outcome).toBe("failed");
+      expect(refused.summary).toContain("test を実行できませんでした");
+      expect(refused.commands.map((command) => command.status)).toEqual([
+        "passed",
+        "not_run",
+        "skipped",
+      ]);
+      const refusedLog = fs.readFileSync(refused.logPath, "utf8");
+      expect(refusedLog).toContain('"outcome": "failed"');
+      expect(refusedLog).not.toContain("interrupted");
+
+      launcher.status = new Error("起動係に届きません");
+      const unreachable = await runVerify(deps, INPUT);
+      expect(unreachable.interrupted).toBe(false);
+      expect(unreachable.outcome).toBe("failed");
+      expect(unreachable.summary).toContain("作業場所の状態を確かめられません");
+      const unreachableLog = fs.readFileSync(unreachable.logPath, "utf8");
+      expect(unreachableLog).toContain('"status": "unknown"');
+      expect(unreachableLog).not.toContain("interrupted");
+    });
+
+    it("合格した検査は、中断ではない", async () => {
+      expect((await runVerify(deps, INPUT)).interrupted).toBe(false);
+    });
+
+    it("中断のログと結果に、トークンに見える文字列を残さない", async () => {
+      launcher.answers.set(
+        "example-setup",
+        ok({ stdout: "token sk-ant-oat01-abcDEF_123" }),
+      );
+      launcher.answers.set(
+        "example-test",
+        new LauncherAbortedError({
+          cause: new Error("socket hang up sk-ant-api03-zzz"),
+        }),
+      );
+      const result = await runVerify(deps, INPUT);
+      expect(result.interrupted).toBe(true);
+      const log = fs.readFileSync(result.logPath, "utf8");
+      expect(log).toContain("token sk-ant-***");
+      expect(log).not.toMatch(/sk-ant-(oat|api)/);
+      expect(JSON.stringify(result)).not.toMatch(/sk-ant-(oat|api)/);
+    });
   });
 
   it("factory.yml が不正なら、実行せずに原因の分かるメッセージで失敗する", async () => {

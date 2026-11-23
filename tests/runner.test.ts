@@ -419,6 +419,57 @@ describe("ステップの実行", () => {
       expect(row.log_path).not.toBe(interrupted[0]);
     });
 
+    it("検査コマンドを中断すると、再開した verify から、中断した検査のログを辿れる", async () => {
+      const controller = new AbortController();
+      // 事務局の停止で、検査コマンドの依頼が中断される起動係。
+      const launcher: WorkerLauncher = {
+        run(request, options) {
+          if (request.argv[2] !== "example-test") {
+            return h.launcher.run(request);
+          }
+          controller.abort();
+          expect(options?.signal?.aborted).toBe(true);
+          return Promise.reject(new LauncherAbortedError());
+        },
+      };
+      const runId = start();
+      expect(
+        await advanceRun({ ...h.runner, launcher }, runId, controller.signal),
+      ).toEqual({ kind: "aborted" });
+
+      // 結果は記録せず、ログの場所だけを残す。
+      const stopped = listSteps(h.db, runId).at(-1);
+      expect(stopped).toMatchObject({
+        name: "verify",
+        status: "running",
+        output: null,
+        finishedAt: null,
+      });
+      const interrupted = stopped?.interruptedLogPaths ?? [];
+      expect(interrupted).toHaveLength(1);
+      const log = fs.readFileSync(interrupted[0] ?? "", "utf8");
+      expect(log).toContain('"outcome": "interrupted"');
+      expect(log).not.toContain("実行できませんでした");
+
+      // 事務局を起動し直した後。
+      expect(await advance(runId)).toEqual({ kind: "waiting_close" });
+      const row = h.db
+        .prepare(
+          "SELECT status, log_path, interrupted_log_paths FROM steps WHERE run_id = ? AND name = 'verify'",
+        )
+        .get(runId) as {
+        status: string;
+        log_path: string;
+        interrupted_log_paths: string;
+      };
+      expect(row.status).toBe("done");
+      expect(JSON.parse(row.interrupted_log_paths)).toEqual(interrupted);
+      expect(row.log_path).not.toBe(interrupted[0]);
+      expect(fs.readFileSync(row.log_path, "utf8")).toContain(
+        '"outcome": "done"',
+      );
+    });
+
     it("中断でない結果は、止められた後に返ってきても、中断のログとして残さない", async () => {
       const controller = new AbortController();
       h.worker.scripts.set("plan", () => {
