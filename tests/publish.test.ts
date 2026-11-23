@@ -302,6 +302,44 @@ describe("PRの内容", () => {
   };
 
   const NO_SUMMARIES = { implementSummary: null, reviewSummary: null };
+
+  it("承認された保護対象のパスは、事務局が確かめた前半に、コードとして書く", () => {
+    const body = buildPrBody({
+      issue: 7,
+      verify,
+      unverified: [],
+      ...NO_SUMMARIES,
+      approvedPaths: [
+        { path: ".github/workflows/ci.yml", pattern: ".github/**" },
+        { path: "a/`@someone`\n<!-- factory -->", pattern: "a/**" },
+      ],
+    });
+    const section = body.slice(
+      body.indexOf("## 承認された保護対象のパス"),
+      body.indexOf(WORKER_SECTIONS_NOTE),
+    );
+    expect(body.indexOf("## 承認された保護対象のパス")).toBeGreaterThan(
+      body.indexOf("## 未検証の範囲"),
+    );
+    expect(section).toContain(
+      "- `.github/workflows/ci.yml`(パターン: `.github/**`)",
+    );
+    expect(section).toContain("- `a/'@someone' ＜!-- factory -->`");
+    expect(section).not.toContain("<!--");
+  });
+
+  it("承認されたパスがなければ、その節を書かない", () => {
+    for (const approvedPaths of [undefined, []]) {
+      const body = buildPrBody({
+        issue: 7,
+        verify,
+        unverified: [],
+        ...NO_SUMMARIES,
+        ...(approvedPaths === undefined ? {} : { approvedPaths }),
+      });
+      expect(body).not.toContain("承認された");
+    }
+  });
   const IMPLEMENT = "### 変更の内容\n\nADDED A FEATURE\n\n### 未検証\n\nなし";
   const REVIEW =
     "### 受け入れ条件ごとの判定\n\n| 条件 | 判定 | 根拠 |\n| --- | --- | --- |\n| a | 満たす | JUDGED |\n\n### 提案\n\nなし";
@@ -582,7 +620,11 @@ describe("publish", () => {
   let gitCalls: (readonly string[])[];
   let git: Git;
 
-  const run = (dryRun: boolean, issueTitle = "Example issue") =>
+  const run = (
+    dryRun: boolean,
+    issueTitle = "Example issue",
+    approvedCommit: string | null = null,
+  ) =>
     publish(
       { db, git, write: { api: fake, dryRun, logger }, dirs },
       {
@@ -594,6 +636,7 @@ describe("publish", () => {
         verify: VERIFY,
         implementSummary: "IMPLEMENT SUMMARY",
         reviewSummary: "REVIEW SUMMARY sk-ant-oat01-SECRETsecret",
+        approvedCommit,
       },
     );
 
@@ -1104,6 +1147,71 @@ describe("publish", () => {
       level: "warn",
       event: "publish.stopped",
       fields: { status: "needs_approval" },
+    });
+  });
+
+  describe("人間が承認したコミット", () => {
+    const touchProtected = (): string => {
+      commitFile(paths.repoDir, "feature.txt", "feature\n");
+      fs.mkdirSync(path.join(paths.repoDir, "docs"), { recursive: true });
+      return commitFile(paths.repoDir, "docs/guide.md", "guide\n");
+    };
+
+    it("先頭が承認されたコミットなら、保護対象のパスに触れていても、push してPRを作る", async () => {
+      const head = touchProtected();
+      const result = await run(false, "Example issue", head);
+      expect(result).toMatchObject({
+        status: "published",
+        outcome: "done",
+        awaitingApproval: false,
+        headCommit: head,
+        protected: [{ path: "docs/guide.md", pattern: "docs/**" }],
+        prNumber: 100,
+      });
+      expect(remoteHead()).toBe(head);
+      const body = fake.pullRequests[0]?.body ?? "";
+      expect(body).toContain("## 承認された保護対象のパス");
+      expect(body).toContain("- `docs/guide.md`(パターン: `docs/**`)");
+      expect(logs.at(-1)).toMatchObject({
+        event: "publish.finished",
+        fields: { approved_protected: 1 },
+      });
+    });
+
+    it("承認の後にコミットが変わっていれば、承認は効かず、また止まる", async () => {
+      const approved = touchProtected();
+      const head = commitFile(paths.repoDir, "docs/more.md", "more\n");
+      const result = await run(false, "Example issue", approved);
+      expect(result).toMatchObject({
+        status: "needs_approval",
+        outcome: "held",
+        headCommit: head,
+      });
+      expectNothingWritten();
+    });
+
+    it("承認されたコミットでも、paths.forbidden に当たる変更は通さない", async () => {
+      touchProtected();
+      fs.mkdirSync(path.join(paths.repoDir, "generated"));
+      const head = commitFile(paths.repoDir, "generated/out.txt", "out\n");
+      const result = await run(false, "Example issue", head);
+      expect(result).toMatchObject({ status: "forbidden", outcome: "held" });
+      expectNothingWritten();
+    });
+
+    it("承認されたコミットでも、作者の検査は緩まない", async () => {
+      touchProtected();
+      const head = commitAs(paths.repoDir, OTHER, WORKER);
+      const result = await run(false, "Example issue", head);
+      expect(result.status).toBe("author_mismatch");
+      expectNothingWritten();
+    });
+
+    it("保護対象のパスに触れていなければ、PRの本文に承認の節を書かない", async () => {
+      const head = commitFile(paths.repoDir, "feature.txt", "feature\n");
+      const result = await run(false, "Example issue", head);
+      expect(result.status).toBe("published");
+      expect(fake.pullRequests[0]?.body).not.toContain("承認された");
     });
   });
 

@@ -19,6 +19,7 @@ import { type IntakeIssue, type IntakeRepo, planIntake } from "./intake.ts";
 import type { RepoLocks } from "./locks.ts";
 import { errorFields } from "./log.ts";
 import { readStoredFactoryYml } from "./product.ts";
+import { inlineCode } from "./publish.ts";
 import { advanceRun, type RunnerDeps } from "./runner.ts";
 import {
   cancelRun,
@@ -99,21 +100,6 @@ const HeldOutputSchema = z.object({
   protected: z.array(PathHitSchema),
 });
 export type HeldOutput = z.infer<typeof HeldOutputSchema>;
-
-/**
- * パスやパターンを、コメントのコードの中に書ける形にする。
- *
- * パスはワーカーが決められる文字列なので、コードの外に抜け出す書き方(バッククォート、改行)と、
- * 目印に見える書き方(HTMLコメントの始まり)を崩す。コードの中なので、メンションは通知にならない。
- */
-function inlineCode(text: string): string {
-  const safe = text
-    // biome-ignore lint/suspicious/noControlCharactersInRegex: 制御文字を空白に置き換える
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
-    .replaceAll("`", "'")
-    .replaceAll("<!--", "＜!--");
-  return `\`${safe}\``;
-}
 
 const HELD_EXPLANATIONS = {
   needs_approval: {
