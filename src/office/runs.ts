@@ -23,6 +23,7 @@ export const RUN_STATUSES = [
   "done",
   "question",
   "failed",
+  "held",
   "cancelled",
 ] as const;
 export type RunStatus = (typeof RUN_STATUSES)[number];

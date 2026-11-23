@@ -50,6 +50,21 @@ describe("ステップの進み方", () => {
     expect(next("review", "rework")).toEqual(run("implement"));
   });
 
+  it("publish が人間の対応待ちを返すと、実行を held で終える", () => {
+    expect(next("publish", "held")).toEqual({ kind: "finish", status: "held" });
+    // 差し戻しの回数には左右されない。
+    expect(next("publish", "held", 2)).toEqual({
+      kind: "finish",
+      status: "held",
+    });
+  });
+
+  it("publish のほかは、人間の対応待ちを返せない", () => {
+    for (const step of STEP_NAMES.filter((name) => name !== "publish")) {
+      expect(() => next(step, "held"), step).toThrow(/人間の対応待ち/);
+    }
+  });
+
   it("差し戻しは1回の実行で2回までで、3回目は失敗で終える", () => {
     expect(MAX_REWORKS).toBe(2);
     for (const step of ["verify", "review"] as const) {

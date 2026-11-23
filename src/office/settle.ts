@@ -80,6 +80,7 @@ export function decideSettlement(input: SettleInput): SettleAction {
       }
       return input.failedCount >= input.maxAttempts ? "give_up" : "retry";
     case "done":
+    case "held":
     case "cancelled":
       return "none";
   }

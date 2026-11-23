@@ -24,8 +24,16 @@ export type StepName = (typeof STEP_NAMES)[number];
  * - `rework`: 差し戻し(verify の失敗、review の修正要求)。implement に戻す。
  * - `question`: 質問を返して終了する。
  * - `failed`: ステップそのものが失敗した。実行を失敗で終える。
+ * - `held`: 人間の対応待ちで終了する(publish が、禁止や保護対象のパスで止まった)。
+ *   失敗ではないので、試行に数えず、再試行もしない。
  */
-export const STEP_OUTCOMES = ["done", "rework", "question", "failed"] as const;
+export const STEP_OUTCOMES = [
+  "done",
+  "rework",
+  "question",
+  "failed",
+  "held",
+] as const;
 export type StepOutcome = (typeof STEP_OUTCOMES)[number];
 
 /** 1回の実行の中で、implement に差し戻せる回数。 */
@@ -35,6 +43,8 @@ export const MAX_REWORKS = 2;
 const REWORK_STEPS: readonly StepName[] = ["verify", "review"];
 /** 質問を返せるステップ(Claudeが担当するもの)。 */
 const QUESTION_STEPS: readonly StepName[] = ["plan", "implement", "review"];
+/** 人間の対応待ちを返せるステップ。 */
+const HELD_STEPS: readonly StepName[] = ["publish"];
 
 export interface RunProgress {
   /** 直前のステップの結果より前に、この実行で起きた差し戻しの回数。 */
@@ -47,7 +57,7 @@ export interface StepResult {
 }
 
 /** 実行の終わり方。取り消し(`cancelled`)は外から起きるので、ここには含めない。 */
-export type FinishStatus = "done" | "question" | "failed";
+export type FinishStatus = "done" | "question" | "failed" | "held";
 
 export type NextAction =
   | { readonly kind: "run_step"; readonly step: StepName }
@@ -93,6 +103,11 @@ export function nextAction(
       return { kind: "finish", status: "question" };
     case "failed":
       return { kind: "finish", status: "failed" };
+    case "held":
+      if (!HELD_STEPS.includes(last.step)) {
+        throw new Error(`${last.step} は人間の対応待ちを返せません`);
+      }
+      return { kind: "finish", status: "held" };
   }
 }
 
