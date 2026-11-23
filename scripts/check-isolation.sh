@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # ワーカーの隔離を、実際にコンテナを立てて確かめる。
-# あわせて、事務局のコンテナで作業場所の準備と後片付けが通ることと、
-# 検査コマンドの実行(verify)が隔離された環境で動くことを確かめる。
+# あわせて、事務局のコンテナで作業場所の準備と後片付けが通ること、
+# 検査コマンドの実行(verify)が隔離された環境で動くこと、
+# ワーカーのイメージのgitが、設定の作者をそのままコミットに書くことを確かめる。
 #
 # 確認用の環境を、稼働中のものとは別の名前(既定: factory-check)で立て、終わったら消す。
 # 稼働中のファクトリーや、同じホストのほかのコンテナには触れない。
@@ -126,6 +127,11 @@ echo
 echo "# 検査コマンドの実行(verify)を調べる"
 echo
 compose run --rm --no-deps -T office node scripts/verify-check.ts 2>&1 || result=1
+
+echo
+echo "# ワーカーのイメージのgitで、コミットの作者を調べる"
+echo
+compose run --rm --no-deps -T office node scripts/author-check.ts 2>&1 || result=1
 
 echo
 echo "# 実行の後の状態"
