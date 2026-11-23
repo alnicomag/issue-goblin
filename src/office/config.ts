@@ -127,6 +127,11 @@ const FactoryConfigSchema = z
       .array(z.number().int().min(0))
       .min(1, "待機時間を1つ以上書いてください")
       .default([5, 30, 120]),
+    /**
+     * UTCの1日に着手する実行の数の上限(再試行を含む、全リポジトリの合計)。
+     * 達したら、その日は新しく着手しない。0 にすると、1件も着手しない。
+     */
+    daily_run_limit: z.number().int().min(0).default(20),
     /** ワーカーのコミットの作者。全製品で同じものを使う。 */
     commit_author: CommitAuthorSchema.default({
       name: DEFAULT_AUTHOR_NAME,

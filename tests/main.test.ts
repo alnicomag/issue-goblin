@@ -81,6 +81,7 @@ describe("起動時のトークンの確認", () => {
     logs_dir: "/data/logs",
     worker_image: "factory-worker",
     retry_wait_minutes: [5, 30, 120],
+    daily_run_limit: 20,
     commit_author: { name: "Example", email: "example@example.invalid" },
     repos: [
       { repo: "owner/first", token_env: "TOKEN_FIRST" },
