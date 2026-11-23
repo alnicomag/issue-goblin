@@ -10,7 +10,7 @@ GitHubのイシューを入力として、AIエージェントが実装からプ
 - ワーカーを、資格情報のない隔離されたコンテナで動かす。
 - 人間が `state:ready` にしたイシューに着手し、計画、実装、検査、レビューを経て、プルリクエストを作る(`dry_run: false` のときだけ)。分類と着手の判断(司令塔)は、まだない。
 
-設計は `docs/design.md`、段階0の仕様は `docs/stage0.md` にあります。
+設計は `docs/design.md`、Dockerに関する用意(イメージの関係、作り直しの順、片付け)は `docs/docker.md`、段階0の仕様は `docs/stage0.md` にあります。
 
 ## 必要なもの
 
@@ -128,7 +128,7 @@ docker compose logs -f office
 - 停止は `docker compose stop` です。実行中のポーリングを終えてから終了します。ワーカーが実行中のステップは待たずに止め、次の起動でそのステップからやり直します(試行には数えません)。
 - ログは1行1件のJSONです。
 
-設定を変えたときは、`docker compose restart office` で読み直します。
+設定を変えたときは、`docker compose restart office` で読み直します。`worker_image` を変えたときは、起動係も読み直します(`docker compose restart office launcher`)。
 
 ### GitHubへの書き込みを有効にする
 
