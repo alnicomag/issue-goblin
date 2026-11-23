@@ -12,6 +12,7 @@ import {
   createPullRequest,
   FACTORY_MARKER,
   pushBranch,
+  setStateLabel,
   updatePullRequest,
   type WriteContext,
   withFactoryMarker,
@@ -137,6 +138,52 @@ describe("GitHubへの書き込み", () => {
         repo: REPO,
         issue: 7,
       });
+    });
+  });
+
+  describe("状態のラベルの付け替え", () => {
+    const T = "2026-03-01T00:00:00.000Z";
+    const change = { from: "ready", to: "in-progress" } as const;
+
+    it("dry_run が true なら、書き込まず、予定だったことをログに出す", async () => {
+      fake.putIssue({ number: 7, labels: ["state:ready"], updatedAt: T });
+      expect(await setStateLabel(ctx(true), REPO, 7, change)).toBe(false);
+      expect(fake.calls).toEqual([]);
+      expect(skipped()).toEqual(["set_state_label"]);
+    });
+
+    it("新しいラベルを付けてから、古いラベルを外す。ほかのラベルは残す", async () => {
+      fake.putIssue({
+        number: 7,
+        labels: ["state:ready", "priority:p1"],
+        updatedAt: T,
+      });
+      expect(await setStateLabel(ctx(false), REPO, 7, change)).toBe(true);
+      expect(fake.writes.map((call) => call.method)).toEqual([
+        "addLabels",
+        "removeLabel",
+      ]);
+      expect(fake.issues[0]?.labels).toEqual([
+        "priority:p1",
+        "state:in-progress",
+      ]);
+    });
+
+    it("2回行っても、同じ結果になる", async () => {
+      fake.putIssue({ number: 7, labels: ["state:ready"], updatedAt: T });
+      await setStateLabel(ctx(false), REPO, 7, change);
+      await setStateLabel(ctx(false), REPO, 7, change);
+      expect(fake.issues[0]?.labels).toEqual(["state:in-progress"]);
+    });
+
+    it("closed と、同じ状態への付け替えは、書き込まずに失敗する", async () => {
+      await expect(
+        setStateLabel(ctx(false), REPO, 7, { from: "in-review", to: "closed" }),
+      ).rejects.toThrow(/closed/);
+      await expect(
+        setStateLabel(ctx(false), REPO, 7, { from: "ready", to: "ready" }),
+      ).rejects.toThrow(/同じ状態/);
+      expect(fake.calls).toEqual([]);
     });
   });
 
