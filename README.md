@@ -56,6 +56,42 @@ GITHUB_TOKEN_EXAMPLE=<トークン>
 
 `config/factory.config.yml` と `.env` はGit管理外です。
 
+### 製品のリポジトリに用意するラベル
+
+対象のリポジトリに、次のラベルを作っておきます。対象のリポジトリを足すたびに行います。
+
+事務局が付けるラベルは、付けるときにGitHubが自動で作ります。人間が画面から付けるラベルは、先に作っておかないと選べません。`state:` のラベルは、人間が手で状態を戻すときにも使うので、すべて先に作っておきます。
+
+| ラベル | 意味 | 付ける人 |
+| --- | --- | --- |
+| `state:triage` | 新規、または再判定待ち | 事務局 |
+| `state:needs-info` | 人間の回答や対応を待っている | 事務局 |
+| `state:blocked` | 依存先のイシューが未完了 | 事務局(司令塔の指示による。段階1では付かない) |
+| `state:ready` | 着手可能 | 人間(段階1)。再試行に戻すときは事務局 |
+| `state:in-progress` | ワーカーが作業中 | 事務局 |
+| `state:in-review` | PR作成済み | 事務局 |
+| `state:failed` | 試行上限に達した | 事務局 |
+| `priority:p0`、`priority:p1`、`priority:p2`、`priority:p3` | 優先度。`p0` が最も高い | 人間 |
+| `size:s`、`size:m`、`size:l` | 大きさ | 人間 |
+| `agent:skip` | エージェントは触らない | 人間 |
+| `agent:approved` | 保護対象のパスに触れる変更の承認 | 人間(事務局が、受け取ったときに外す) |
+
+意味と遷移の詳しい説明は、[docs/design.md](docs/design.md) の「イシューの状態と遷移」にあります。食い違う場合は、`docs/design.md` を正とします。
+
+作り方の例です。`owner/name` は対象のリポジトリに読み替えます。`--force` を付けているので、すでにあるラベルがあっても失敗せず、何度実行しても同じ結果になります。
+
+```bash
+for label in \
+  state:triage state:needs-info state:blocked state:ready \
+  state:in-progress state:in-review state:failed \
+  priority:p0 priority:p1 priority:p2 priority:p3 \
+  size:s size:m size:l \
+  agent:skip agent:approved
+do
+  gh label create "$label" --repo owner/name --force
+done
+```
+
 ### ワーカーの実行環境
 
 ワーカーは、事務局とは別のコンテナで動きます。コンテナを立てるのは「起動係」で、事務局は起動係に依頼します。仕組みは `docs/design.md` の「ワーカーの封じ込め」にあります。
@@ -199,6 +235,7 @@ pnpm run status
 
 ### 1. 準備
 
+- 対象のリポジトリに、「製品のリポジトリに用意するラベル」のとおりにラベルを作ります。`state:ready` は人間が手で付けるので、先に作っておかないと選べません。
 - 対象のリポジトリに `factory.yml` を置き、小さなイシューを1件用意します。起票者は `issues.allowed_authors` に入れます。
 - 製品の検査コマンドに要るツールが、ワーカーのイメージに入っていることを確かめます。基本のイメージにあるのは、Node、git、Claude Code だけです。足りなければ、「ワーカーの実行環境」のとおりに別のイメージを作り、`worker_image` で指定します。
 
