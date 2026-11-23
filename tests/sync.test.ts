@@ -110,6 +110,9 @@ describe("同期", () => {
       priority: "p1",
       size: "s",
       depends_on: null,
+      author: "alice",
+      body: "",
+      agent_skip: 0,
       github_updated_at: T1,
       synced_at: NOW,
     });
@@ -305,6 +308,43 @@ describe("同期", () => {
         },
       },
     ]);
+  });
+
+  it("起票者、本文、agent:skip を保存し、変わったら更新する", async () => {
+    fake.putIssue({
+      number: 1,
+      author: "example-login",
+      body: "the body",
+      labels: ["state:ready"],
+      updatedAt: T1,
+    });
+    await sync();
+    expect(issueRow(1)).toMatchObject({
+      author: "example-login",
+      body: "the body",
+      agent_skip: 0,
+    });
+
+    fake.putIssue({
+      number: 1,
+      body: "edited",
+      labels: ["state:ready", "agent:skip"],
+      updatedAt: T2,
+    });
+    await sync();
+    expect(issueRow(1)).toMatchObject({ body: "edited", agent_skip: 1 });
+    // 状態は変わっていないので、イベントは増えない。
+    expect(events().map((e) => e.type)).toEqual(["issue.created"]);
+  });
+
+  it("起票者が空のまま残っている行は、全件の取り直しで埋まる", async () => {
+    fake.putIssue({ number: 1, author: "example-login", updatedAt: T1 });
+    await sync();
+    db.prepare("UPDATE issues SET author = NULL, body = NULL").run();
+
+    await sync({ full: [REPO] });
+    expect(issueRow(1)).toMatchObject({ author: "example-login", body: "" });
+    expect(events("issue.created")).toHaveLength(1);
   });
 
   it("同じ内容を2回同期しても、イベントが増えない", async () => {

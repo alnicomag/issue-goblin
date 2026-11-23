@@ -24,6 +24,8 @@ import { type IssueState, isIssueState } from "./transitions.ts";
 
 export const STATE_LABEL_PREFIX = "state:";
 export const TRIAGE_LABEL = "state:triage";
+/** エージェントが触らないイシューに、人間が付けるラベル。 */
+export const AGENT_SKIP_LABEL = "agent:skip";
 
 const PRIORITIES = ["p0", "p1", "p2", "p3"] as const;
 const SIZES = ["s", "m", "l"] as const;
@@ -171,6 +173,9 @@ interface IssueRow {
   state: string;
   priority: string | null;
   size: string | null;
+  author: string | null;
+  body: string | null;
+  agent_skip: number;
   github_updated_at: string;
 }
 
@@ -269,12 +274,14 @@ async function syncIssue(
   const { db, clock, logger } = deps;
   const existing = db
     .prepare(
-      `SELECT title, state, priority, size, github_updated_at
+      `SELECT title, state, priority, size, author, body, agent_skip,
+              github_updated_at
        FROM issues WHERE repo = ? AND number = ?`,
     )
     .get(repo, issue.number) as IssueRow | undefined;
 
   const derived = deriveIssue(issue);
+  const agentSkip = issue.labels.includes(AGENT_SKIP_LABEL) ? 1 : 0;
   // 前回の取り込みより後に更新されたか。取得範囲は前回と重なるので、
   // 同じ内容がもう一度届くことがある(再起動の後も同じ)。
   const fresh =
@@ -285,7 +292,10 @@ async function syncIssue(
       state === existing.state &&
       issue.title === existing.title &&
       derived.priority === existing.priority &&
-      derived.size === existing.size;
+      derived.size === existing.size &&
+      issue.author === existing.author &&
+      issue.body === existing.body &&
+      agentSkip === existing.agent_skip;
     const labelDue = full && derived.needsTriageLabel;
     if (unchanged && !labelDue) return null;
   }
@@ -328,8 +338,9 @@ async function syncIssue(
       const state: IssueState = derived.state ?? "triage";
       db.prepare(
         `INSERT INTO issues
-           (repo, number, title, state, priority, size, github_updated_at, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           (repo, number, title, state, priority, size, author, body, agent_skip,
+            github_updated_at, synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         repo,
         issue.number,
@@ -337,6 +348,9 @@ async function syncIssue(
         state,
         derived.priority,
         derived.size,
+        issue.author,
+        issue.body,
+        agentSkip,
         issue.updatedAt,
         now,
       );
@@ -363,6 +377,7 @@ async function syncIssue(
     db.prepare(
       `UPDATE issues
          SET title = ?, state = ?, priority = ?, size = ?,
+             author = ?, body = ?, agent_skip = ?,
              github_updated_at = ?, synced_at = ?
        WHERE repo = ? AND number = ?`,
     ).run(
@@ -370,6 +385,9 @@ async function syncIssue(
       state,
       derived.priority,
       derived.size,
+      issue.author,
+      issue.body,
+      agentSkip,
       fresh ? issue.updatedAt : existing.github_updated_at,
       now,
       repo,

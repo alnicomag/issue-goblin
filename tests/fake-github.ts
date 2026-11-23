@@ -68,6 +68,7 @@ export class FakeGitHub implements GitHubApi {
     const previous = this.issues.find((i) => i.number === issue.number);
     const next: GitHubIssue = {
       title: `Issue ${issue.number}`,
+      body: "",
       open: true,
       labels: [],
       author: "someone",

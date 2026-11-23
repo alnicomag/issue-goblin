@@ -21,6 +21,8 @@ export const FACTORY_MARKER = "<!-- factory -->";
 export interface GitHubIssue {
   readonly number: number;
   readonly title: string;
+  /** 本文。ないときは空文字。 */
+  readonly body: string;
   readonly open: boolean;
   readonly labels: readonly string[];
   readonly author: string | null;
@@ -311,6 +313,7 @@ const UserSchema = z.object({ login: z.string() }).nullish();
 const IssueSchema = z.object({
   number: z.number().int(),
   title: z.string(),
+  body: z.string().nullish(),
   state: z.enum(["open", "closed"]),
   labels: z.array(
     z.union([z.string(), z.object({ name: z.string().nullish() })]),
@@ -442,6 +445,7 @@ export function createOctokitApi(options: {
         return {
           number: issue.number,
           title: issue.title,
+          body: issue.body ?? "",
           open: issue.state === "open",
           labels: issue.labels
             .map((label) => (typeof label === "string" ? label : label.name))
