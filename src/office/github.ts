@@ -2,7 +2,7 @@
  * GitHubクライアント。GitHubとの読み書きは、すべてこのファイルを通す。
  *
  * - `GitHubApi` は通信の口。同期の処理にはこれを注入し、テストでは偽の実装に差し替える。
- * - GitHubへの書き込みは、このファイルの書き込み関数(`addLabels`、`pushBranch`、
+ * - GitHubへの書き込みは、このファイルの書き込み関数(`addLabels`、`setStateLabel`、`pushBranch`、
  *   `createPullRequest`、`updatePullRequest`、`addIssueComment`)だけが行う。
  *   書き込み関数は必ず `dry_run` を確認し、`true` なら通信せずにログだけを出す。
  * - push はgitで行うが、GitHubへの書き込みなので、ここに置く。
@@ -14,6 +14,7 @@ import { z } from "zod";
 import { formatZodError } from "./config.ts";
 import type { Git } from "./git.ts";
 import type { Logger } from "./log.ts";
+import type { IssueState } from "./transitions.ts";
 
 /** エージェントが書いたコメントとPRに付ける目印。人間の書き込みと見分ける。 */
 export const FACTORY_MARKER = "<!-- factory -->";
@@ -21,6 +22,8 @@ export const FACTORY_MARKER = "<!-- factory -->";
 export interface GitHubIssue {
   readonly number: number;
   readonly title: string;
+  /** 本文。ないときは空文字。 */
+  readonly body: string;
   readonly open: boolean;
   readonly labels: readonly string[];
   readonly author: string | null;
@@ -80,6 +83,11 @@ export interface GitHubApi {
     path: string,
     knownSha: string | null,
   ): Promise<GitHubFileResult>;
+  /** イシュー1件に付いたコメントのすべて(古い順)。 */
+  listCommentsOnIssue(
+    repo: string,
+    issueNumber: number,
+  ): Promise<GitHubComment[]>;
   /** ブランチ `head` から出ている、オープンなPR。なければ null。 */
   findOpenPullRequest(
     repo: string,
@@ -87,6 +95,11 @@ export interface GitHubApi {
   ): Promise<GitHubPullRequest | null>;
   /** 書き込み。直接呼ばず、必ず下の `addLabels` を通す。 */
   addLabels(repo: string, issueNumber: number, labels: string[]): Promise<void>;
+  /**
+   * 書き込み。直接呼ばず、必ず下の `setStateLabel` を通す。
+   * そのラベルが付いていなくても、失敗しない。
+   */
+  removeLabel(repo: string, issueNumber: number, label: string): Promise<void>;
   /** 書き込み。直接呼ばず、必ず下の `createPullRequest` を通す。 */
   createPullRequest(
     repo: string,
@@ -143,6 +156,53 @@ export async function addLabels(
     issue: issueNumber,
     labels,
   });
+  return true;
+}
+
+/** 状態を表すラベル。`closed` はラベルではなく、イシューのクローズで表す。 */
+function stateLabel(state: IssueState): string {
+  if (state === "closed") {
+    throw new Error(
+      "closed はラベルで表せません(イシューのクローズで表します)",
+    );
+  }
+  return `state:${state}`;
+}
+
+/**
+ * イシューの状態のラベルを、`from` から `to` に付け替える。
+ *
+ * 遷移表による検査は、呼び出す側が先に済ませる。ここは書き込みだけを行う。
+ * 新しいラベルを付けてから、古いラベルを外す。途中で止まっても、もう一度呼べば同じ結果になる
+ * (付いているラベルを付けても、付いていないラベルを外しても、失敗しない)。
+ *
+ * `dry_run` が `true` のときは通信せず、付け替える予定だったことをログに出して `false` を返す。
+ */
+export async function setStateLabel(
+  ctx: WriteContext,
+  repo: string,
+  issueNumber: number,
+  change: { from: IssueState; to: IssueState },
+): Promise<boolean> {
+  const add = stateLabel(change.to);
+  const remove = stateLabel(change.from);
+  if (add === remove) {
+    throw new Error(`同じ状態には付け替えられません: ${add}`);
+  }
+  const fields = {
+    action: "set_state_label",
+    repo,
+    issue: issueNumber,
+    add,
+    remove,
+  };
+  if (ctx.dryRun) {
+    ctx.logger.info("github.write_skipped", { reason: "dry_run", ...fields });
+    return false;
+  }
+  await ctx.api.addLabels(repo, issueNumber, [add]);
+  await ctx.api.removeLabel(repo, issueNumber, remove);
+  ctx.logger.info("github.write", fields);
   return true;
 }
 
@@ -311,6 +371,7 @@ const UserSchema = z.object({ login: z.string() }).nullish();
 const IssueSchema = z.object({
   number: z.number().int(),
   title: z.string(),
+  body: z.string().nullish(),
   state: z.enum(["open", "closed"]),
   labels: z.array(
     z.union([z.string(), z.object({ name: z.string().nullish() })]),
@@ -382,6 +443,25 @@ const REQUEST_LOG_PATTERN = /^[A-Z]+ \S+ - \d{3} with id /;
 
 const ThrottledOctokit = Octokit.plugin(throttling);
 
+function toComment(item: unknown, what: string): GitHubComment {
+  const comment = parseResponse(CommentSchema, item, what);
+  const match = /\/issues\/(\d+)$/.exec(comment.issue_url);
+  if (!match?.[1]) {
+    throw new Error(
+      `コメント ${comment.id} のイシュー番号を読めません: ${comment.issue_url}`,
+    );
+  }
+  return {
+    id: comment.id,
+    issueNumber: Number.parseInt(match[1], 10),
+    body: comment.body ?? "",
+    author: comment.user?.login ?? null,
+    createdAt: comment.created_at,
+    updatedAt: comment.updated_at,
+    onPullRequest: /\/pull\/\d+#/.test(comment.html_url),
+  };
+}
+
 export function createOctokitApi(options: {
   token: string;
   logger: Logger;
@@ -442,6 +522,7 @@ export function createOctokitApi(options: {
         return {
           number: issue.number,
           title: issue.title,
+          body: issue.body ?? "",
           open: issue.state === "open",
           labels: issue.labels
             .map((label) => (typeof label === "string" ? label : label.name))
@@ -464,28 +545,18 @@ export function createOctokitApi(options: {
           ...sinceParam(since),
         },
       );
-      return items.map((item) => {
-        const comment = parseResponse(
-          CommentSchema,
-          item,
-          `${repo} のコメント`,
-        );
-        const match = /\/issues\/(\d+)$/.exec(comment.issue_url);
-        if (!match?.[1]) {
-          throw new Error(
-            `コメント ${comment.id} のイシュー番号を読めません: ${comment.issue_url}`,
-          );
-        }
-        return {
-          id: comment.id,
-          issueNumber: Number.parseInt(match[1], 10),
-          body: comment.body ?? "",
-          author: comment.user?.login ?? null,
-          createdAt: comment.created_at,
-          updatedAt: comment.updated_at,
-          onPullRequest: /\/pull\/\d+#/.test(comment.html_url),
-        };
+      return items.map((item) => toComment(item, `${repo} のコメント`));
+    },
+
+    async listCommentsOnIssue(repo, issueNumber) {
+      const items = await octokit.paginate(octokit.rest.issues.listComments, {
+        ...splitRepo(repo),
+        issue_number: issueNumber,
+        per_page: 100,
       });
+      return items.map((item) =>
+        toComment(item, `${repo} のイシュー ${issueNumber} のコメント`),
+      );
     },
 
     async getFile(repo, path, knownSha) {
@@ -548,6 +619,19 @@ export function createOctokitApi(options: {
         issue_number: issueNumber,
         labels,
       });
+    },
+
+    async removeLabel(repo, issueNumber, label) {
+      try {
+        await octokit.rest.issues.removeLabel({
+          ...splitRepo(repo),
+          issue_number: issueNumber,
+          name: label,
+        });
+      } catch (error) {
+        // 付いていないラベルは、外し終わっているものとして扱う。
+        if (statusOf(error) !== 404) throw error;
+      }
     },
 
     async createPullRequest(repo, input) {

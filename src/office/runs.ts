@@ -129,7 +129,12 @@ export function nextAttempt(db: Db, repo: string, issueNumber: number): number {
   return countFailedRuns(db, repo, issueNumber) + 1;
 }
 
-function countFailedRuns(db: Db, repo: string, issueNumber: number): number {
+/** 試行に数える失敗(`failed` で終わり、リセットされていない実行)の数。 */
+export function countFailedRuns(
+  db: Db,
+  repo: string,
+  issueNumber: number,
+): number {
   const row = db
     .prepare(
       `SELECT COUNT(*) AS n FROM runs
@@ -145,20 +150,105 @@ function countFailedRuns(db: Db, repo: string, issueNumber: number): number {
  *
  * それまでの失敗を試行に数えなくするだけで、実行の記録は消さない。次の実行は1回目になる。
  * 2回呼んでも、最初にリセットした時刻は変わらない。リセットした失敗の数を返す。
+ *
+ * `finishedUntil` を渡すと、その時刻までに終わった失敗だけをリセットする。
+ * 人間がイシューを戻した後の失敗を、後から巻き込まないためである。
  */
 export function resetAttempts(
   db: Db,
   clock: Clock,
-  target: { repo: string; issueNumber: number },
+  target: { repo: string; issueNumber: number; finishedUntil?: string },
 ): number {
   const info = db
     .prepare(
       `UPDATE runs SET attempt_reset_at = ?
        WHERE repo = ? AND issue_number = ? AND status = 'failed'
-         AND attempt_reset_at IS NULL`,
+         AND attempt_reset_at IS NULL
+         AND (? IS NULL OR finished_at <= ?)`,
     )
-    .run(isoNow(clock), target.repo, target.issueNumber);
+    .run(
+      isoNow(clock),
+      target.repo,
+      target.issueNumber,
+      target.finishedUntil ?? null,
+      target.finishedUntil ?? null,
+    );
   return info.changes;
+}
+
+/** イシューの最新の実行。なければ null。 */
+export function latestRun(
+  db: Db,
+  repo: string,
+  issueNumber: number,
+): Run | null {
+  const row = db
+    .prepare(
+      `SELECT ${RUN_COLUMNS} FROM runs
+       WHERE repo = ? AND issue_number = ? ORDER BY id DESC LIMIT 1`,
+    )
+    .get(repo, issueNumber);
+  return row === undefined ? null : parseRun(row);
+}
+
+/** `since`(UTCのISO 8601形式)以降に開始した実行の数。全リポジトリの合計で、再試行を含む。 */
+export function countRunsStartedSince(db: Db, since: string): number {
+  const row = db
+    .prepare("SELECT COUNT(*) AS n FROM runs WHERE started_at >= ?")
+    .get(since) as { n: number };
+  return row.n;
+}
+
+/**
+ * 失敗の後、次に再試行してよい時刻。待機がなければ null。
+ * 試行に数える失敗のうち、最後のものの値を返す。
+ */
+export function retryNotBefore(
+  db: Db,
+  repo: string,
+  issueNumber: number,
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT next_retry_at FROM runs
+       WHERE repo = ? AND issue_number = ? AND status = 'failed'
+         AND attempt_reset_at IS NULL
+       ORDER BY id DESC LIMIT 1`,
+    )
+    .get(repo, issueNumber) as { next_retry_at: string | null } | undefined;
+  return row?.next_retry_at ?? null;
+}
+
+/** 実行に、作業場所、ブランチ、PRの番号を記録する。渡した項目だけを書く。 */
+export function recordRunDetails(
+  db: Db,
+  runId: number,
+  details: { workspacePath?: string; branch?: string; prNumber?: number },
+): void {
+  db.prepare(
+    `UPDATE runs
+     SET worktree_path = COALESCE(?, worktree_path),
+         branch = COALESCE(?, branch),
+         pr_number = COALESCE(?, pr_number)
+     WHERE id = ?`,
+  ).run(
+    details.workspacePath ?? null,
+    details.branch ?? null,
+    details.prNumber ?? null,
+    runId,
+  );
+}
+
+/** 実行中の実行について、次に行うステップを返す。 */
+export function nextStep(
+  db: Db,
+  runId: number,
+): { step: StepName; interrupted: boolean } {
+  const run = getRun(db, runId);
+  if (run.status !== "running") {
+    throw new Error(`実行 ${runId} は終わっています(${run.status})`);
+  }
+  return pendingStep(db, run);
 }
 
 /**

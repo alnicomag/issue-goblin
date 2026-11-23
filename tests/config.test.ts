@@ -30,6 +30,7 @@ describe("ファクトリー側の設定", () => {
       logs_dir: "/data/logs",
       worker_image: "factory-worker",
       retry_wait_minutes: [5, 30, 120],
+      daily_run_limit: 20,
       commit_author: {
         name: "factory-worker",
         email: "factory-worker@example.invalid",
@@ -146,6 +147,17 @@ describe("ファクトリー側の設定", () => {
   it("失敗後の待機時間を指定できる", () => {
     const config = parseConfig(`${VALID}retry_wait_minutes: [1, 10]\n`);
     expect(config.retry_wait_minutes).toEqual([1, 10]);
+  });
+
+  it("1日の実行数の上限を指定できる。0以上の整数でなければ通さない", () => {
+    expect(parseConfig(`${VALID}daily_run_limit: 3\n`).daily_run_limit).toBe(3);
+    expect(parseConfig(`${VALID}daily_run_limit: 0\n`).daily_run_limit).toBe(0);
+    for (const value of ["-1", "1.5", '"20"']) {
+      expect(
+        () => parseConfig(`${VALID}daily_run_limit: ${value}\n`),
+        value,
+      ).toThrow("daily_run_limit");
+    }
   });
 
   it("失敗後の待機時間は、1つ以上の0以上の整数でなければ通さない", () => {

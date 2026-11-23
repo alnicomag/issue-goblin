@@ -18,6 +18,13 @@ type Call =
       issueNumber: number;
       labels: string[];
     }
+  | {
+      method: "removeLabel";
+      repo: string;
+      issueNumber: number;
+      label: string;
+    }
+  | { method: "listCommentsOnIssue"; repo: string; issueNumber: number }
   | { method: "findOpenPullRequest"; repo: string; head: string }
   | { method: "createPullRequest"; repo: string; input: NewPullRequest }
   | {
@@ -35,6 +42,7 @@ type Call =
 
 const WRITE_METHODS: readonly Call["method"][] = [
   "addLabels",
+  "removeLabel",
   "createPullRequest",
   "updatePullRequest",
   "createIssueComment",
@@ -68,6 +76,7 @@ export class FakeGitHub implements GitHubApi {
     const previous = this.issues.find((i) => i.number === issue.number);
     const next: GitHubIssue = {
       title: `Issue ${issue.number}`,
+      body: "",
       open: true,
       labels: [],
       author: "someone",
@@ -136,10 +145,32 @@ export class FakeGitHub implements GitHubApi {
       const bumped = new Date(Date.parse(issue.updatedAt) + 1000).toISOString();
       this.putIssue({
         number: issueNumber,
-        labels: [...issue.labels, ...labels],
+        labels: [...new Set([...issue.labels, ...labels])],
         updatedAt: bumped,
       });
     }
+  }
+
+  async removeLabel(repo: string, issueNumber: number, label: string) {
+    this.calls.push({ method: "removeLabel", repo, issueNumber, label });
+    if (this.failWritesWith) throw this.failWritesWith;
+    const issue = this.issues.find((i) => i.number === issueNumber);
+    if (issue?.labels.includes(label)) {
+      const bumped = new Date(Date.parse(issue.updatedAt) + 1000).toISOString();
+      this.putIssue({
+        number: issueNumber,
+        labels: issue.labels.filter((l) => l !== label),
+        updatedAt: bumped,
+      });
+    }
+  }
+
+  async listCommentsOnIssue(repo: string, issueNumber: number) {
+    this.calls.push({ method: "listCommentsOnIssue", repo, issueNumber });
+    if (this.failWith) throw this.failWith;
+    return this.comments
+      .filter((comment) => comment.issueNumber === issueNumber)
+      .sort((a, b) => a.id - b.id);
   }
 
   async findOpenPullRequest(

@@ -2,12 +2,13 @@
 
 GitHubのイシューを入力として、AIエージェントが実装からプルリクエストの作成までを進める「ソフトウェアファクトリー」です。
 
-現在は段階1(ワーカー)の途中で、次のことができます。
+現在は段階1(ワーカー)で、次のことができます。
 
 - 対象リポジトリのイシューとコメントをポーリングで取り込み、SQLiteに記録する。
 - `state:` ラベルのない新規イシューに `state:triage` を付ける(`dry_run: false` のときだけ)。
 - 対象リポジトリの `factory.yml` を取得して検証する。
-- ワーカーを、資格情報のない隔離されたコンテナで動かす(起動の仕組みまで。イシューの実装はまだ行わない)。
+- ワーカーを、資格情報のない隔離されたコンテナで動かす。
+- 人間が `state:ready` にしたイシューに着手し、計画、実装、検査、レビューを経て、プルリクエストを作る(`dry_run: false` のときだけ)。分類と着手の判断(司令塔)は、まだない。
 
 設計は `docs/design.md`、段階0の仕様は `docs/stage0.md` にあります。
 
@@ -50,7 +51,8 @@ GITHUB_TOKEN_EXAMPLE=<トークン>
 | 権限 | `dry_run: true` | `dry_run: false` |
 | --- | --- | --- |
 | Issues | 読み取り | 読み書き |
-| Contents | 読み取り | 読み取り |
+| Contents | 読み取り | 読み書き(作業用のブランチの push) |
+| Pull requests | 不要 | 読み書き |
 
 `config/factory.config.yml` と `.env` はGit管理外です。
 
@@ -107,7 +109,7 @@ docker compose logs -f office
 - 起動時にマイグレーションを実行します。未適用のものがあれば、適用前にDBファイルを同じ場所に複製します(`factory.db.bak-v<版>-<日時>`)。
 - DBファイルは名前付きボリューム `factory-data` に置かれます。
 - `restart: unless-stopped` なので、ホストの再起動後も自動で復旧します。Dockerが起動時に立ち上がるようにしておいてください(`sudo systemctl enable docker`)。
-- 停止は `docker compose stop` です。実行中のポーリングを終えてから終了します。
+- 停止は `docker compose stop` です。実行中のポーリングを終えてから終了します。ワーカーが実行中のステップは待たずに止め、次の起動でそのステップからやり直します(試行には数えません)。
 - ログは1行1件のJSONです。
 
 設定を変えたときは、`docker compose restart office` で読み直します。
@@ -115,6 +117,17 @@ docker compose logs -f office
 ### GitHubへの書き込みを有効にする
 
 `dry_run` を `false` にすると、`state:` ラベルのないオープンのイシューに `state:triage` が付きます。`true` の間は、付ける予定だったことをログに出すだけです(`github.write_skipped`)。
+
+`dry_run` が `false` の間は、`state:ready` のイシューに着手します。`true` の間は、着手も、途中の実行を進めることもしません(ラベルを書けないと、GitHubから見えないところで作業が進むためです)。
+
+着手するのは、次をすべて満たすイシューです。順は、`priority:` の高い順、同じなら番号の若い順です。
+
+- 状態が `state:ready` で、`agent:skip` が付いていない。
+- 起票者が、製品の `factory.yml` の `issues.allowed_authors` にいる。
+- 同時実行の枠(`limits.max_parallel`)と、1日の実行数の上限(`daily_run_limit`、UTCの1日、全リポジトリの合計)に収まる。
+- 失敗の後の待機時間(`retry_wait_minutes`)が過ぎている。
+
+実行中に人間が `state:` ラベルを変えると、事務局は実行を取り消して、その状態に従います。
 
 ## ワーカーの隔離を確かめる
 

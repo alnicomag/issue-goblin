@@ -4,6 +4,7 @@
  * GitHubが正。人間がラベルを手で変えた場合も、遷移表による検査はせずにそのまま受け入れる。
  * 同じ変更を2回処理しても、イベントが二重に記録されないようにしている。
  * イシューのイベントは、DBにある現在の内容との差分があるときだけ記録する。
+ * 状態の差分は、`github_updated_at` が進んだ内容からだけ読む(事務局自身の変更の直後に届く、古い内容を除くため)。
  * 差分に現れないもの(ラベルの競合、ラベル付け)は `github_updated_at` が進んだときだけ扱う。
  * コメントは、コメントIDで既出かを確かめる。
  */
@@ -18,12 +19,15 @@ import {
   type GitHubIssue,
   type WriteContext,
 } from "./github.ts";
+import type { RepoLocks } from "./locks.ts";
 import { errorFields, type Logger } from "./log.ts";
 import { syncFactoryYml } from "./product.ts";
 import { type IssueState, isIssueState } from "./transitions.ts";
 
 export const STATE_LABEL_PREFIX = "state:";
 export const TRIAGE_LABEL = "state:triage";
+/** エージェントが触らないイシューに、人間が付けるラベル。 */
+export const AGENT_SKIP_LABEL = "agent:skip";
 
 const PRIORITIES = ["p0", "p1", "p2", "p3"] as const;
 const SIZES = ["s", "m", "l"] as const;
@@ -114,6 +118,11 @@ export interface SyncDeps {
   readonly dryRun: boolean;
   readonly clock: Clock;
   readonly logger: Logger;
+  /**
+   * リポジトリごとの排他。事務局自身の状態の変更(`transition-apply.ts`)と、同じものを渡す。
+   * 取得した内容を取り込む途中で事務局がラベルを変えると、古い内容を人間の変更と見誤るためである。
+   */
+  readonly locks?: RepoLocks;
 }
 
 export interface SyncOptions {
@@ -148,9 +157,11 @@ export async function syncAll(
   const results: RepoSyncResult[] = [];
   for (const repo of repos) {
     try {
-      const result = await syncRepo(deps, repo, {
-        full: options.fullRepos?.has(repo) ?? false,
-      });
+      const run = () =>
+        syncRepo(deps, repo, { full: options.fullRepos?.has(repo) ?? false });
+      const result = await (deps.locks === undefined
+        ? run()
+        : deps.locks.run(repo, run));
       deps.logger.info("sync.repo_done", { ...result });
       results.push(result);
     } catch (error) {
@@ -171,6 +182,9 @@ interface IssueRow {
   state: string;
   priority: string | null;
   size: string | null;
+  author: string | null;
+  body: string | null;
+  agent_skip: number;
   github_updated_at: string;
 }
 
@@ -269,23 +283,27 @@ async function syncIssue(
   const { db, clock, logger } = deps;
   const existing = db
     .prepare(
-      `SELECT title, state, priority, size, github_updated_at
+      `SELECT title, state, priority, size, author, body, agent_skip,
+              github_updated_at
        FROM issues WHERE repo = ? AND number = ?`,
     )
     .get(repo, issue.number) as IssueRow | undefined;
 
   const derived = deriveIssue(issue);
+  const agentSkip = issue.labels.includes(AGENT_SKIP_LABEL) ? 1 : 0;
   // 前回の取り込みより後に更新されたか。取得範囲は前回と重なるので、
   // 同じ内容がもう一度届くことがある(再起動の後も同じ)。
   const fresh =
     existing === undefined || issue.updatedAt > existing.github_updated_at;
   if (existing !== undefined && !fresh) {
-    const state = derived.state ?? existing.state;
+    // 更新時刻が進んでいない内容からは、状態を読まない(下の説明)。
     const unchanged =
-      state === existing.state &&
       issue.title === existing.title &&
       derived.priority === existing.priority &&
-      derived.size === existing.size;
+      derived.size === existing.size &&
+      issue.author === existing.author &&
+      issue.body === existing.body &&
+      agentSkip === existing.agent_skip;
     const labelDue = full && derived.needsTriageLabel;
     if (unchanged && !labelDue) return null;
   }
@@ -328,8 +346,9 @@ async function syncIssue(
       const state: IssueState = derived.state ?? "triage";
       db.prepare(
         `INSERT INTO issues
-           (repo, number, title, state, priority, size, github_updated_at, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+           (repo, number, title, state, priority, size, author, body, agent_skip,
+            github_updated_at, synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         repo,
         issue.number,
@@ -337,6 +356,9 @@ async function syncIssue(
         state,
         derived.priority,
         derived.size,
+        issue.author,
+        issue.body,
+        agentSkip,
         issue.updatedAt,
         now,
       );
@@ -359,10 +381,14 @@ async function syncIssue(
     }
 
     // 状態を決められないときは、状態を更新しない。
-    const state = derived.state ?? existing.state;
+    // 更新時刻が進んでいない内容からも、状態を読まない。事務局が自分でラベルを変えた直後に、
+    // GitHubが変更前の内容を返すことがあり、それを人間の変更と見誤らないためである。
+    // 事務局の変更も人間の変更も、更新時刻を進めるので、進んだ内容が届いたときに読めば足りる。
+    const state = fresh ? (derived.state ?? existing.state) : existing.state;
     db.prepare(
       `UPDATE issues
          SET title = ?, state = ?, priority = ?, size = ?,
+             author = ?, body = ?, agent_skip = ?,
              github_updated_at = ?, synced_at = ?
        WHERE repo = ? AND number = ?`,
     ).run(
@@ -370,6 +396,9 @@ async function syncIssue(
       state,
       derived.priority,
       derived.size,
+      issue.author,
+      issue.body,
+      agentSkip,
       fresh ? issue.updatedAt : existing.github_updated_at,
       now,
       repo,

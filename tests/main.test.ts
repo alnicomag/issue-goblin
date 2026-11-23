@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { type LogFields, silentLogger } from "../src/office/log.ts";
-import { createApis, runLoop } from "../src/office/main.ts";
+import { createApis, pollOnce, runLoop } from "../src/office/main.ts";
+import { findResumableRuns } from "../src/office/runs.ts";
+import { createHarness, REPO } from "./factory-harness.ts";
+import { FakeGitHub } from "./fake-github.ts";
 
 describe("メインループ", () => {
   it("止められるまで、間隔をあけて繰り返す", async () => {
@@ -71,6 +74,105 @@ describe("メインループ", () => {
   });
 });
 
+describe("1回のポーリング", () => {
+  it("同期の後に、同期できたリポジトリだけの実行を扱う", async () => {
+    const h = createHarness();
+    try {
+      const broken = new FakeGitHub();
+      broken.failWith = new Error("boom");
+      const ticks: (readonly string[])[] = [];
+      const pendingFull = new Set(["owner/broken", REPO]);
+      h.putIssue(1);
+      await pollOnce({
+        sync: {
+          db: h.db,
+          apiFor: (repo) => (repo === REPO ? h.fake : broken),
+          dryRun: false,
+          clock: h.clock,
+          logger: h.logger,
+          locks: h.locks,
+        },
+        supervisor: {
+          tick: async (repos) => {
+            // 同期が先に済んでいる。
+            expect(h.state(1)).toBe("ready");
+            ticks.push(repos);
+          },
+        },
+        repos: ["owner/broken", REPO],
+        pendingFull,
+      });
+      expect(ticks).toEqual([[REPO]]);
+      expect([...pendingFull]).toEqual(["owner/broken"]);
+    } finally {
+      h.cleanup();
+    }
+  });
+
+  it("止める合図で、実行中のステップを待たずに終わり、起動し直すと続きから進む", async () => {
+    const h = createHarness();
+    try {
+      const poll = (supervisor: ReturnType<typeof h.newSupervisor>) => () =>
+        pollOnce({
+          sync: {
+            db: h.db,
+            apiFor: () => h.fake,
+            dryRun: false,
+            clock: h.clock,
+            logger: h.logger,
+            locks: h.locks,
+          },
+          supervisor,
+          repos: [REPO],
+          pendingFull: new Set(),
+        });
+
+      // SIGTERMに当たる合図を、implement の途中で出す。
+      const controller = new AbortController();
+      let release: () => void = () => {};
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      h.worker.scripts.set("implement", async () => {
+        controller.abort();
+        await held;
+        return undefined;
+      });
+      h.putIssue(1);
+      const first = h.newSupervisor();
+      await runLoop({
+        poll: poll(first),
+        intervalMs: 5,
+        signal: controller.signal,
+        logger: h.logger,
+      });
+      // ステップは終わっていないが、待たずに止まる。
+      expect(await first.stop(20)).toBe(false);
+      release();
+      await first.idle();
+      expect(findResumableRuns(h.db)).toMatchObject([
+        { step: "implement", interrupted: true, run: { attempt: 1 } },
+      ]);
+
+      // 起動し直す。
+      h.worker.scripts.delete("implement");
+      const second = h.newSupervisor();
+      await poll(second)();
+      await second.idle();
+      await poll(second)();
+      expect(h.labels(1)).toEqual(["state:in-review"]);
+      expect(h.fake.pullRequests).toHaveLength(1);
+      expect(h.worker.callsOf("plan")).toHaveLength(1);
+      expect(h.db.prepare("SELECT attempt, status FROM runs").all()).toEqual([
+        { attempt: 1, status: "running" },
+      ]);
+      await second.stop(1000);
+    } finally {
+      h.cleanup();
+    }
+  });
+});
+
 describe("起動時のトークンの確認", () => {
   const config = {
     dry_run: true,
@@ -81,6 +183,7 @@ describe("起動時のトークンの確認", () => {
     logs_dir: "/data/logs",
     worker_image: "factory-worker",
     retry_wait_minutes: [5, 30, 120],
+    daily_run_limit: 20,
     commit_author: { name: "Example", email: "example@example.invalid" },
     repos: [
       { repo: "owner/first", token_env: "TOKEN_FIRST" },

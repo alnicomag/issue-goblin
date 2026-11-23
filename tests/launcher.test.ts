@@ -544,6 +544,47 @@ describe("起動係の窓口", () => {
     finish({ exitCode: 137, stdout: "", stderr: "", truncated: false });
   });
 
+  it("事務局の側から中断すると、例外で戻り、コンテナを止める", async () => {
+    let started: () => void = () => {};
+    const running = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    let finish: (result: CommandResult) => void = () => {};
+    const fake = fakeDocker(
+      () =>
+        new Promise<CommandResult>((resolve) => {
+          finish = resolve;
+          started();
+        }),
+    );
+    const client = createLauncherClient({
+      socketPath: await serve(fake.docker),
+    });
+    const controller = new AbortController();
+    const pending = client.run(REQUEST, { signal: controller.signal });
+    await running;
+    controller.abort();
+
+    await expect(pending).rejects.toThrow("起動係への依頼を中断しました");
+    await expect
+      .poll(() => fake.kills().map((kill) => kill.args))
+      .toEqual([["kill", "factory-worker-test-1"]]);
+    finish({ exitCode: 137, stdout: "", stderr: "", truncated: false });
+  });
+
+  it("すでに中断されていれば、依頼せずに例外で戻る", async () => {
+    const fake = fakeDocker();
+    const client = createLauncherClient({
+      socketPath: await serve(fake.docker),
+    });
+    const controller = new AbortController();
+    controller.abort();
+    await expect(
+      client.run(REQUEST, { signal: controller.signal }),
+    ).rejects.toThrow("起動係への依頼を中断しました");
+    expect(fake.calls).toHaveLength(0);
+  });
+
   it("JSONでない依頼と、知らない宛先は拒否する", async () => {
     const fake = fakeDocker();
     const socketPath = await serve(fake.docker);
