@@ -12,6 +12,9 @@
  * 食い違ったまま合格にしないように、コマンドの前に、コミットされていない内容が残っていないことを
  * 確かめる。確かめるためのgitも、事務局の中ではなく、起動係を通したコンテナの中で実行する。
  * 作業場所のgit設定はワーカーが書き換えられ、事務局の権限でコマンドを起動できるからである。
+ *
+ * review の差分と publish が見るのは、作業用のブランチのコミットである。同じ確認で、
+ * 取り出されているのが作業用のブランチであることも確かめる。
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -24,7 +27,7 @@ import { type Clock, systemClock } from "./clock.ts";
 import type { Db } from "./db.ts";
 import { type FactoryYml, readStoredFactoryYml } from "./product.ts";
 import { maskSecrets, stepLogDir, writeStepLog } from "./step-log.ts";
-import { type WorkspaceDirs, workspacePaths } from "./workspace.ts";
+import { branchFor, type WorkspaceDirs, workspacePaths } from "./workspace.ts";
 
 /** 検査コマンドの名前。この順に実行する。 */
 export const VERIFY_COMMANDS = ["setup", "test", "lint"] as const;
@@ -33,7 +36,8 @@ export type VerifyCommandName = (typeof VERIFY_COMMANDS)[number];
 /**
  * 作業場所の状態を確かめるコマンド。コンテナの中の、製品のcloneで実行する。
  *
- * - 出力は、パスごとにNULで区切る(`-z`)。パスは引用されない。
+ * - 出力の先頭に、取り出されているブランチの項目(`## <ブランチ>`)を付ける(`--branch`)。
+ * - 出力は、項目ごとにNULで区切る(`-z`)。パスは引用されない。
  * - 追跡していないファイルは、ディレクトリにまとめずに1つずつ挙げる。無視対象は挙げない。
  * - 改名は1つにまとめず、消したパスと足したパスに分ける(1項目が1パスになる)。
  * - 確かめるだけで、インデックスを書き換えない(`--no-optional-locks`)。
@@ -43,6 +47,7 @@ export const STATUS_ARGV = [
   "--no-optional-locks",
   "status",
   "--porcelain=v1",
+  "--branch",
   "-z",
   "--untracked-files=all",
   "--no-renames",
@@ -98,8 +103,8 @@ export interface VerifyCommandResult {
  *
  * - `done`: すべてのコマンドが終了コード0で終わった(合格)。
  * - `rework`: 終了コードが0でないコマンド、または時間切れのコマンドがあった(不合格)。
- *   または、作業場所にコミットされていない内容が残っていて、コマンドを実行しなかった。
- *   implement に差し戻す。
+ *   または、作業場所にコミットされていない内容が残っていたか、作業用のブランチ以外が
+ *   取り出されていて、コマンドを実行しなかった。implement に差し戻す。
  * - `failed`: コマンドを実行できなかった、または作業場所の状態を確かめられなかった。
  *   製品の側の失敗ではないので、差し戻さない。
  */
@@ -117,6 +122,11 @@ export interface VerifyResult {
   readonly uncommittedPaths: readonly string[];
   /** 残っていたパスの数(載せなかったものを含む)。 */
   readonly uncommittedCount: number;
+  /**
+   * 作業用のブランチ以外が取り出されていた場合の、取り出されていたもの(`checkedOut`)と、
+   * 戻すべきブランチ(`expected`)。差し戻しのときに、implement へ渡す。それ以外は null。
+   */
+  readonly wrongBranch: WrongBranch | null;
   /** この実行のログのファイル。 */
   readonly logPath: string;
   /**
@@ -124,6 +134,17 @@ export interface VerifyResult {
    * `outcome` は `failed` だが、検査が失敗したわけではない。ログには `interrupted` と残る。
    */
   readonly interrupted: boolean;
+}
+
+/** 作業用のブランチ以外が取り出されていた、という記録。 */
+export interface WrongBranch {
+  /**
+   * 取り出されていたもの。ブランチならその名前。ブランチなしの取り出しなどは、
+   * gitの表示(`HEAD (no branch)` など)のまま。
+   */
+  readonly checkedOut: string;
+  /** 戻すべき、作業用のブランチ。 */
+  readonly expected: string;
 }
 
 /** 中断した検査の要約。実行できなかった場合や、確かめられなかった場合とは別の文にする。 */
@@ -135,26 +156,61 @@ export function buildVerifyArgv(command: string): string[] {
   return ["sh", "-c", command];
 }
 
+/** 取り出されているブランチの項目の、先頭の印。 */
+const HEAD_PREFIX = "## ";
+
+/** 項目の中で、ブランチ名と、追跡先の表示を分ける印。ブランチ名には現れない。 */
+const UPSTREAM_SEPARATOR = "...";
+
 /**
- * `git status --porcelain=v1 -z --no-renames` の出力から、パスを取り出す純粋関数。
+ * `git status --porcelain=v1 --branch -z --no-renames` の出力を、取り出されているブランチの
+ * 項目と、パスに分ける純粋関数。
  *
- * 項目は「状態の2文字、空白、パス」で、NULで区切られている。想定外の形の項目は、
- * 捨てずにそのまま残す(残っているものを、ないものとして扱わないため)。
+ * 項目はNULで区切られている。先頭が `## ` で始まる項目で、その後ろをそのまま `head` に返す
+ * (`<ブランチ>`、`<ブランチ>...<追跡先> [ahead 1]`、`HEAD (no branch)` など)。なければ null。
+ * 残りは「状態の2文字、空白、パス」で、想定外の形の項目は、捨てずにそのまま残す
+ * (残っているものを、ないものとして扱わないため)。
  */
-export function parseStatusPaths(stdout: string): string[] {
-  return stdout
-    .split("\0")
-    .filter((entry) => entry !== "")
-    .map((entry) =>
+export function parseStatus(stdout: string): {
+  head: string | null;
+  paths: string[];
+} {
+  const entries = stdout.split("\0").filter((entry) => entry !== "");
+  const first = entries[0];
+  const hasHead = first?.startsWith(HEAD_PREFIX) === true;
+  return {
+    head: hasHead ? first.slice(HEAD_PREFIX.length) : null,
+    paths: (hasHead ? entries.slice(1) : entries).map((entry) =>
       entry.length > 3 && entry[2] === " " ? entry.slice(3) : entry,
-    );
+    ),
+  };
+}
+
+/**
+ * ブランチの項目(`parseStatus` の `head`)が、ブランチ `branch` の取り出しを表すかを
+ * 決める純粋関数。
+ *
+ * 一致とみなすのは、項目がブランチ名そのものか、ブランチ名に追跡先の表示が続く場合だけである。
+ * ブランチなしの取り出しや、コミットのないブランチの表示は、文言を当てにせず、
+ * 一致しないものとして扱う(gitの文言は、実行する環境で変わりうる)。
+ */
+export function isOnBranch(head: string, branch: string): boolean {
+  return head === branch || head.startsWith(`${branch}${UPSTREAM_SEPARATOR}`);
+}
+
+/** ブランチの項目から、追跡先の表示を除く。指摘に載せるための形。 */
+function checkedOutOf(head: string): string {
+  const at = head.indexOf(UPSTREAM_SEPARATOR);
+  return at === -1 ? head : head.slice(0, at);
 }
 
 /**
  * 作業場所の状態。
  *
- * - `clean`: コミットされていない内容がない。
+ * - `clean`: 作業用のブランチが取り出されていて、コミットされていない内容がない。
  * - `dirty`: コミットしていない変更か、追跡していないファイルがある。
+ * - `wrong_branch`: 作業用のブランチ以外(別のブランチ、ブランチなしの取り出し)が
+ *   取り出されている。コミットされていない内容も残っていれば、`paths` に入る。
  * - `unknown`: 確かめられなかった。
  * - `interrupted`: 確かめている途中で、依頼した側が止めた(事務局の停止)。
  */
@@ -162,10 +218,22 @@ export type WorkspaceStatus =
   | { readonly status: "clean" }
   | { readonly status: "interrupted" }
   | { readonly status: "dirty"; readonly paths: readonly string[] }
+  | {
+      readonly status: "wrong_branch";
+      readonly checkedOut: string;
+      readonly expected: string;
+      readonly paths: readonly string[];
+    }
   | { readonly status: "unknown"; readonly reason: string };
 
-/** 起動係の結果(状態の確認)を、作業場所の状態にする純粋関数。 */
-export function interpretStatus(run: RunResult): WorkspaceStatus {
+/**
+ * 起動係の結果(状態の確認)を、作業場所の状態にする純粋関数。
+ * `branch` は、取り出されているはずの、作業用のブランチ。
+ */
+export function interpretStatus(
+  run: RunResult,
+  branch: string,
+): WorkspaceStatus {
   if (run.timed_out) {
     return { status: "unknown", reason: "時間の上限に達しました" };
   }
@@ -176,7 +244,21 @@ export function interpretStatus(run: RunResult): WorkspaceStatus {
     };
   }
   // 出力が途中で切られていても、読めた分のパスがあるので、残っているものとして扱う。
-  const paths = parseStatusPaths(run.stdout);
+  const { head, paths } = parseStatus(run.stdout);
+  if (head === null || head.trim() === "") {
+    return {
+      status: "unknown",
+      reason: "git status の出力に、取り出されているブランチの項目がありません",
+    };
+  }
+  if (!isOnBranch(head, branch)) {
+    return {
+      status: "wrong_branch",
+      checkedOut: checkedOutOf(head),
+      expected: branch,
+      paths,
+    };
+  }
   return paths.length === 0 ? { status: "clean" } : { status: "dirty", paths };
 }
 
@@ -286,7 +368,7 @@ export function judgeVerify(
   };
 }
 
-/** 作業場所がきれいでなかった場合の、全体の結果を決める純粋関数。 */
+/** 作業場所が、検査できる状態でなかった場合の、全体の結果を決める純粋関数。 */
 export function judgeWorkspace(
   workspace: Exclude<WorkspaceStatus, { status: "clean" }>,
 ): Pick<VerifyResult, "outcome" | "passed" | "summary" | "failedCommands"> {
@@ -303,6 +385,18 @@ export function judgeWorkspace(
       outcome: "failed",
       passed: false,
       summary: `作業場所の状態を確かめられませんでした: ${workspace.reason}`,
+      failedCommands: [],
+    };
+  }
+  if (workspace.status === "wrong_branch") {
+    const uncommitted =
+      workspace.paths.length === 0
+        ? ""
+        : `。コミットされていない内容も${workspace.paths.length}件残っています。必要なものはコミットし、不要なものは元に戻すか消してください`;
+    return {
+      outcome: "rework",
+      passed: false,
+      summary: `作業用のブランチ「${workspace.expected}」ではなく、「${displayPath(workspace.checkedOut)}」が取り出されているので、検査コマンドを実行しませんでした。検査の対象になり、PRに入るのは、作業用のブランチのコミットだけです。作業用のブランチ「${workspace.expected}」に切り替え、必要なコミットをそこに取り込んでください${uncommitted}`,
       failedCommands: [],
     };
   }
@@ -360,8 +454,9 @@ function logText(
 /**
  * 検査コマンドを順に実行し、合否とログの場所を返す。
  *
- * 最初に作業場所の状態を確かめ、コミットされていない内容が残っていれば、コマンドを
- * 1つも実行せずに `rework` を返す。確かめられなかった場合は `failed` を返す。
+ * 最初に作業場所の状態を確かめ、コミットされていない内容が残っているか、作業用のブランチ
+ * 以外が取り出されていれば、コマンドを1つも実行せずに `rework` を返す。
+ * 確かめられなかった場合は `failed` を返す。
  *
  * コマンドの失敗と時間切れは、例外ではなく結果(`rework`)として返る。
  * 途中で止められた場合も、例外ではなく `interrupted` を立てて返る。
@@ -388,13 +483,14 @@ export async function runVerify(
   const factoryYml: FactoryYml = readStoredFactoryYml(deps.db, repo);
   const paths = workspacePaths(deps.dirs, repo, issue);
   assertWorkspace(paths.repoDir, repo, issue);
+  const branch = branchFor(issue);
   const logDir = stepLogDir(deps.logsDir, repo, issue);
 
   const startedAt = clock.now();
   const results: VerifyCommandResult[] = [];
   const outputs: { name: string; run: RunResult | null }[] = [];
 
-  // 先に、コミットされていない内容が残っていないことを確かめる。
+  // 先に、作業用のブランチが取り出されていて、コミットされていない内容が残っていないことを確かめる。
   let workspace: WorkspaceStatus;
   try {
     const run = await deps.launcher.run({
@@ -404,7 +500,7 @@ export async function runVerify(
       claude_token: false,
       timeout_sec: Math.min(timeoutSec, STATUS_TIMEOUT_SEC),
     });
-    workspace = interpretStatus(run);
+    workspace = interpretStatus(run, branch);
     // ログでは、区切りのNULを改行にする。
     outputs.push({
       name: "status",
@@ -466,12 +562,21 @@ export async function runVerify(
   }
   const finishedAt = clock.now();
 
-  const uncommittedCount =
-    workspace.status === "dirty" ? workspace.paths.length : 0;
-  const uncommittedPaths =
-    workspace.status === "dirty"
-      ? workspace.paths.slice(0, MAX_UNCOMMITTED_PATHS).map(displayPath)
+  const leftPaths =
+    workspace.status === "dirty" || workspace.status === "wrong_branch"
+      ? workspace.paths
       : [];
+  const uncommittedCount = leftPaths.length;
+  const uncommittedPaths = leftPaths
+    .slice(0, MAX_UNCOMMITTED_PATHS)
+    .map(displayPath);
+  const wrongBranch: WrongBranch | null =
+    workspace.status === "wrong_branch"
+      ? {
+          checkedOut: displayPath(workspace.checkedOut),
+          expected: workspace.expected,
+        }
+      : null;
   const judged =
     workspace.status === "clean"
       ? judgeVerify(results, timeoutSec)
@@ -491,6 +596,7 @@ export async function runVerify(
     summary: judged.summary,
     workspace: {
       status: workspace.status,
+      checked_out: wrongBranch?.checkedOut ?? null,
       uncommitted_count: uncommittedCount,
     },
     commands: results.map((result) => ({
@@ -513,6 +619,7 @@ export async function runVerify(
     commands: results,
     uncommittedPaths,
     uncommittedCount,
+    wrongBranch,
     logPath,
     interrupted,
   };
