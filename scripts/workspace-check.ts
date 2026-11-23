@@ -30,26 +30,32 @@ function report(ok: boolean, item: string, detail = ""): void {
 
 /** 守りを付けない素のgit。仮のリポジトリの用意と、結果の確認に使う。 */
 function plainGit(cwd: string, ...args: string[]): string {
-  return execFileSync(
-    "git",
-    [
-      "-c",
-      "user.name=Example",
-      "-c",
-      "user.email=example@example.invalid",
-      ...args,
-    ],
-    {
-      cwd,
-      encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        PATH: process.env.PATH ?? "",
-        GIT_CONFIG_NOSYSTEM: "1",
-        GIT_CONFIG_GLOBAL: "/dev/null",
-      },
+  return rawGit(
+    cwd,
+    "-c",
+    "user.name=Example",
+    "-c",
+    "user.email=example@example.invalid",
+    ...args,
+  );
+}
+
+/** 作者を渡さず、推測もさせないgit。ユーザーとシステムのgit設定は読まない。 */
+function unconfiguredGit(cwd: string, ...args: string[]): string {
+  return rawGit(cwd, "-c", "user.useConfigOnly=true", ...args);
+}
+
+function rawGit(cwd: string, ...args: string[]): string {
+  return execFileSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      PATH: process.env.PATH ?? "",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
     },
-  ).trim();
+  }).trim();
 }
 
 async function main(): Promise<void> {
@@ -79,7 +85,12 @@ async function main(): Promise<void> {
 
   console.log("\n# 作業場所の準備と後片付け");
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "workspace-check-"));
-  const input = { dirs, repo: first.repo, issue: ISSUE };
+  const input = {
+    dirs,
+    repo: first.repo,
+    issue: ISSUE,
+    author: config.commit_author,
+  };
   try {
     const source = path.join(tmp, "source");
     fs.mkdirSync(source);
@@ -123,6 +134,27 @@ async function main(): Promise<void> {
     report(
       !again.created && again.repoDir === prepared.repoDir,
       "prepare をやり直すと、すでにある作業場所を使う",
+    );
+
+    let committed: string;
+    try {
+      fs.writeFileSync(path.join(prepared.repoDir, "work.txt"), "work\n");
+      unconfiguredGit(prepared.repoDir, "add", "--", "work.txt");
+      unconfiguredGit(prepared.repoDir, "commit", "--quiet", "-m", "work");
+      committed = unconfiguredGit(
+        prepared.repoDir,
+        "log",
+        "-1",
+        "--format=%an <%ae>",
+      );
+    } catch (error) {
+      committed = String(error);
+    }
+    const expected = `${config.commit_author.name} <${config.commit_author.email}>`;
+    report(
+      committed === expected,
+      `作業場所で、git設定を足さずにコミットでき、作者が設定の値(${expected})になる`,
+      committed,
     );
 
     cleanupWorkspace(input);
