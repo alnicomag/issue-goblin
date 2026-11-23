@@ -113,6 +113,7 @@ describe("同期", () => {
       author: "alice",
       body: "",
       agent_skip: 0,
+      approved: 0,
       github_updated_at: T1,
       synced_at: NOW,
     });

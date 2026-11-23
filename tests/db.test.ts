@@ -10,6 +10,7 @@ const clockAt = (iso: string): Clock => ({ now: () => new Date(iso) });
 const clock = clockAt("2026-01-02T03:04:05.000Z");
 
 const EXPECTED_TABLES = [
+  "approvals",
   "decisions",
   "events",
   "issues",
@@ -67,9 +68,9 @@ describe("マイグレーション", () => {
   it("空のDBに適用できる", () => {
     const result = migrate(db, { clock });
 
-    expect(result.applied).toEqual([1, 2, 3, 4]);
+    expect(result.applied).toEqual([1, 2, 3, 4, 5]);
     expect(tableNames(db)).toEqual(EXPECTED_TABLES);
-    expect(currentVersion(db)).toBe(4);
+    expect(currentVersion(db)).toBe(5);
   });
 
   it("実行中の実行とステップの重複を防ぐ索引がある", () => {
@@ -93,6 +94,40 @@ describe("マイグレーション", () => {
     );
   });
 
+  it("issues に承認のラベルの有無を残す列があり、既定は 0", () => {
+    migrate(db, { clock });
+    const columns = db.pragma("table_info(issues)") as {
+      name: string;
+      notnull: number;
+      dflt_value: string | null;
+    }[];
+    expect(columns.find((column) => column.name === "approved")).toMatchObject({
+      notnull: 1,
+      dflt_value: "0",
+    });
+  });
+
+  it("承認は、止まったステップ1つにつき1件まで", () => {
+    migrate(db, { clock });
+    db.prepare(
+      `INSERT INTO runs (repo, issue_number, attempt, status, started_at)
+       VALUES ('owner/name', 1, 1, 'held', '2026-01-01T00:00:00.000Z')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO steps (run_id, name, status, started_at)
+       VALUES (1, 'publish', 'held', '2026-01-01T00:00:00.000Z')`,
+    ).run();
+    const insert = db.prepare(
+      `INSERT INTO approvals (repo, issue_number, run_id, step_id, head_commit, created_at)
+       VALUES ('owner/name', 1, 1, 1, 'abc', '2026-01-01T00:00:00.000Z')`,
+    );
+    insert.run();
+    expect(() => insert.run()).toThrow(/UNIQUE/);
+    expect(db.prepare("SELECT used_at FROM approvals").all()).toEqual([
+      { used_at: null },
+    ]);
+  });
+
   it("状態を持つテーブルはリポジトリの列を持つ", () => {
     migrate(db, { clock });
     for (const table of [
@@ -101,6 +136,7 @@ describe("マイグレーション", () => {
       "events",
       "decisions",
       "runs",
+      "approvals",
       "schedules",
       "reports",
     ]) {
@@ -121,7 +157,7 @@ describe("マイグレーション", () => {
 
     expect(second).toEqual({ applied: [], backupPath: null });
     expect(schemaDump(db)).toEqual(before);
-    expect(currentVersion(db)).toBe(4);
+    expect(currentVersion(db)).toBe(5);
     expect(backups()).toEqual(backupsBefore);
   });
 
