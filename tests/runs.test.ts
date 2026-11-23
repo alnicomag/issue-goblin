@@ -4,12 +4,18 @@ import { type Db, migrate, openDb } from "../src/office/db.ts";
 import type { StepName, StepOutcome } from "../src/office/run-steps.ts";
 import {
   cancelRun,
+  countFailedRuns,
+  countRunsStartedSince,
   findResumableRuns,
   finishStep,
   getRun,
+  latestRun,
   listSteps,
   nextAttempt,
+  nextStep,
+  recordRunDetails,
   resetAttempts,
+  retryNotBefore,
   startRun,
   startStep,
 } from "../src/office/runs.ts";
@@ -607,6 +613,36 @@ describe("実行とステップの記録", () => {
       expect(db.prepare("SELECT * FROM runs").all()).toEqual(before);
     });
 
+    it("時刻を渡すと、それまでに終わった失敗だけをリセットする", () => {
+      const first = startRun(db, clock, target);
+      record(first.id, "prepare", "failed");
+      const firstFinishedAt = getRun(db, first.id).finishedAt as string;
+      clock.set("2026-01-02T04:00:00.000Z");
+      const second = startRun(db, clock, target);
+      record(second.id, "prepare", "failed");
+
+      expect(
+        resetAttempts(db, clock, { ...target, finishedUntil: firstFinishedAt }),
+      ).toBe(1);
+      expect(countFailedRuns(db, target.repo, target.issueNumber)).toBe(1);
+      expect(nextAttempt(db, target.repo, target.issueNumber)).toBe(2);
+      // 何度行っても変わらない。
+      expect(
+        resetAttempts(db, clock, { ...target, finishedUntil: firstFinishedAt }),
+      ).toBe(0);
+    });
+
+    it("次に再試行してよい時刻は、試行に数える最後の失敗のもの。リセットすると空になる", () => {
+      expect(retryNotBefore(db, target.repo, target.issueNumber)).toBeNull();
+      const run = startRun(db, clock, target);
+      record(run.id, "prepare", "failed");
+      expect(retryNotBefore(db, target.repo, target.issueNumber)).toBe(
+        "2026-01-02T03:09:05.000Z",
+      );
+      resetAttempts(db, clock, target);
+      expect(retryNotBefore(db, target.repo, target.issueNumber)).toBeNull();
+    });
+
     it("失敗のたびに、設定の待機時間から次に再試行してよい時刻を決める", () => {
       clock.set("2026-01-02T10:00:00.000Z");
       expect(failRun().nextRetryAt).toBe("2026-01-02T10:05:00.000Z");
@@ -630,6 +666,58 @@ describe("実行とステップの記録", () => {
         { retryWaitMinutes: [1] },
       );
       expect(getRun(db, run.id).nextRetryAt).toBe("2026-01-02T10:01:00.000Z");
+    });
+  });
+
+  describe("補助の読み書き", () => {
+    it("ある時刻以降に開始した実行を、終わり方によらず、全リポジトリで数える", () => {
+      const first = startRun(db, clock, target);
+      cancelRun(db, clock, first.id);
+      clock.set("2026-01-03T00:00:00.000Z");
+      startRun(db, clock, target);
+      startRun(db, clock, { repo: "owner/other", issueNumber: 1 });
+
+      expect(countRunsStartedSince(db, "2026-01-02T00:00:00.000Z")).toBe(3);
+      expect(countRunsStartedSince(db, "2026-01-03T00:00:00.000Z")).toBe(2);
+      expect(countRunsStartedSince(db, "2026-01-03T00:00:00.001Z")).toBe(0);
+    });
+
+    it("イシューの最新の実行を返す。なければ null", () => {
+      expect(latestRun(db, target.repo, target.issueNumber)).toBeNull();
+      const first = startRun(db, clock, target);
+      cancelRun(db, clock, first.id);
+      const second = startRun(db, clock, target);
+      expect(latestRun(db, target.repo, target.issueNumber)?.id).toBe(
+        second.id,
+      );
+    });
+
+    it("次のステップを返す。終わった実行では失敗する", () => {
+      const run = startRun(db, clock, target);
+      expect(nextStep(db, run.id)).toEqual({
+        step: "prepare",
+        interrupted: false,
+      });
+      startStep(db, clock, run.id, "prepare");
+      expect(nextStep(db, run.id)).toEqual({
+        step: "prepare",
+        interrupted: true,
+      });
+      cancelRun(db, clock, run.id);
+      expect(() => nextStep(db, run.id)).toThrow(/終わっています/);
+    });
+
+    it("作業場所、ブランチ、PRの番号は、渡した項目だけを書く", () => {
+      const run = startRun(db, clock, target);
+      recordRunDetails(db, run.id, { workspacePath: "/w/1", branch: "b" });
+      recordRunDetails(db, run.id, { prNumber: 5 });
+      expect(
+        db
+          .prepare(
+            "SELECT worktree_path, branch, pr_number FROM runs WHERE id = ?",
+          )
+          .get(run.id),
+      ).toEqual({ worktree_path: "/w/1", branch: "b", pr_number: 5 });
     });
   });
 

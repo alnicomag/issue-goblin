@@ -1,0 +1,365 @@
+import fs from "node:fs";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { FACTORY_MARKER } from "../src/office/github.ts";
+import {
+  advanceRun,
+  feedbackFor,
+  formatIssue,
+  formatVerify,
+} from "../src/office/runner.ts";
+import { getRun, listSteps, startRun } from "../src/office/runs.ts";
+import { workspacePaths } from "../src/office/workspace.ts";
+import { createHarness, type Harness, REPO } from "./factory-harness.ts";
+import { plainGit } from "./git-fixtures.ts";
+
+const ISSUE = 7;
+
+describe("ステップの実行", () => {
+  let h: Harness;
+
+  beforeEach(async () => {
+    h = createHarness();
+    h.putIssue(ISSUE, { labels: ["state:in-progress"], body: "the body" });
+    await h.sync();
+  });
+
+  afterEach(() => h.cleanup());
+
+  const start = () =>
+    startRun(h.db, h.clock, { repo: REPO, issueNumber: ISSUE }).id;
+  const advance = (runId: number, signal = new AbortController().signal) =>
+    advanceRun(h.runner, runId, signal);
+  const stepsOf = (runId: number) =>
+    listSteps(h.db, runId).map((step) => `${step.name}:${step.status}`);
+  const outputOf = (runId: number, name: string) => {
+    const step = listSteps(h.db, runId).findLast((s) => s.name === name);
+    return JSON.parse(step?.output ?? "null") as Record<string, unknown>;
+  };
+  const close = async () => {
+    h.putIssue(ISSUE, { labels: ["state:in-review"], open: false });
+    await h.sync();
+  };
+
+  it("prepare から publish まで進み、クローズを待つ", async () => {
+    const runId = start();
+    expect(await advance(runId)).toEqual({ kind: "waiting_close" });
+    expect(stepsOf(runId)).toEqual([
+      "prepare:done",
+      "plan:done",
+      "implement:done",
+      "verify:done",
+      "review:done",
+      "publish:done",
+    ]);
+    expect(getRun(h.db, runId).status).toBe("running");
+    expect(h.launcher.commands).toEqual([
+      "example-setup",
+      "example-test",
+      "example-lint",
+    ]);
+
+    // PRが1つでき、ブランチが取得元に届いている。
+    expect(h.fake.pullRequests).toHaveLength(1);
+    expect(h.fake.pullRequests[0]).toMatchObject({
+      head: `agent/issue-${ISSUE}`,
+      base: "main",
+    });
+    expect(h.fake.pullRequests[0]?.body).toContain(FACTORY_MARKER);
+    const pushed = plainGit(h.source, "rev-parse", `agent/issue-${ISSUE}`);
+    expect(outputOf(runId, "publish")).toMatchObject({
+      status: "published",
+      prNumber: 100,
+      headCommit: pushed,
+    });
+    expect(outputOf(runId, "implement").headCommit).toBe(pushed);
+    const row = h.db
+      .prepare("SELECT branch, pr_number, worktree_path FROM runs WHERE id = ?")
+      .get(runId);
+    expect(row).toEqual({
+      branch: `agent/issue-${ISSUE}`,
+      pr_number: 100,
+      worktree_path: workspacePaths(h.dirs, REPO, ISSUE).issueDir,
+    });
+  });
+
+  it("状態(ラベル)は変えない", async () => {
+    await advance(start());
+    expect(h.labels(ISSUE)).toEqual(["state:in-progress"]);
+    expect(h.fake.writes.map((call) => call.method)).toEqual([
+      "createPullRequest",
+    ]);
+  });
+
+  it("クローズを待つ間は、何度呼んでも進まない。クローズされたら cleanup して終わる", async () => {
+    const runId = start();
+    await advance(runId);
+    expect(await advance(runId)).toEqual({ kind: "waiting_close" });
+    const { issueDir } = workspacePaths(h.dirs, REPO, ISSUE);
+    expect(fs.existsSync(issueDir)).toBe(true);
+
+    await close();
+    expect(await advance(runId)).toEqual({ kind: "finished", status: "done" });
+    expect(stepsOf(runId).at(-1)).toBe("cleanup:done");
+    expect(getRun(h.db, runId).status).toBe("done");
+    expect(fs.existsSync(issueDir)).toBe(false);
+    // 終わった実行は、もう進まない。
+    expect(await advance(runId)).toEqual({ kind: "finished", status: "done" });
+  });
+
+  it("ワーカーには、イシューの本文、人間のコメント、保存済みの factory.yml を渡す", async () => {
+    h.fake.putComment({
+      id: 10,
+      issueNumber: ISSUE,
+      author: "alice",
+      body: "a human comment",
+      updatedAt: "2026-03-01T00:30:00.000Z",
+    });
+    h.fake.putComment({
+      id: 11,
+      issueNumber: ISSUE,
+      body: `from the factory\n${FACTORY_MARKER}`,
+      updatedAt: "2026-03-01T00:31:00.000Z",
+    });
+    await h.sync();
+    h.worker.answer("plan", { status: "done", summary: "THE PLAN" });
+    await advance(start());
+
+    const [plan] = h.worker.callsOf("plan");
+    expect(plan?.values.issue).toContain(`Issue ${ISSUE}`);
+    expect(plan?.values.issue).toContain("the body");
+    expect(plan?.values.issue).toContain("a human comment");
+    expect(plan?.values.issue).not.toContain("from the factory");
+    expect(plan?.values.factory_yml).toContain("example-test");
+
+    const [implement] = h.worker.callsOf("implement");
+    expect(implement?.values).toMatchObject({ plan: "THE PLAN", feedback: "" });
+
+    const [review] = h.worker.callsOf("review");
+    expect(review?.values.diff).toContain(`feature-${ISSUE}-1.txt`);
+    expect(review?.values.test_result).toContain("- test: passed");
+  });
+
+  it("ワーカーが質問を返したら、質問で終わる", async () => {
+    h.worker.answer("plan", { status: "question", summary: "どちらですか" });
+    const runId = start();
+    expect(await advance(runId)).toEqual({
+      kind: "finished",
+      status: "question",
+    });
+    expect(stepsOf(runId)).toEqual(["prepare:done", "plan:question"]);
+    expect(getRun(h.db, runId).status).toBe("question");
+    expect(h.fake.writes).toEqual([]);
+  });
+
+  it("verify が通らなければ implement に戻し、出力の末尾を指摘として渡す", async () => {
+    h.launcher.answer("example-test", { exit_code: 1, stdout: "TEST BROKE" });
+    const runId = start();
+    expect(await advance(runId)).toEqual({ kind: "waiting_close" });
+    expect(stepsOf(runId)).toEqual([
+      "prepare:done",
+      "plan:done",
+      "implement:done",
+      "verify:rework",
+      "implement:done",
+      "verify:done",
+      "review:done",
+      "publish:done",
+    ]);
+    const second = h.worker.callsOf("implement")[1];
+    expect(second?.values.feedback).toContain("TEST BROKE");
+    expect(second?.values.feedback).toContain("test");
+  });
+
+  it("review の修正要求も implement に戻す。3回目の差し戻しで失敗する", async () => {
+    const rework = { status: "rework", summary: "FIX THIS" } as const;
+    h.worker.answer("review", rework, rework, rework);
+    const runId = start();
+    expect(await advance(runId)).toEqual({
+      kind: "finished",
+      status: "failed",
+    });
+    expect(h.worker.callsOf("implement")).toHaveLength(3);
+    expect(h.worker.callsOf("implement")[1]?.values.feedback).toBe("FIX THIS");
+    const run = getRun(h.db, runId);
+    expect(run.status).toBe("failed");
+    expect(run.nextRetryAt).not.toBeNull();
+    expect(h.fake.pullRequests).toEqual([]);
+  });
+
+  it("ステップの中の例外は、そのステップの失敗として記録する", async () => {
+    h.db.prepare("UPDATE repos SET factory_yml = NULL").run();
+    const runId = start();
+    expect(await advance(runId)).toEqual({
+      kind: "finished",
+      status: "failed",
+    });
+    expect(stepsOf(runId)).toEqual(["prepare:done", "plan:failed"]);
+    expect(String(outputOf(runId, "plan").summary)).toContain("factory.yml");
+    expect(
+      h.logs.filter((line) => line.event === "run.step_error"),
+    ).toHaveLength(1);
+  });
+
+  it("コミットがなければ、publish で止まって失敗する", async () => {
+    h.worker.answer("implement", { status: "done", summary: "did nothing" });
+    const runId = start();
+    expect(await advance(runId)).toEqual({
+      kind: "finished",
+      status: "failed",
+    });
+    expect(stepsOf(runId).at(-1)).toBe("publish:failed");
+    expect(outputOf(runId, "publish").status).toBe("no_commits");
+    expect(h.fake.writes).toEqual([]);
+  });
+
+  it("dry_run なら、publish は書き込まずに終わる", async () => {
+    h.dryRun = true;
+    const runId = start();
+    expect(await advance(runId)).toEqual({ kind: "waiting_close" });
+    expect(outputOf(runId, "publish").status).toBe("dry_run");
+    expect(h.fake.writes).toEqual([]);
+  });
+
+  it("止められたら、何も記録せずに戻る。実行中のステップは残る", async () => {
+    const controller = new AbortController();
+    h.worker.scripts.set("implement", () => {
+      controller.abort();
+      return undefined;
+    });
+    const runId = start();
+    expect(await advance(runId, controller.signal)).toEqual({
+      kind: "aborted",
+    });
+    expect(stepsOf(runId)).toEqual([
+      "prepare:done",
+      "plan:done",
+      "implement:running",
+    ]);
+    expect(getRun(h.db, runId).status).toBe("running");
+  });
+
+  describe("再開", () => {
+    const STEPS = [
+      "prepare",
+      "plan",
+      "implement",
+      "verify",
+      "review",
+      "publish",
+    ];
+
+    for (const stopAt of STEPS) {
+      it(`${stopAt} の途中で止めて作り直すと、そのステップから続き、PRは1つのまま`, async () => {
+        const controller = new AbortController();
+        h.onLog = (line) => {
+          if (
+            line.event === "run.step_started" &&
+            line.fields.step === stopAt
+          ) {
+            controller.abort();
+          }
+        };
+        const runId = start();
+        expect(await advance(runId, controller.signal)).toEqual({
+          kind: "aborted",
+        });
+        expect(stepsOf(runId).at(-1)).toBe(`${stopAt}:running`);
+        const attempt = getRun(h.db, runId).attempt;
+
+        // 事務局を起動し直した後。
+        h.onLog = () => {};
+        expect(await advance(runId)).toEqual({ kind: "waiting_close" });
+        expect(stepsOf(runId)).toEqual(STEPS.map((name) => `${name}:done`));
+        expect(h.fake.pullRequests).toHaveLength(1);
+        expect(
+          h.fake.writes.filter((call) => call.method === "createPullRequest"),
+        ).toHaveLength(1);
+        expect(getRun(h.db, runId).attempt).toBe(attempt);
+        // 終わったステップは、やり直していない。
+        const before = STEPS.slice(0, STEPS.indexOf(stopAt));
+        for (const prompt of ["plan", "implement", "review"]) {
+          const expected = before.includes(prompt) || prompt !== stopAt ? 1 : 2;
+          expect(h.worker.callsOf(prompt), prompt).toHaveLength(expected);
+        }
+      });
+    }
+
+    it("cleanup の途中で止めて作り直しても、終わる", async () => {
+      const runId = start();
+      await advance(runId);
+      await close();
+      const controller = new AbortController();
+      h.onLog = (line) => {
+        if (line.event === "run.step_started") controller.abort();
+      };
+      expect(await advance(runId, controller.signal)).toEqual({
+        kind: "aborted",
+      });
+      h.onLog = () => {};
+      expect(await advance(runId)).toEqual({
+        kind: "finished",
+        status: "done",
+      });
+    });
+  });
+});
+
+describe("指示書に差し込む文章", () => {
+  it("イシューは、タイトル、本文、コメントの順に並べる", () => {
+    const text = formatIssue({
+      number: 3,
+      title: "Title",
+      body: "Body\n",
+      comments: [
+        {
+          author: "alice",
+          body: "first",
+          commentedAt: "2026-03-01T00:00:00.000Z",
+        },
+        { author: null, body: "second", commentedAt: null },
+      ],
+    });
+    expect(text).toBe(
+      [
+        "# Title(#3)",
+        "",
+        "Body",
+        "",
+        "## コメント 1(alice、2026-03-01T00:00:00.000Z)",
+        "",
+        "first",
+        "",
+        "## コメント 2(不明)",
+        "",
+        "second",
+        "",
+      ].join("\n"),
+    );
+  });
+
+  it("本文が空なら、空であることを書く", () => {
+    expect(
+      formatIssue({ number: 1, title: "T", body: null, comments: [] }),
+    ).toContain("(本文なし)");
+  });
+
+  it("検査の結果は、コマンドごとの状態と、出力の末尾を書く", () => {
+    const text = formatVerify({
+      passed: false,
+      summary: "検査コマンドが失敗しました",
+      commands: [
+        { name: "setup", status: "passed", exitCode: 0, outputTail: "" },
+        { name: "test", status: "failed", exitCode: 1, outputTail: "boom" },
+      ],
+    });
+    expect(text).toContain("- setup: passed(終了コード: 0)");
+    expect(text).toContain("- test: failed(終了コード: 1)");
+    expect(text).toContain("### test の出力の末尾");
+    expect(text).toContain("boom");
+    expect(formatVerify(null)).toContain("記録がありません");
+  });
+
+  it("差し戻しがなければ、指摘は空", () => {
+    expect(feedbackFor([])).toBe("");
+  });
+});

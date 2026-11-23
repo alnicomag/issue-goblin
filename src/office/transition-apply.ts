@@ -7,12 +7,16 @@
  *
  * 遷移元は、引数ではなく、DBにあるGitHubの写しから読む。GitHubが正だからである。
  * 書き込んだ後、DBの状態も同じ値にする。次の同期が、事務局自身の変更を人間の変更と見誤らないためである。
+ *
+ * イシューが `failed` を離れたら、試行回数をリセットする(人間が方針を示した後は、別の取り組みとして扱う)。
+ * 人間がラベルを手で変えて離れた場合は、ここを通らないので、`supervisor.ts` が同期の記録から行う。
  */
 import { type Clock, isoNow } from "./clock.ts";
 import type { Db } from "./db.ts";
 import { insertEvent } from "./events.ts";
 import { setStateLabel, type WriteContext } from "./github.ts";
 import type { RepoLocks } from "./locks.ts";
+import { resetAttempts } from "./runs.ts";
 import {
   type IssueState,
   isIssueState,
@@ -130,6 +134,9 @@ export function applyTransition(
     db.prepare(
       "UPDATE issues SET state = ? WHERE repo = ? AND number = ? AND state = ?",
     ).run(to, repo, issue, from);
+    if (from === "failed") {
+      resetAttempts(db, deps.clock, { repo, issueNumber: issue });
+    }
     write.logger.info("transition.applied", {
       repo,
       issue,

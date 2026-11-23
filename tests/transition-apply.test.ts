@@ -3,6 +3,7 @@ import type { Clock } from "../src/office/clock.ts";
 import { type Db, migrate, openDb } from "../src/office/db.ts";
 import { createRepoLocks } from "../src/office/locks.ts";
 import type { LogFields, Logger } from "../src/office/log.ts";
+import { nextAttempt } from "../src/office/runs.ts";
 import { syncAll } from "../src/office/sync.ts";
 import { applyTransition } from "../src/office/transition-apply.ts";
 import {
@@ -175,6 +176,17 @@ describe("事務局による状態の変更", () => {
       .get() as { n: number };
     expect(changed.n).toBe(0);
     expect(dbState()).toBe("in-progress");
+  });
+
+  it("failed を離れたら、試行回数をリセットする", async () => {
+    await seed("failed");
+    db.prepare(
+      `INSERT INTO runs (repo, issue_number, attempt, status, started_at, finished_at)
+       VALUES (?, 1, 1, 'failed', ?, ?)`,
+    ).run(REPO, NOW, NOW);
+    expect(nextAttempt(db, REPO, 1)).toBe(2);
+    expect((await apply("triage")).status).toBe("applied");
+    expect(nextAttempt(db, REPO, 1)).toBe(1);
   });
 
   it("イシューがDBになければ失敗する", async () => {
