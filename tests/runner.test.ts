@@ -284,6 +284,76 @@ describe("ステップの実行", () => {
       });
     }
 
+    it("implement の途中の状態が残った作業場所で再開すると、作業場所には手を付けずに、同じ指示書でやり直す", async () => {
+      const { repoDir } = workspacePaths(h.dirs, REPO, ISSUE);
+      // コミットしていない変更と、追跡していないファイルの一覧。
+      const status = () => ({
+        modified: plainGit(repoDir, "diff", "--name-only", "HEAD"),
+        untracked: plainGit(
+          repoDir,
+          "ls-files",
+          "--others",
+          "--exclude-standard",
+        ),
+      });
+      const controller = new AbortController();
+      let committed = "";
+      // 1回目のワーカーは、コミットを1つ作り、書きかけを残したところで止められる。
+      h.worker.scripts.set("implement", (call) => {
+        if (h.worker.callsOf("implement").length > 1) return undefined;
+        committed = h.worker.commit(call.repo, call.issue);
+        fs.writeFileSync(`${repoDir}/README.txt`, "half-written change\n");
+        fs.writeFileSync(`${repoDir}/untracked.txt`, "half-written file\n");
+        controller.abort();
+        // 止めた後の結果は、記録されない。
+        return { status: "done", summary: "中断された呼び出しの結果" };
+      });
+      const runId = start();
+      expect(await advance(runId, controller.signal)).toEqual({
+        kind: "aborted",
+      });
+      expect(stepsOf(runId).at(-1)).toBe("implement:running");
+      const leftover = status();
+      expect(leftover).toEqual({
+        modified: "README.txt",
+        untracked: "untracked.txt",
+      });
+
+      // 事務局を起動し直した後。再開したワーカーが呼ばれた時点で、途中の状態はそのまま残っている。
+      let seenOnResume: unknown;
+      h.worker.scripts.set("implement", () => {
+        seenOnResume = {
+          status: status(),
+          head: plainGit(repoDir, "rev-parse", "HEAD"),
+        };
+        return undefined;
+      });
+      expect(await advance(runId)).toEqual({ kind: "waiting_close" });
+      expect(seenOnResume).toEqual({ status: leftover, head: committed });
+
+      // 再開の呼び出しは、中断していない呼び出しと同じ内容である。
+      const [first, second] = h.worker.callsOf("implement");
+      expect(second).toEqual(first);
+      expect(second?.values.feedback).toBe("");
+
+      // 事務局は最後まで作業場所を片付けない。コミット済みの内容は残り、PRに入る。
+      expect(status()).toEqual(leftover);
+      expect(fs.readFileSync(`${repoDir}/untracked.txt`, "utf8")).toBe(
+        "half-written file\n",
+      );
+      expect(
+        plainGit(repoDir, "merge-base", "--is-ancestor", committed, "HEAD"),
+      ).toBe("");
+      expect(stepsOf(runId)).toEqual(STEPS.map((name) => `${name}:done`));
+      expect(h.fake.pullRequests).toHaveLength(1);
+      // コミットしていない変更は、PRに入らない。
+      const pushed = plainGit(h.source, "rev-parse", `agent/issue-${ISSUE}`);
+      expect(pushed).toBe(plainGit(repoDir, "rev-parse", "HEAD"));
+      expect(plainGit(h.source, "show", `${pushed}:README.txt`)).toBe(
+        "example",
+      );
+    });
+
     it("cleanup の途中で止めて作り直しても、終わる", async () => {
       const runId = start();
       await advance(runId);
