@@ -10,10 +10,21 @@ import type { Db } from "./db.ts";
 import { insertEvent } from "./events.ts";
 import type { GitHubApi } from "./github.ts";
 import type { Logger } from "./log.ts";
+import { globPatternError } from "./paths.ts";
 
 export const FACTORY_YML_PATH = "factory.yml";
 
 const Command = z.string().min(1);
+
+/**
+ * `paths` のパターン。publish の照合と同じ関数で、読めるかを確かめる。
+ * 読めないパターンを publish の時点まで持ち越さず、着手の前に不正として扱うためである。
+ * 空のパターンも、ここで読めないものとして落ちる。
+ */
+const PathPattern = z.string().superRefine((pattern, context) => {
+  const message = globPatternError(pattern);
+  if (message !== null) context.addIssue({ code: "custom", message });
+});
 
 export const FactoryYmlSchema = z.strictObject({
   version: z.literal(1),
@@ -28,8 +39,8 @@ export const FactoryYmlSchema = z.strictObject({
     .default({ unverified: [] }),
   paths: z
     .strictObject({
-      protected: z.array(z.string().min(1)).default([]),
-      forbidden: z.array(z.string().min(1)).default([]),
+      protected: z.array(PathPattern).default([]),
+      forbidden: z.array(PathPattern).default([]),
     })
     .default({ protected: [], forbidden: [] }),
   limits: z
@@ -166,7 +177,7 @@ function lastConfigEventType(db: Db, repo: string): string | null {
  *
  * 作業場所にあるファイルではなく、こちらを使う。作業場所のファイルはワーカーが書き換えられるからである。
  * 未取得の場合と、不正で保存されていない場合は、原因の分かるメッセージで失敗する。
- * 保存してある内容も、使う前に検証し直す。
+ * 保存してある内容も、使う前に検証し直す(`paths` のパターンの書き方を含む)。
  */
 export function readStoredFactoryYml(db: Db, repo: string): FactoryYml {
   const row = db

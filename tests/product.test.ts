@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { type Db, migrate, openDb } from "../src/office/db.ts";
 import { silentLogger } from "../src/office/log.ts";
+import { checkPaths } from "../src/office/paths.ts";
 import {
   parseFactoryYml,
   readStoredFactoryYml,
@@ -101,6 +102,97 @@ issues: { allowed_authors: [] }
   });
 });
 
+describe("factory.yml の paths のパターンの検証", () => {
+  const withPaths = (forbidden: string[], protectedPaths: string[]) =>
+    `
+version: 1
+level: A
+commands: { setup: a, test: b, lint: c }
+paths:
+  forbidden: ${JSON.stringify(forbidden)}
+  protected: ${JSON.stringify(protectedPaths)}
+issues: { allowed_authors: [] }
+`;
+
+  it("対応している書き方だけなら、通る", () => {
+    const result = parseFactoryYml(
+      withPaths(
+        ["generated/**", "**/*.lock", "secrets/"],
+        ["CLAUDE.md", "docs/?.md", "a/**/b", ".github/*"],
+      ),
+    );
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        paths: {
+          forbidden: ["generated/**", "**/*.lock", "secrets/"],
+          protected: ["CLAUDE.md", "docs/?.md", "a/**/b", ".github/*"],
+        },
+      },
+    });
+  });
+
+  it.each([
+    ["文字の集合", "docs/[a-z]*.md", "*、?、**"],
+    ["波かっこ", "docs/{a,b}.md", "*、?、**"],
+    ["否定", "!docs/keep.md", "否定"],
+    ["先頭の /", "/docs/**", "相対パス"],
+    ["区切りにはさまれていない **", "docs/**.md", "**"],
+    [". と ..", "../outside", ". と .."],
+  ])(
+    "%s は、forbidden でも protected でも失敗する",
+    (_name, pattern, reason) => {
+      const inForbidden = parseFactoryYml(withPaths(["ok/**", pattern], []));
+      expect(inForbidden.ok).toBe(false);
+      if (!inForbidden.ok) {
+        expect(inForbidden.errors).toContain("paths.forbidden.1:");
+        expect(inForbidden.errors).toContain(JSON.stringify(pattern));
+        expect(inForbidden.errors).toContain(reason);
+        expect(inForbidden.errors).not.toContain("paths.protected");
+      }
+
+      const inProtected = parseFactoryYml(withPaths([], [pattern, "ok/**"]));
+      expect(inProtected.ok).toBe(false);
+      if (!inProtected.ok) {
+        expect(inProtected.errors).toContain("paths.protected.0:");
+        expect(inProtected.errors).toContain(JSON.stringify(pattern));
+        expect(inProtected.errors).toContain(reason);
+        expect(inProtected.errors).not.toContain("paths.forbidden");
+      }
+    },
+  );
+
+  it("読めないパターンが複数あれば、すべて挙げる", () => {
+    const result = parseFactoryYml(
+      withPaths(["a/[b]", "ok/**", "!c"], ["ok", "{d}"]),
+    );
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.errors.split("\n")).toEqual([
+        '  paths.protected.1: パスのパターンを読めません: "{d}"(使えるのは *、?、** だけです)',
+        '  paths.forbidden.0: パスのパターンを読めません: "a/[b]"(使えるのは *、?、** だけです)',
+        '  paths.forbidden.2: パスのパターンを読めません: "!c"(否定には対応していません)',
+      ]);
+    }
+  });
+
+  it("理由は、publish の照合(checkPaths)が出すものと同じである", () => {
+    const pattern = "docs/[a-z]*.md";
+    const result = parseFactoryYml(withPaths([pattern], []));
+    let thrown = "";
+    try {
+      checkPaths([], { forbidden: [pattern], protected: [] });
+    } catch (error) {
+      thrown = (error as Error).message;
+    }
+    expect(thrown).not.toBe("");
+    expect(result).toEqual({
+      ok: false,
+      errors: `  paths.forbidden.0: ${thrown}`,
+    });
+  });
+});
+
 describe("factory.yml の取得と保存", () => {
   let db: Db;
   let fake: FakeGitHub;
@@ -172,6 +264,64 @@ describe("factory.yml の取得と保存", () => {
     );
     expect(payload).toMatchObject({ path: "factory.yml", sha: "sha-2" });
     expect(payload.errors).toMatch(/extra/);
+  });
+
+  it("読めないパターンがあれば、保存せずに、項目とパターンと理由を記録する", async () => {
+    fake.file = { sha: "sha-1", content: VALID_FACTORY_YML };
+    await run();
+    fake.file = {
+      sha: "sha-2",
+      content: VALID_FACTORY_YML.replace(
+        "- generated/**",
+        "- generated/**\n    - secrets/{a,b}.txt",
+      ),
+    };
+    const warnings: { event: string; fields: unknown }[] = [];
+    const logger = {
+      ...silentLogger,
+      warn: (event: string, fields?: unknown) => {
+        warnings.push({ event, fields });
+      },
+    };
+
+    expect(
+      await syncFactoryYml({ db, api: fake, repo: REPO, clock, logger }),
+    ).toBe("invalid");
+
+    expect(stored()).toEqual({ factory_yml: null, factory_yml_sha: "sha-2" });
+    expect(eventTypes()).toEqual(["repo.config_invalid"]);
+    const errors =
+      '  paths.forbidden.1: パスのパターンを読めません: "secrets/{a,b}.txt"(使えるのは *、?、** だけです)';
+    const payload = JSON.parse(
+      (db.prepare("SELECT payload FROM events").get() as { payload: string })
+        .payload,
+    );
+    expect(payload).toEqual({ path: "factory.yml", sha: "sha-2", errors });
+    expect(warnings).toEqual([
+      {
+        event: "product.config_invalid",
+        fields: { repo: REPO, path: "factory.yml", errors },
+      },
+    ]);
+  });
+
+  it("対応している書き方だけのパターンは、これまでどおり保存する", async () => {
+    fake.file = {
+      sha: "sha-1",
+      content: VALID_FACTORY_YML.replace(
+        "- generated/**",
+        "- generated/**\n    - '**/*.lock'\n    - secrets/\n    - notes/?.md",
+      ),
+    };
+
+    expect(await run()).toBe("updated");
+
+    expect(JSON.parse(stored().factory_yml as string).paths).toEqual({
+      protected: ["docs/**"],
+      forbidden: ["generated/**", "**/*.lock", "secrets/", "notes/?.md"],
+    });
+    expect(eventTypes()).toEqual([]);
+    expect(readStoredFactoryYml(db, REPO).paths.forbidden).toHaveLength(4);
   });
 
   it("ファイルがなければ repo.config_missing を1回だけ記録する", async () => {
@@ -252,5 +402,19 @@ describe("保存済みの factory.yml の読み出し", () => {
       JSON.stringify({ version: 1 }),
     );
     expect(() => readStoredFactoryYml(db, REPO)).toThrow(/commands/);
+  });
+
+  it("保存してある内容に読めないパターンがあれば、項目とパターンの分かるメッセージで失敗する", () => {
+    const parsed = parseFactoryYml(VALID_FACTORY_YML);
+    if (!parsed.ok) throw new Error(parsed.errors);
+    // 検証が入る前に保存された内容を模す。
+    const old = {
+      ...parsed.value,
+      paths: { protected: ["docs/**", "docs/[a-z]*.md"], forbidden: [] },
+    };
+    insert(JSON.stringify(old), "sha-1");
+    expect(() => readStoredFactoryYml(db, REPO)).toThrow(
+      'paths.protected.1: パスのパターンを読めません: "docs/[a-z]*.md"(使えるのは *、?、** だけです)',
+    );
   });
 });
