@@ -17,11 +17,19 @@ export interface WorkerLauncher {
    * ワーカーのコンテナでコマンドを実行し、終わるまで待つ。
    * コマンドが失敗しても、結果(終了コード)として返る。
    * 依頼が拒否された場合や、起動係に届かない場合は、例外になる。
+   *
+   * `signal` が止められたら、結果を待たずに例外で戻る。起動係は、依頼した側がいなくなると
+   * コンテナを止めるので、ワーカーも残らない。
    */
-  run(request: RunRequestInput): Promise<RunResult>;
+  run(
+    request: RunRequestInput,
+    options?: { signal?: AbortSignal },
+  ): Promise<RunResult>;
 }
 
 const ErrorBodySchema = z.object({ error: z.string() });
+
+const ABORTED_MESSAGE = "起動係への依頼を中断しました";
 
 /** 起動係の時間の上限に足す、応答を待つ余裕。 */
 const RESPONSE_MARGIN_MS = 60_000;
@@ -31,8 +39,13 @@ export function createLauncherClient(options: {
   socketPath: string;
 }): WorkerLauncher {
   return {
-    run(request) {
+    run(request, runOptions = {}) {
+      const { signal } = runOptions;
       return new Promise((resolve, reject) => {
+        if (signal?.aborted) {
+          reject(new Error(ABORTED_MESSAGE));
+          return;
+        }
         const body = JSON.stringify(request);
         const call = http.request(
           {
@@ -80,7 +93,14 @@ export function createLauncherClient(options: {
         call.setTimeout(request.timeout_sec * 1000 + RESPONSE_MARGIN_MS, () => {
           call.destroy(new Error("起動係の応答がありません"));
         });
+        const abort = () => call.destroy(new Error(ABORTED_MESSAGE));
+        signal?.addEventListener("abort", abort, { once: true });
+        call.on("close", () => signal?.removeEventListener("abort", abort));
         call.on("error", (error) => {
+          if (signal?.aborted) {
+            reject(new Error(ABORTED_MESSAGE, { cause: error }));
+            return;
+          }
           reject(
             new Error(`起動係に届きません: ${options.socketPath}`, {
               cause: error,
