@@ -23,6 +23,7 @@ import { readStoredFactoryYml } from "./product.ts";
 import { importCommits, inspectChanges, publish } from "./publish.ts";
 import type { FinishStatus, StepName, StepOutcome } from "./run-steps.ts";
 import {
+  approvedCommit,
   finishStep,
   getRun,
   listSteps,
@@ -509,6 +510,8 @@ async function executeStep(
           verify: lastVerify(steps),
           implementSummary: lastDoneSummary(steps, "implement"),
           reviewSummary: lastDoneSummary(steps, "review"),
+          // 人間が承認したコミット。承認から再開した実行だけが持つ。
+          approvedCommit: approvedCommit(db, run.id),
         },
       );
       if (result.prNumber !== null) {

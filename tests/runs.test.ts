@@ -3,20 +3,25 @@ import type { Clock } from "../src/office/clock.ts";
 import { type Db, migrate, openDb } from "../src/office/db.ts";
 import type { StepName, StepOutcome } from "../src/office/run-steps.ts";
 import {
+  approvedCommit,
   cancelRun,
   countFailedRuns,
   countRunsStartedSince,
   countRunsStartedToday,
+  findApproval,
   findResumableRuns,
   finishStep,
   getRun,
+  heldPublishStep,
   latestRun,
   listSteps,
   nextAttempt,
   nextStep,
+  recordApproval,
   recordInterruptedLog,
   recordRunDetails,
   resetAttempts,
+  resumeApprovedRun,
   retryNotBefore,
   startRun,
   startStep,
@@ -312,6 +317,110 @@ describe("実行とステップの記録", () => {
       expect(nextAttempt(db, target.repo, target.issueNumber)).toBe(1);
       expect(retryNotBefore(db, target.repo, target.issueNumber)).toBeNull();
       expect(findResumableRuns(db)).toEqual([]);
+    });
+
+    describe("人間の承認", () => {
+      const UNTIL_REVIEW = [
+        "prepare",
+        "plan",
+        "implement",
+        "verify",
+        "review",
+      ] as const;
+      /** publish が人間の対応待ちで止まった実行を作る。 */
+      const heldRun = () => {
+        const run = startRun(db, clock, target);
+        for (const step of UNTIL_REVIEW) record(run.id, step);
+        record(run.id, "publish", "held", { status: "needs_approval" });
+        return run;
+      };
+      const names = (runId: number) =>
+        listSteps(db, runId).map((step) => `${step.name}:${step.status}`);
+
+      it("止まったステップに、承認を1件だけ記録する。2回目は、最初の記録を返す", () => {
+        const run = heldRun();
+        const held = heldPublishStep(db, run.id);
+        expect(held).toMatchObject({ count: 1, step: { name: "publish" } });
+
+        const first = recordApproval(db, clock, {
+          runId: run.id,
+          headCommit: "abc",
+        });
+        expect(first).toMatchObject({
+          runId: run.id,
+          stepId: held?.step.id,
+          headCommit: "abc",
+          usedAt: null,
+        });
+        expect(first.createdAt).toMatch(ISO_UTC);
+        // 承認したコミットは、やり直しても変わらない。
+        expect(
+          recordApproval(db, clock, { runId: run.id, headCommit: "other" }),
+        ).toEqual(first);
+        expect(findApproval(db, first.stepId)).toEqual(first);
+        expect(approvedCommit(db, run.id)).toBeNull();
+      });
+
+      it("止まっていない実行には、承認を記録できない", () => {
+        const running = startRun(db, clock, target);
+        record(running.id, "prepare");
+        expect(() =>
+          recordApproval(db, clock, { runId: running.id, headCommit: "abc" }),
+        ).toThrow(/止まっていません/);
+        expect(heldPublishStep(db, running.id)).toBeNull();
+      });
+
+      it("承認された実行を、publish からやり直せるようにする。2回行っても変わらない", () => {
+        const run = heldRun();
+        recordApproval(db, clock, { runId: run.id, headCommit: "abc" });
+
+        const resumed = resumeApprovedRun(db, clock, run.id);
+        expect(resumed).toMatchObject({
+          status: "running",
+          finishedAt: null,
+          currentStep: "publish",
+        });
+        expect(names(run.id).slice(-2)).toEqual([
+          "publish:held",
+          "publish:running",
+        ]);
+        expect(approvedCommit(db, run.id)).toBe("abc");
+        expect(nextStep(db, run.id).step).toBe("publish");
+        expect(findResumableRuns(db).map((entry) => entry.step)).toEqual([
+          "publish",
+        ]);
+
+        resumeApprovedRun(db, clock, run.id);
+        expect(count("steps")).toBe(UNTIL_REVIEW.length + 2);
+
+        // やり直した publish が通れば、cleanup に進む。
+        expect(record(run.id, "publish")).toEqual({
+          kind: "run_step",
+          step: "cleanup",
+        });
+      });
+
+      it("承認がなければ、再開できない。使用済みの承認でも、再開できない", () => {
+        const run = heldRun();
+        expect(() => resumeApprovedRun(db, clock, run.id)).toThrow(
+          /未使用の承認がありません/,
+        );
+
+        recordApproval(db, clock, { runId: run.id, headCommit: "abc" });
+        resumeApprovedRun(db, clock, run.id);
+        // やり直した publish が、また止まった(コミットが変わっていた)。
+        record(run.id, "publish", "held", { status: "needs_approval" });
+        expect(heldPublishStep(db, run.id)?.count).toBe(2);
+        expect(() => resumeApprovedRun(db, clock, run.id)).toThrow(
+          /未使用の承認がありません/,
+        );
+
+        // 新しく止まったステップは、もう一度承認できる。
+        recordApproval(db, clock, { runId: run.id, headCommit: "def" });
+        resumeApprovedRun(db, clock, run.id);
+        expect(approvedCommit(db, run.id)).toBe("def");
+        expect(nextAttempt(db, target.repo, target.issueNumber)).toBe(1);
+      });
     });
 
     it("差し戻しは implement に戻り、3回目で実行が失敗になる", () => {

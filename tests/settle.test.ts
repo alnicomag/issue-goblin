@@ -110,6 +110,101 @@ describe("記録から決まる後処理", () => {
       expect(decide({ run: finished("held"), failedCount: 3 })).toBe("hold");
     });
 
+    describe("人間の承認", () => {
+      const held = (
+        reason: "needs_approval" | "forbidden" | null,
+        approval: "none" | "pending" | "used" = "none",
+      ) => ({ ...finished("held"), held: { reason, approval } });
+      const waiting = { issueState: "needs-info" };
+
+      it("needs_approval で待っている実行は、ラベルが付いたら承認として進める", () => {
+        expect(
+          decide({
+            ...waiting,
+            run: held("needs_approval"),
+            approvedLabel: true,
+          }),
+        ).toBe("approve");
+      });
+
+      it("ラベルがなければ、待ち続ける", () => {
+        expect(decide({ ...waiting, run: held("needs_approval") })).toBe(
+          "none",
+        );
+        expect(
+          decide({
+            ...waiting,
+            run: held("needs_approval"),
+            approvedLabel: false,
+          }),
+        ).toBe("none");
+      });
+
+      it("承認を記録した後で止まっていたら、ラベルがなくても続きを行う", () => {
+        expect(
+          decide({ ...waiting, run: held("needs_approval", "pending") }),
+        ).toBe("approve");
+        expect(decide({ run: held("needs_approval", "pending") })).toBe(
+          "resume",
+        );
+      });
+
+      it("使用済みの承認では、もう一度進めない(同じ変更を、ラベルだけで通さない)", () => {
+        expect(
+          decide({
+            ...waiting,
+            run: held("needs_approval", "used"),
+            approvedLabel: true,
+          }),
+        ).toBe("none");
+        // 再開した publish がまた止まった直後は、理由を知らせて待つ。
+        expect(decide({ run: held("needs_approval", "used") })).toBe("hold");
+      });
+
+      it("forbidden で止まった実行と、理由を読めない実行は、ラベルがあっても進めない", () => {
+        for (const reason of ["forbidden", null] as const) {
+          for (const approval of ["none", "pending", "used"] as const) {
+            expect(
+              decide({
+                ...waiting,
+                run: held(reason, approval),
+                approvedLabel: true,
+              }),
+              `${String(reason)} ${approval}`,
+            ).toBe("none");
+          }
+        }
+      });
+
+      it("質問や失敗で終わった実行は、ラベルがあっても進めない", () => {
+        for (const status of ["question", "failed", "done"] as const) {
+          expect(
+            decide({ ...waiting, run: finished(status), approvedLabel: true }),
+            status,
+          ).toBe("none");
+        }
+      });
+
+      it("needs-info と in-progress のほかの状態では、ラベルがあっても進めない", () => {
+        for (const issueState of ["triage", "ready", "in-review", "failed"]) {
+          expect(
+            decide({
+              issueState,
+              run: held("needs_approval", "pending"),
+              approvedLabel: true,
+            }),
+            issueState,
+          ).toBe("none");
+        }
+      });
+
+      it("実行中の実行は、ラベルに左右されない", () => {
+        expect(decide({ run: running("implement"), approvedLabel: true })).toBe(
+          "advance",
+        );
+      });
+    });
+
     it("失敗で、試行に余裕があれば、ready に戻す", () => {
       expect(decide({ run: finished("failed"), failedCount: 1 })).toBe("retry");
       expect(decide({ run: finished("failed"), failedCount: 2 })).toBe("retry");

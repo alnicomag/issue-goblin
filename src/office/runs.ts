@@ -538,6 +538,178 @@ export function cancelRun(db: Db, clock: Clock, runId: number): void {
   }).immediate();
 }
 
+/** 人間の承認の記録。publish が `needs_approval` で止まったステップ1つにつき、1件まで。 */
+export interface Approval {
+  readonly id: number;
+  readonly runId: number;
+  /** 止まった publish のステップ。 */
+  readonly stepId: number;
+  /** 承認されたコミット。 */
+  readonly headCommit: string;
+  readonly createdAt: string;
+  /** 実行を publish から再開した時刻。未使用なら null。 */
+  readonly usedAt: string | null;
+}
+
+const ApprovalRowSchema = z
+  .object({
+    id: z.number().int(),
+    run_id: z.number().int(),
+    step_id: z.number().int(),
+    head_commit: z.string().min(1),
+    created_at: z.string(),
+    used_at: z.string().nullable(),
+  })
+  .transform((row) => ({
+    id: row.id,
+    runId: row.run_id,
+    stepId: row.step_id,
+    headCommit: row.head_commit,
+    createdAt: row.created_at,
+    usedAt: row.used_at,
+  }));
+
+const APPROVAL_COLUMNS =
+  "id, run_id, step_id, head_commit, created_at, used_at";
+
+function parseApproval(row: unknown): Approval {
+  const result = ApprovalRowSchema.safeParse(row);
+  if (!result.success) {
+    throw new Error("approvals の行が想定外の内容です", {
+      cause: result.error,
+    });
+  }
+  return result.data;
+}
+
+/**
+ * 実行が publish の人間の対応待ち(`held`)で終わっていれば、その止まったステップと、
+ * その実行で止まった publish の数(今回を含む)を返す。そうでなければ null。
+ */
+export function heldPublishStep(
+  db: Db,
+  runId: number,
+): { step: Step; count: number } | null {
+  const steps = listSteps(db, runId);
+  const last = steps.at(-1);
+  if (last === undefined || last.name !== "publish" || last.status !== "held") {
+    return null;
+  }
+  const count = steps.filter(
+    (step) => step.name === "publish" && step.status === "held",
+  ).length;
+  return { step: last, count };
+}
+
+/** 止まったステップに対する承認。なければ null。 */
+export function findApproval(db: Db, stepId: number): Approval | null {
+  const row = db
+    .prepare(`SELECT ${APPROVAL_COLUMNS} FROM approvals WHERE step_id = ?`)
+    .get(stepId);
+  return row === undefined ? null : parseApproval(row);
+}
+
+/**
+ * 人間の承認を記録する。
+ *
+ * 対象は、実行の最後のステップが、人間の対応待ちで止まった publish である場合だけである。
+ * 同じステップの承認がすでにあれば、書かずにそれを返す(承認したコミットは変わらない)。
+ */
+export function recordApproval(
+  db: Db,
+  clock: Clock,
+  input: { runId: number; headCommit: string },
+): Approval {
+  return db
+    .transaction((): Approval => {
+      const run = getRun(db, input.runId);
+      const held = heldPublishStep(db, run.id);
+      if (run.status !== "held" || held === null) {
+        throw new Error(
+          `実行 ${run.id} は、publish の人間の対応待ちで止まっていません(${run.status})。承認を記録できません`,
+        );
+      }
+      const existing = findApproval(db, held.step.id);
+      if (existing !== null) return existing;
+      db.prepare(
+        `INSERT INTO approvals
+           (repo, issue_number, run_id, step_id, head_commit, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      ).run(
+        run.repo,
+        run.issueNumber,
+        run.id,
+        held.step.id,
+        input.headCommit,
+        isoNow(clock),
+      );
+      const created = findApproval(db, held.step.id);
+      if (created === null) {
+        throw new Error(`実行 ${run.id} の承認を記録できませんでした`);
+      }
+      return created;
+    })
+    .immediate();
+}
+
+/**
+ * 承認された実行を、publish からやり直せるようにする。
+ *
+ * 実行を実行中に戻し、publish のステップを始め、承認を使用済みにする(1つのトランザクション)。
+ * ほかのステップ(plan、implement など)は、やり直さない。承認したコミットを変えないためである。
+ * 止まったステップに未使用の承認がなければ、エラーにする。
+ * すでに再開してあれば(実行中で、最後の承認が使用済み)、何もしない。
+ */
+export function resumeApprovedRun(db: Db, clock: Clock, runId: number): Run {
+  return db
+    .transaction((): Run => {
+      const run = getRun(db, runId);
+      if (run.status === "running" && approvedCommit(db, runId) !== null) {
+        return run;
+      }
+      const held = heldPublishStep(db, runId);
+      if (run.status !== "held" || held === null) {
+        throw new Error(
+          `実行 ${runId} は、publish の人間の対応待ちで止まっていません(${run.status})。再開できません`,
+        );
+      }
+      const approval = findApproval(db, held.step.id);
+      if (approval === null || approval.usedAt !== null) {
+        throw new Error(
+          `実行 ${runId} には、未使用の承認がありません。再開できません`,
+        );
+      }
+      const now = isoNow(clock);
+      db.prepare(
+        "UPDATE runs SET status = 'running', finished_at = NULL, current_step = 'publish' WHERE id = ?",
+      ).run(runId);
+      db.prepare(
+        `INSERT INTO steps (run_id, name, status, started_at)
+         VALUES (?, 'publish', 'running', ?)`,
+      ).run(runId, now);
+      db.prepare("UPDATE approvals SET used_at = ? WHERE id = ?").run(
+        now,
+        approval.id,
+      );
+      return getRun(db, runId);
+    })
+    .immediate();
+}
+
+/**
+ * 実行の publish が通してよい、承認されたコミット。なければ null。
+ * 使用済みの承認(その承認で実行を再開したもの)のうち、最後のものを返す。
+ */
+export function approvedCommit(db: Db, runId: number): string | null {
+  const row = db
+    .prepare(
+      `SELECT head_commit FROM approvals
+       WHERE run_id = ? AND used_at IS NOT NULL ORDER BY id DESC LIMIT 1`,
+    )
+    .get(runId) as { head_commit: string } | undefined;
+  return row?.head_commit ?? null;
+}
+
 export interface ResumableRun {
   readonly run: Run;
   /** 次に行うステップ。 */

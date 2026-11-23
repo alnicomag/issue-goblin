@@ -14,7 +14,7 @@
  */
 import { z } from "zod";
 import { isoNow } from "./clock.ts";
-import { addIssueComment } from "./github.ts";
+import { addIssueComment, removeLabel } from "./github.ts";
 import { type IntakeIssue, type IntakeRepo, planIntake } from "./intake.ts";
 import type { RepoLocks } from "./locks.ts";
 import { errorFields } from "./log.ts";
@@ -25,16 +25,20 @@ import {
   cancelRun,
   countFailedRuns,
   countRunsStartedToday,
+  findApproval,
   findResumableRuns,
+  heldPublishStep,
   latestRun,
   listSteps,
   type Run,
+  recordApproval,
   resetAttempts,
+  resumeApprovedRun,
   retryNotBefore,
   startRun,
 } from "./runs.ts";
 import { decideSettlement, type SettleAction } from "./settle.ts";
-import type { Priority } from "./sync.ts";
+import { AGENT_APPROVED_LABEL, type Priority } from "./sync.ts";
 import { applyTransition, type TransitionDeps } from "./transition-apply.ts";
 import type { IssueState } from "./transitions.ts";
 
@@ -82,9 +86,16 @@ export function questionComment(runId: number, question: string): string {
   ].join("\n");
 }
 
-/** 人間の対応待ちのコメントに付ける目印。同じ実行の知らせを、重ねて書かないために使う。 */
-export function heldMarker(runId: number): string {
-  return `<!-- factory:held run=${runId} -->`;
+/**
+ * 人間の対応待ちのコメントに付ける目印。同じ知らせを、重ねて書かないために使う。
+ *
+ * `publishCount` は、その実行で止まった publish の数(今回を含む)。
+ * 承認の後に再開した publish がまた止まった場合(2回目以降)は、回数を入れて、前の知らせと区別する。
+ */
+export function heldMarker(runId: number, publishCount = 1): string {
+  return publishCount <= 1
+    ? `<!-- factory:held run=${runId} -->`
+    : `<!-- factory:held run=${runId} publish=${publishCount} -->`;
 }
 
 /** 人間の対応待ちのコメントに挙げるパスの数の上限。残りは件数だけを書く。 */
@@ -104,7 +115,7 @@ export type HeldOutput = z.infer<typeof HeldOutputSchema>;
 const HELD_EXPLANATIONS = {
   needs_approval: {
     what: "人間の承認が要るパス(`paths.protected`)に触れる変更があります。",
-    next: "承認を受け取ってPRにする仕組みは、まだありません。保護対象のパスを避ける方針をコメントするか、人間が作業を引き取ってください。",
+    next: `承認するには、上のコミットの内容を確かめてから、このイシューにラベル \`${AGENT_APPROVED_LABEL}\` を付けてください。承認が効くのは、上のコミットだけです(このコメントより前に付いていたラベルは、外しました)。コミットは push していないので、内容は、ファクトリーの作業場所で確かめます。承認しない場合は、保護対象のパスを避ける方針をコメントするか、人間が作業を引き取ってください。`,
   },
   forbidden: {
     what: "ワーカーが変更してはいけないパス(`paths.forbidden`)に触れる変更があります。",
@@ -116,7 +127,11 @@ const HELD_EXPLANATIONS = {
  * 人間の対応待ちのコメントの本文。純粋関数で、同じ入力からは同じ本文になる。
  * `output` が null なら、記録から内容を読めなかったことを書く。
  */
-export function heldComment(runId: number, output: HeldOutput | null): string {
+export function heldComment(
+  runId: number,
+  output: HeldOutput | null,
+  publishCount = 1,
+): string {
   const lines = [
     "PRを作る前の検査で止まりました。push もPRの作成もしていません。人間の対応を待ちます。自動では再試行しません。",
     "",
@@ -150,7 +165,7 @@ export function heldComment(runId: number, output: HeldOutput | null): string {
       "イシューへのコメントは、次の実行のワーカーに渡ります。`state:ready` に戻すと、新しい実行として着手します。変更が同じなら、同じところで止まります。",
     );
   }
-  lines.push("", heldMarker(runId));
+  lines.push("", heldMarker(runId, publishCount));
   return lines.join("\n");
 }
 
@@ -240,11 +255,13 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
   /**
    * 目印つきのコメントを、まだなければ書く。
    * コメントした後、状態を変える前に止まった場合に、同じコメントを重ねて書かないためである。
+   * `before` は、コメントを書く直前に行うこと(すでにコメントがあれば、行わない)。
    */
   async function commentOnce(
     run: Run,
     marker: string,
     body: string,
+    before?: () => Promise<void>,
   ): Promise<void> {
     const write = runner.writeFor(run.repo);
     const comments = await write.api.listCommentsOnIssue(
@@ -252,7 +269,38 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       run.issueNumber,
     );
     if (comments.some((comment) => comment.body.includes(marker))) return;
+    await before?.();
     await addIssueComment(write, run.repo, run.issueNumber, body);
+  }
+
+  /**
+   * 承認のラベルを外し、DBの写しも合わせる。付いていなくても行う(やり直して安全)。
+   *
+   * 写しも合わせるのは、次の同期が、外す前の内容を承認と見誤らないためである(同期は、
+   * 更新時刻が進んだ内容からだけ、ラベルの有無を読む)。同期と同じ排他の中で行う。
+   */
+  function dropApprovedLabel(run: Run): Promise<void> {
+    return deps.locks.run(run.repo, async () => {
+      const removed = await removeLabel(
+        runner.writeFor(run.repo),
+        run.repo,
+        run.issueNumber,
+        AGENT_APPROVED_LABEL,
+      );
+      if (!removed) return;
+      db.prepare(
+        "UPDATE issues SET approved = 0 WHERE repo = ? AND number = ?",
+      ).run(run.repo, run.issueNumber);
+    });
+  }
+
+  /** 止まった publish の記録を読む。読めなければ null。 */
+  function readHeldOutput(run: Run): HeldOutput | null {
+    const held = heldPublishStep(db, run.id);
+    const parsed = HeldOutputSchema.safeParse(
+      held?.step.output == null ? null : JSON.parse(held.step.output),
+    );
+    return parsed.success ? parsed.data : null;
   }
 
   /** 質問をコメントして、`needs-info` に進める。 */
@@ -278,28 +326,63 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
 
   /** publish が止まった理由をコメントして、`needs-info` に進める。 */
   async function hold(run: Run): Promise<void> {
-    const stopped = listSteps(db, run.id).findLast(
-      (step) => step.name === "publish" && step.status === "held",
-    );
-    const parsed = HeldOutputSchema.safeParse(
-      stopped?.output == null ? null : JSON.parse(stopped.output),
-    );
-    if (!parsed.success) {
-      logger.warn("run.held_record_unreadable", {
-        ...fieldsOf(run),
-        ...errorFields(parsed.error),
-      });
+    const output = readHeldOutput(run);
+    if (output === null) {
+      logger.warn("run.held_record_unreadable", fieldsOf(run));
     }
+    const count = heldPublishStep(db, run.id)?.count ?? 1;
     await commentOnce(
       run,
-      heldMarker(run.id),
-      heldComment(run.id, parsed.success ? parsed.data : null),
+      heldMarker(run.id, count),
+      heldComment(run.id, output, count),
+      // 承認が効くのは、このコメントより後に付いたラベルだけにする。
+      // コメントがすでにあれば外さない(コメントを見た人間が付けたラベルかもしれない)。
+      () => dropApprovedLabel(run),
     );
     await transition(
       run,
       "needs-info",
       "publish が人間の対応待ちで止まりました",
     );
+  }
+
+  /** 承認された実行を、publish から再開する。 */
+  function resume(run: Run): void {
+    const resumed = resumeApprovedRun(db, clock, run.id);
+    logger.info("run.resumed_by_approval", fieldsOf(run));
+    spawn(resumed);
+  }
+
+  /**
+   * 人間の承認を受け取る。承認を記録し、ラベルを外し、`in-progress` に進めて、publish から再開する。
+   *
+   * 途中で止まっても、記録から続きが決まる。承認の記録は、止まったステップにつき1件で、
+   * 承認したコミット(止まったときの先頭)は、やり直しても変わらない。
+   */
+  async function approve(run: Run): Promise<void> {
+    const output = readHeldOutput(run);
+    if (output?.status !== "needs_approval" || output.headCommit === null) {
+      throw new Error(
+        `実行 ${run.id} は、承認できる止まり方をしていません(記録: ${output?.status ?? "読めません"})`,
+      );
+    }
+    const approval = recordApproval(db, clock, {
+      runId: run.id,
+      headCommit: output.headCommit,
+    });
+    logger.info("run.approved", {
+      ...fieldsOf(run),
+      head: approval.headCommit,
+    });
+    await dropApprovedLabel(run);
+    const result = await transition(
+      run,
+      "in-progress",
+      "人間が、保護対象のパスに触れる変更を承認しました",
+    );
+    if (result.status === "applied" || result.status === "unchanged") {
+      resume(run);
+    }
   }
 
   async function perform(
@@ -337,6 +420,12 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       case "hold":
         await hold(run);
         return;
+      case "approve":
+        await approve(run);
+        return;
+      case "resume":
+        resume(run);
+        return;
       case "retry":
         await transition(run, "ready", "失敗しました。待機後に再試行します");
         return;
@@ -346,20 +435,45 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     }
   }
 
+  /** `held` で終わった実行の、止まった理由と、承認の記録。 */
+  function heldInfo(run: Run): {
+    reason: HeldOutput["status"] | null;
+    approval: "none" | "pending" | "used";
+  } {
+    const held = heldPublishStep(db, run.id);
+    const approval = held === null ? null : findApproval(db, held.step.id);
+    return {
+      reason: readHeldOutput(run)?.status ?? null,
+      approval:
+        approval === null
+          ? "none"
+          : approval.usedAt === null
+            ? "pending"
+            : "used",
+    };
+  }
+
   /** リポジトリの中で、実行に関わるイシューを1件ずつ見て、行うべきことを行う。 */
   async function reconcile(repo: string): Promise<void> {
     const rows = db
       .prepare(
-        `SELECT number, state FROM issues
+        `SELECT number, state, approved FROM issues
          WHERE repo = ?
            AND (state = 'in-progress'
                 OR EXISTS (SELECT 1 FROM runs
                            WHERE runs.repo = issues.repo
                              AND runs.issue_number = issues.number
-                             AND runs.status = 'running'))
+                             AND runs.status = 'running')
+                -- 人間の承認を待っているもの。ラベルが付いたか、承認を記録した後で止まっていた。
+                OR (state = 'needs-info'
+                    AND (approved = 1
+                         OR EXISTS (SELECT 1 FROM approvals
+                                    WHERE approvals.repo = issues.repo
+                                      AND approvals.issue_number = issues.number
+                                      AND approvals.used_at IS NULL))))
          ORDER BY number`,
       )
-      .all(repo) as { number: number; state: string }[];
+      .all(repo) as { number: number; state: string; approved: number }[];
     if (rows.length === 0) return;
 
     const resumable = new Map(
@@ -380,7 +494,9 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
             status: run.status,
             nextStep: pending?.step ?? null,
             started: listSteps(db, run.id).length > 0,
+            ...(run.status === "held" ? { held: heldInfo(run) } : {}),
           },
+          approvedLabel: row.approved !== 0,
           active: tasks.has(run.id),
           failedCount: countFailedRuns(db, repo, row.number),
           // 上限を読むのは、使うときだけにする(factory.yml が不正でも、ほかの処理を止めない)。
