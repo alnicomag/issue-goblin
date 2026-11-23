@@ -1,12 +1,17 @@
 import type { Db } from "./db.ts";
 
-/** 段階0で事務局が記録するイベントの種類。 */
+/**
+ * 事務局が記録するイベントの種類。
+ *
+ * `issue.transition_rejected` は、遷移表にないので実行しなかった状態の変更。
+ */
 export type EventType =
   | "issue.created"
   | "issue.state_changed"
   | "issue.closed"
   | "issue.label_conflict"
   | "issue.commented"
+  | "issue.transition_rejected"
   | "repo.config_invalid"
   | "repo.config_missing";
 

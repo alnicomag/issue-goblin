@@ -18,6 +18,7 @@ import {
   type GitHubIssue,
   type WriteContext,
 } from "./github.ts";
+import type { RepoLocks } from "./locks.ts";
 import { errorFields, type Logger } from "./log.ts";
 import { syncFactoryYml } from "./product.ts";
 import { type IssueState, isIssueState } from "./transitions.ts";
@@ -116,6 +117,11 @@ export interface SyncDeps {
   readonly dryRun: boolean;
   readonly clock: Clock;
   readonly logger: Logger;
+  /**
+   * リポジトリごとの排他。事務局自身の状態の変更(`transition-apply.ts`)と、同じものを渡す。
+   * 取得した内容を取り込む途中で事務局がラベルを変えると、古い内容を人間の変更と見誤るためである。
+   */
+  readonly locks?: RepoLocks;
 }
 
 export interface SyncOptions {
@@ -150,9 +156,11 @@ export async function syncAll(
   const results: RepoSyncResult[] = [];
   for (const repo of repos) {
     try {
-      const result = await syncRepo(deps, repo, {
-        full: options.fullRepos?.has(repo) ?? false,
-      });
+      const run = () =>
+        syncRepo(deps, repo, { full: options.fullRepos?.has(repo) ?? false });
+      const result = await (deps.locks === undefined
+        ? run()
+        : deps.locks.run(repo, run));
       deps.logger.info("sync.repo_done", { ...result });
       results.push(result);
     } catch (error) {
