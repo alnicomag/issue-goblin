@@ -4,6 +4,7 @@
  * GitHubが正。人間がラベルを手で変えた場合も、遷移表による検査はせずにそのまま受け入れる。
  * 同じ変更を2回処理しても、イベントが二重に記録されないようにしている。
  * イシューのイベントは、DBにある現在の内容との差分があるときだけ記録する。
+ * 状態の差分は、`github_updated_at` が進んだ内容からだけ読む(事務局自身の変更の直後に届く、古い内容を除くため)。
  * 差分に現れないもの(ラベルの競合、ラベル付け)は `github_updated_at` が進んだときだけ扱う。
  * コメントは、コメントIDで既出かを確かめる。
  */
@@ -295,9 +296,8 @@ async function syncIssue(
   const fresh =
     existing === undefined || issue.updatedAt > existing.github_updated_at;
   if (existing !== undefined && !fresh) {
-    const state = derived.state ?? existing.state;
+    // 更新時刻が進んでいない内容からは、状態を読まない(下の説明)。
     const unchanged =
-      state === existing.state &&
       issue.title === existing.title &&
       derived.priority === existing.priority &&
       derived.size === existing.size &&
@@ -381,7 +381,10 @@ async function syncIssue(
     }
 
     // 状態を決められないときは、状態を更新しない。
-    const state = derived.state ?? existing.state;
+    // 更新時刻が進んでいない内容からも、状態を読まない。事務局が自分でラベルを変えた直後に、
+    // GitHubが変更前の内容を返すことがあり、それを人間の変更と見誤らないためである。
+    // 事務局の変更も人間の変更も、更新時刻を進めるので、進んだ内容が届いたときに読めば足りる。
+    const state = fresh ? (derived.state ?? existing.state) : existing.state;
     db.prepare(
       `UPDATE issues
          SET title = ?, state = ?, priority = ?, size = ?,

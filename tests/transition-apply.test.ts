@@ -189,6 +189,31 @@ describe("事務局による状態の変更", () => {
     expect(nextAttempt(db, REPO, 1)).toBe(1);
   });
 
+  it("状態を変えた直後に、変える前の古い内容が届いても、人間の変更として扱わない", async () => {
+    await seed("ready");
+    const stale = fake.issues.map((issue) => ({ ...issue }));
+    await apply("in-progress");
+    const current = fake.issues;
+
+    // GitHubの一覧が、まだ変更前の内容を返す場合。
+    fake.issues = stale;
+    db.prepare("UPDATE repos SET issues_synced_until = NULL").run();
+    await sync();
+    expect(dbState()).toBe("in-progress");
+    expect(
+      db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM events WHERE type = 'issue.state_changed'",
+        )
+        .get(),
+    ).toEqual({ n: 0 });
+
+    // 変更後の内容が届いても、何も起きない。
+    fake.issues = current;
+    await sync();
+    expect(dbState()).toBe("in-progress");
+  });
+
   it("イシューがDBになければ失敗する", async () => {
     await expect(apply("in-progress")).rejects.toThrow(/イシューがありません/);
   });
