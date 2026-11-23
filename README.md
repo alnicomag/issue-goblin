@@ -79,7 +79,23 @@ GITHUB_TOKEN_EXAMPLE=<トークン>
    docker compose build worker-image
    ```
 
-製品に固有のツールが要る場合は、`docker/worker.Dockerfile` を土台にした別のイメージを作り、`config/factory.config.yml` の `worker_image` で指定します。
+製品に固有のツール(検査コマンドが使うもの)が要る場合は、基本のイメージを土台にした別のイメージを作り、`config/factory.config.yml` の `worker_image` で指定します。
+
+イメージの定義(Dockerfile)は、製品リポジトリに置きます。どのツールが要るかは、検査コマンドと同じく製品の知識だからです。置き方は次のとおりです。
+
+- 場所は、製品リポジトリの `.factory/worker.Dockerfile` とします。
+- 基本のイメージの名前は、ビルド引数で受け取ります(`ARG FACTORY_BASE_IMAGE` と `FROM ${FACTORY_BASE_IMAGE}`)。ファクトリーの手元の名前を、製品には書きません。
+- 最後に、基本のイメージと同じユーザー(`USER node`)に戻します。
+- 製品の `factory.yml` の `paths.protected` に、`.factory/**` を入れます。ワーカーの環境を決めるファイルを、ワーカーが承認なしに変えられないようにするためです。
+
+ビルドは、ファクトリーのホストで、製品の既定ブランチの内容から行います。作業用のブランチの内容からは作りません。
+
+```bash
+git clone --depth 1 https://github.com/owner/name.git /tmp/owner-name
+docker build -f /tmp/owner-name/.factory/worker.Dockerfile \
+  --build-arg FACTORY_BASE_IMAGE=factory-worker \
+  -t owner-name-worker /tmp/owner-name/.factory
+```
 
 ```yaml
 worker_image: factory-worker          # 既定のイメージ
