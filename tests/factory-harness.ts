@@ -99,7 +99,8 @@ export class FakeWorker implements WorkerInvoker {
     const { repoDir } = workspacePaths(this.dirs, repo, issue);
     const target = path.join(repoDir, file);
     fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.writeFileSync(target, `content of ${file}\n`);
+    this.commits += 1;
+    fs.writeFileSync(target, `content ${this.commits} of ${file}\n`);
     unconfiguredGit(repoDir, "add", "--", file);
     unconfiguredGit(repoDir, "commit", "--quiet", "-m", `add ${file}`);
     return unconfiguredGit(repoDir, "rev-parse", "HEAD");

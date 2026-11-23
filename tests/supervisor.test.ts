@@ -7,6 +7,8 @@ import {
   startRun,
 } from "../src/office/runs.ts";
 import {
+  heldComment,
+  heldMarker,
   questionComment,
   questionMarker,
   type Supervisor,
@@ -352,6 +354,239 @@ describe("実行の管理", () => {
           "<!-- factory:question run=12 -->",
         ].join("\n"),
       );
+    });
+  });
+
+  describe("人間の対応待ち(needs_approval と forbidden)", () => {
+    /** implement が、パス `file` に触れるコミットを作る。 */
+    const touch = (file: string) => {
+      h.worker.scripts.set("implement", (call) => {
+        h.worker.commitPath(call.repo, call.issue, file);
+        return { status: "done", summary: "touched a guarded path" };
+      });
+    };
+
+    it("needs_approval で止まると、理由が目印つきでコメントされ、needs-info になり、自動で再試行されない", async () => {
+      touch("docs/guide.md");
+      h.putIssue(1);
+      await tick();
+      await tick();
+      expect(h.labels(1)).toEqual(["state:needs-info"]);
+      expect(h.state(1)).toBe("needs-info");
+      expect(runs()).toMatchObject([{ attempt: 1, status: "held" }]);
+      const comments = factoryComments(1);
+      expect(comments).toHaveLength(1);
+      expect(comments[0]?.body).toContain("`needs_approval`");
+      expect(comments[0]?.body).toContain("`docs/guide.md`");
+      expect(comments[0]?.body).toContain("`docs/**`");
+      expect(comments[0]?.body).toContain(heldMarker(1));
+      // push もPRの作成もしていない。
+      expect(labelWrites()).not.toContain("PR");
+      expect(h.fake.pullRequests).toEqual([]);
+      // 試行に数えない。
+      expect(nextAttempt(h.db, REPO, 1)).toBe(1);
+
+      // 待機時間に当たる時間が過ぎても、ready に戻らず、新しい実行も始まらない。
+      const before = writes();
+      const calls = h.worker.calls.length;
+      for (const minutes of [6, 31, 121]) {
+        wait(minutes);
+        await tick();
+      }
+      expect(writes()).toEqual(before);
+      expect(h.worker.calls).toHaveLength(calls);
+      expect(runs()).toHaveLength(1);
+      expect(h.labels(1)).toEqual(["state:needs-info"]);
+    });
+
+    it("forbidden で止まった場合も、同じく人間の対応待ちになる", async () => {
+      touch("generated/out.txt");
+      h.putIssue(1);
+      await tick();
+      await tick();
+      expect(h.labels(1)).toEqual(["state:needs-info"]);
+      expect(runs()).toMatchObject([{ attempt: 1, status: "held" }]);
+      const comments = factoryComments(1);
+      expect(comments).toHaveLength(1);
+      expect(comments[0]?.body).toContain("`forbidden`");
+      expect(comments[0]?.body).toContain("`generated/out.txt`");
+      expect(comments[0]?.body).toContain("`generated/**`");
+      expect(nextAttempt(h.db, REPO, 1)).toBe(1);
+
+      wait(121);
+      await tick();
+      expect(runs()).toHaveLength(1);
+    });
+
+    it("コメントの後、ラベルを変える前に止まっても、コメントを重ねて書かない", async () => {
+      touch("docs/guide.md");
+      h.putIssue(1);
+      await tick();
+      const removeLabel = h.fake.removeLabel.bind(h.fake);
+      h.fake.removeLabel = () => Promise.reject(new Error("boom"));
+      await tick();
+      expect(factoryComments(1)).toHaveLength(1);
+      expect(logged("run.settle_failed")).toHaveLength(1);
+
+      h.fake.removeLabel = removeLabel;
+      await tick();
+      await tick();
+      expect(factoryComments(1)).toHaveLength(1);
+      expect(h.labels(1)).toEqual(["state:needs-info"]);
+    });
+
+    it("コメントの前に止まっても、起動し直すとコメントして needs-info になる", async () => {
+      touch("docs/guide.md");
+      h.putIssue(1);
+      await tick();
+      await supervisor.stop(1000);
+      expect(factoryComments(1)).toEqual([]);
+
+      supervisor = h.newSupervisor();
+      await tick();
+      await tick();
+      expect(factoryComments(1)).toHaveLength(1);
+      expect(h.labels(1)).toEqual(["state:needs-info"]);
+    });
+
+    it("人間が ready に戻すと、新しい実行として着手し、止まれば、その実行の目印でもう一度コメントする", async () => {
+      touch("docs/guide.md");
+      h.putIssue(1);
+      await tick();
+      await tick();
+      h.putIssue(1, { labels: ["state:ready"] });
+      await tick();
+      await tick();
+      expect(runs()).toMatchObject([
+        { attempt: 1, status: "held" },
+        { attempt: 1, status: "held" },
+      ]);
+      expect(factoryComments(1).map((comment) => comment.body)).toEqual([
+        expect.stringContaining(heldMarker(1)),
+        expect.stringContaining(heldMarker(2)),
+      ]);
+      expect(h.labels(1)).toEqual(["state:needs-info"]);
+    });
+
+    it("止まった後に人間が状態を変えていたら、コメントも状態の変更もしない", async () => {
+      touch("docs/guide.md");
+      h.putIssue(1);
+      await tick();
+      await supervisor.stop(1000);
+      h.putIssue(1, { labels: ["state:triage"] });
+      const before = writes();
+
+      supervisor = h.newSupervisor();
+      await tick();
+      await tick();
+      expect(writes()).toEqual(before);
+      expect(h.labels(1)).toEqual(["state:triage"]);
+    });
+
+    it("dry_run の間は、コメントも状態の変更もしない", async () => {
+      touch("docs/guide.md");
+      h.putIssue(1);
+      await tick();
+      await supervisor.stop(1000);
+      const before = h.fake.writes.length;
+
+      h.dryRun = true;
+      supervisor = h.newSupervisor();
+      await tick();
+      await tick();
+      expect(h.fake.writes).toHaveLength(before);
+      expect(factoryComments(1)).toEqual([]);
+      expect(h.state(1)).toBe("in-progress");
+      expect(logged("run.held").map((line) => line.fields.action)).toContain(
+        "hold",
+      );
+    });
+
+    describe("コメントの本文", () => {
+      const hit = (path: string, pattern: string) => ({ path, pattern });
+
+      it("結果の種類、コミット、当たったパスとパターン、実行ごとの目印を書く", () => {
+        const body = heldComment(12, {
+          status: "needs_approval",
+          headCommit: "0123456789abcdef0123456789abcdef01234567",
+          forbidden: [],
+          protected: [
+            hit(".github/workflows/ci.yml", ".github/**"),
+            hit("CLAUDE.md", "CLAUDE.md"),
+          ],
+        });
+        expect(body).toContain("`needs_approval`");
+        expect(body).toContain("paths.protected");
+        expect(body).toContain("`0123456789abcdef0123456789abcdef01234567`");
+        expect(body).toContain(
+          "- `.github/workflows/ci.yml`(パターン: `.github/**`)",
+        );
+        expect(body).toContain("- `CLAUDE.md`(パターン: `CLAUDE.md`)");
+        expect(body).toContain("再試行しません");
+        expect(body.trimEnd().endsWith("<!-- factory:held run=12 -->")).toBe(
+          true,
+        );
+      });
+
+      it("forbidden では、禁止のパスを挙げる", () => {
+        const body = heldComment(3, {
+          status: "forbidden",
+          headCommit: "abc",
+          forbidden: [hit("migrations/001.sql", "migrations/**")],
+          protected: [hit("CLAUDE.md", "CLAUDE.md")],
+        });
+        expect(body).toContain("`forbidden`");
+        expect(body).toContain("paths.forbidden");
+        expect(body).toContain(
+          "- `migrations/001.sql`(パターン: `migrations/**`)",
+        );
+        // forbidden で止まったときは、禁止のパスだけを挙げる。
+        expect(body).not.toContain("- `CLAUDE.md`");
+      });
+
+      it("同じ入力からは、同じ本文になる", () => {
+        const input = {
+          status: "forbidden" as const,
+          headCommit: "abc",
+          forbidden: [hit("a", "a")],
+          protected: [],
+        };
+        expect(heldComment(1, input)).toBe(heldComment(1, input));
+      });
+
+      it("パスは50件までで、残りは件数だけを書く", () => {
+        const body = heldComment(1, {
+          status: "forbidden",
+          headCommit: "abc",
+          forbidden: Array.from({ length: 53 }, (_, index) =>
+            hit(`generated/${index}.txt`, "generated/**"),
+          ),
+          protected: [],
+        });
+        expect(body.match(/^- `generated\//gm)).toHaveLength(50);
+        expect(body).toContain("ほか 3 件");
+      });
+
+      it("パスに書かれた記号で、目印の偽装、メンション、コードの外への抜け出しが起きない", () => {
+        const body = heldComment(1, {
+          status: "forbidden",
+          headCommit: "abc",
+          forbidden: [
+            hit("a/<!-- factory:held run=2 -->", "a/**"),
+            hit("b/`@someone`\nline", "b/**"),
+          ],
+          protected: [],
+        });
+        expect(body).not.toContain(heldMarker(2));
+        expect(body.match(/<!--/g)).toHaveLength(1);
+        expect(body).toContain("- `b/'@someone' line`(パターン: `b/**`)");
+      });
+
+      it("記録から内容を読めなければ、そのことを書く", () => {
+        const body = heldComment(4, null);
+        expect(body).toContain("記録から読めませんでした");
+        expect(body).toContain(heldMarker(4));
+      });
     });
   });
 
