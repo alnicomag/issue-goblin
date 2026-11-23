@@ -7,6 +7,11 @@
  *
  * コマンドは、作業場所のファイルではなく、事務局が同期して保存した `factory.yml` から読む。
  * 作業場所のファイルはワーカーが書き換えられ、検査そのものを差し替えられるからである。
+ *
+ * コマンドが検査するのは作業場所のファイルで、PRに入るのはコミットされた内容である。
+ * 食い違ったまま合格にしないように、コマンドの前に、コミットされていない内容が残っていないことを
+ * 確かめる。確かめるためのgitも、事務局の中ではなく、起動係を通したコンテナの中で実行する。
+ * 作業場所のgit設定はワーカーが書き換えられ、事務局の権限でコマンドを起動できるからである。
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -21,6 +26,33 @@ import { type WorkspaceDirs, workspacePaths } from "./workspace.ts";
 /** 検査コマンドの名前。この順に実行する。 */
 export const VERIFY_COMMANDS = ["setup", "test", "lint"] as const;
 export type VerifyCommandName = (typeof VERIFY_COMMANDS)[number];
+
+/**
+ * 作業場所の状態を確かめるコマンド。コンテナの中の、製品のcloneで実行する。
+ *
+ * - 出力は、パスごとにNULで区切る(`-z`)。パスは引用されない。
+ * - 追跡していないファイルは、ディレクトリにまとめずに1つずつ挙げる。無視対象は挙げない。
+ * - 改名は1つにまとめず、消したパスと足したパスに分ける(1項目が1パスになる)。
+ * - 確かめるだけで、インデックスを書き換えない(`--no-optional-locks`)。
+ */
+export const STATUS_ARGV = [
+  "git",
+  "--no-optional-locks",
+  "status",
+  "--porcelain=v1",
+  "-z",
+  "--untracked-files=all",
+  "--no-renames",
+] as const;
+
+/** 状態の確認の時間の上限(秒)。検査コマンドの上限のほうが短ければ、そちらを使う。 */
+const STATUS_TIMEOUT_SEC = 5 * 60;
+
+/** 結果に載せる、コミットされていないパスの数の上限。件数は、別に残す。 */
+export const MAX_UNCOMMITTED_PATHS = 50;
+
+/** 結果に載せる、パス1つの長さの上限(文字数)。 */
+const MAX_PATH_CHARS = 300;
 
 /** 結果に載せる、失敗したコマンドの出力の長さの上限(文字数)。 */
 const MAX_TAIL_CHARS = 4000;
@@ -56,8 +88,10 @@ export interface VerifyCommandResult {
  *
  * - `done`: すべてのコマンドが終了コード0で終わった(合格)。
  * - `rework`: 終了コードが0でないコマンド、または時間切れのコマンドがあった(不合格)。
+ *   または、作業場所にコミットされていない内容が残っていて、コマンドを実行しなかった。
  *   implement に差し戻す。
- * - `failed`: コマンドを実行できなかった。製品の側の失敗ではないので、差し戻さない。
+ * - `failed`: コマンドを実行できなかった、または作業場所の状態を確かめられなかった。
+ *   製品の側の失敗ではないので、差し戻さない。
  */
 export interface VerifyResult {
   readonly outcome: "done" | "rework" | "failed";
@@ -66,6 +100,13 @@ export interface VerifyResult {
   /** 合格しなかったコマンドの名前(実行しなかったものは含まない)。 */
   readonly failedCommands: readonly VerifyCommandName[];
   readonly commands: readonly VerifyCommandResult[];
+  /**
+   * 作業場所に残っていた、コミットされていないパス(変更と、追跡していないファイル)。
+   * 多いときは先頭の `MAX_UNCOMMITTED_PATHS` 件だけ。差し戻しのときに、implement へ渡す。
+   */
+  readonly uncommittedPaths: readonly string[];
+  /** 残っていたパスの数(載せなかったものを含む)。 */
+  readonly uncommittedCount: number;
   /** この実行のログのファイル。 */
   readonly logPath: string;
 }
@@ -73,6 +114,57 @@ export interface VerifyResult {
 /** コンテナの中で実行するコマンドを組み立てる純粋関数。 */
 export function buildVerifyArgv(command: string): string[] {
   return ["sh", "-c", command];
+}
+
+/**
+ * `git status --porcelain=v1 -z --no-renames` の出力から、パスを取り出す純粋関数。
+ *
+ * 項目は「状態の2文字、空白、パス」で、NULで区切られている。想定外の形の項目は、
+ * 捨てずにそのまま残す(残っているものを、ないものとして扱わないため)。
+ */
+export function parseStatusPaths(stdout: string): string[] {
+  return stdout
+    .split("\0")
+    .filter((entry) => entry !== "")
+    .map((entry) =>
+      entry.length > 3 && entry[2] === " " ? entry.slice(3) : entry,
+    );
+}
+
+/**
+ * 作業場所の状態。
+ *
+ * - `clean`: コミットされていない内容がない。
+ * - `dirty`: コミットしていない変更か、追跡していないファイルがある。
+ * - `unknown`: 確かめられなかった。
+ */
+export type WorkspaceStatus =
+  | { readonly status: "clean" }
+  | { readonly status: "dirty"; readonly paths: readonly string[] }
+  | { readonly status: "unknown"; readonly reason: string };
+
+/** 起動係の結果(状態の確認)を、作業場所の状態にする純粋関数。 */
+export function interpretStatus(run: RunResult): WorkspaceStatus {
+  if (run.timed_out) {
+    return { status: "unknown", reason: "時間の上限に達しました" };
+  }
+  if (run.exit_code !== 0) {
+    return {
+      status: "unknown",
+      reason: `git status が終了コード ${String(run.exit_code)} で終わりました: ${outputTail(run.stderr)}`,
+    };
+  }
+  // 出力が途中で切られていても、読めた分のパスがあるので、残っているものとして扱う。
+  const paths = parseStatusPaths(run.stdout);
+  return paths.length === 0 ? { status: "clean" } : { status: "dirty", paths };
+}
+
+/** 結果に載せるパス。トークンに見える文字列を伏せ、長すぎるものは切る。 */
+function displayPath(value: string): string {
+  const masked = maskSecrets(value);
+  return masked.length <= MAX_PATH_CHARS
+    ? masked
+    : `${masked.slice(0, MAX_PATH_CHARS)}…`;
 }
 
 /** 起動係の結果を、コマンド1つの結果にする純粋関数。 */
@@ -165,6 +257,26 @@ export function judgeVerify(
   };
 }
 
+/** 作業場所がきれいでなかった場合の、全体の結果を決める純粋関数。 */
+export function judgeWorkspace(
+  workspace: Exclude<WorkspaceStatus, { status: "clean" }>,
+): Pick<VerifyResult, "outcome" | "passed" | "summary" | "failedCommands"> {
+  if (workspace.status === "unknown") {
+    return {
+      outcome: "failed",
+      passed: false,
+      summary: `作業場所の状態を確かめられませんでした: ${workspace.reason}`,
+      failedCommands: [],
+    };
+  }
+  return {
+    outcome: "rework",
+    passed: false,
+    summary: `作業場所に、コミットされていない内容(変更、または追跡していないファイル)が${workspace.paths.length}件残っているので、検査コマンドを実行しませんでした。検査の対象になるのは、コミットされた内容だけです。必要なものはコミットし、不要なものは元に戻すか消してください`,
+    failedCommands: [],
+  };
+}
+
 export interface VerifyDeps {
   readonly db: Db;
   /** 起動係に依頼する口。テストでは、偽の実装に差し替える。 */
@@ -211,6 +323,9 @@ function logText(
 /**
  * 検査コマンドを順に実行し、合否とログの場所を返す。
  *
+ * 最初に作業場所の状態を確かめ、コミットされていない内容が残っていれば、コマンドを
+ * 1つも実行せずに `rework` を返す。確かめられなかった場合は `failed` を返す。
+ *
  * コマンドの失敗と時間切れは、例外ではなく結果(`rework`)として返る。
  * 例外になるのは、実行を始められない場合(`factory.yml` が未取得または不正、作業場所がない、
  * 時間の上限が範囲の外)と、ログを書けない場合だけで、そのときコマンドは1つも実行しない。
@@ -241,9 +356,31 @@ export async function runVerify(
   const results: VerifyCommandResult[] = [];
   const outputs: { name: string; run: RunResult | null }[] = [];
 
+  // 先に、コミットされていない内容が残っていないことを確かめる。
+  let workspace: WorkspaceStatus;
+  try {
+    const run = await deps.launcher.run({
+      repo,
+      issue,
+      argv: [...STATUS_ARGV],
+      claude_token: false,
+      timeout_sec: Math.min(timeoutSec, STATUS_TIMEOUT_SEC),
+    });
+    workspace = interpretStatus(run);
+    // ログでは、区切りのNULを改行にする。
+    outputs.push({
+      name: "status",
+      run: { ...run, stdout: run.stdout.replaceAll("\0", "\n") },
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    workspace = { status: "unknown", reason: outputTail(message) };
+    outputs.push({ name: "status", run: null });
+  }
+
   for (const name of VERIFY_COMMANDS) {
     const command = factoryYml.commands[name];
-    if (!shouldRun(results)) {
+    if (workspace.status !== "clean" || !shouldRun(results)) {
       results.push({
         name,
         command,
@@ -285,7 +422,16 @@ export async function runVerify(
   }
   const finishedAt = clock.now();
 
-  const judged = judgeVerify(results, timeoutSec);
+  const uncommittedCount =
+    workspace.status === "dirty" ? workspace.paths.length : 0;
+  const uncommittedPaths =
+    workspace.status === "dirty"
+      ? workspace.paths.slice(0, MAX_UNCOMMITTED_PATHS).map(displayPath)
+      : [];
+  const judged =
+    workspace.status === "clean"
+      ? judgeVerify(results, timeoutSec)
+      : judgeWorkspace(workspace);
   const header = {
     repo,
     issue,
@@ -295,6 +441,10 @@ export async function runVerify(
     timeout_sec: timeoutSec,
     outcome: judged.outcome,
     summary: judged.summary,
+    workspace: {
+      status: workspace.status,
+      uncommitted_count: uncommittedCount,
+    },
     commands: results.map((result) => ({
       name: result.name,
       command: result.command,
@@ -310,5 +460,11 @@ export async function runVerify(
     step: "verify",
     text: logText(header, outputs),
   });
-  return { ...judged, commands: results, logPath };
+  return {
+    ...judged,
+    commands: results,
+    uncommittedPaths,
+    uncommittedCount,
+    logPath,
+  };
 }
