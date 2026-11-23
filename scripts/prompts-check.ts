@@ -245,6 +245,15 @@ async function main(): Promise<void> {
     (await read("rev-parse", "main")) === base,
     "既定のブランチは、変わっていない",
   );
+  const messages = (await read("log", "--format=%B%x00", `${base}..HEAD`))
+    .split("\0")
+    .map((message) => message.trim())
+    .filter((message) => message !== "");
+  report(
+    messages.every((message) => !message.includes("\n")),
+    "コミットメッセージが、製品の規約(1行)に従っている",
+    JSON.stringify(messages),
+  );
   const changed = (await read("diff", "--name-only", `${base}..HEAD`))
     .split("\n")
     .filter((file) => file !== "");
