@@ -16,9 +16,11 @@ import {
   makeTempDir,
   plainGit,
   plantHooks,
+  unconfiguredGit,
 } from "./git-fixtures.ts";
 
 const REPO = "owner/name";
+const AUTHOR = { name: "Example Worker", email: "worker@example.invalid" };
 const TOKEN = "dummy-token-value";
 
 /** 本物のgitに渡しつつ、呼び出しを記録する。 */
@@ -61,7 +63,10 @@ describe("作業場所", () => {
   const git = createGit();
 
   const prepare = (issue: number, repo = REPO, url = source) =>
-    prepareWorkspace({ git }, { dirs, repo, issue, source: { url } });
+    prepareWorkspace(
+      { git },
+      { dirs, repo, issue, source: { url }, author: AUTHOR },
+    );
 
   beforeEach(() => {
     tmp = makeTempDir();
@@ -168,7 +173,13 @@ describe("作業場所", () => {
       await expect(
         prepareWorkspace(
           { git: failing },
-          { dirs, repo: REPO, issue: 4, source: { url: source } },
+          {
+            dirs,
+            repo: REPO,
+            issue: 4,
+            source: { url: source },
+            author: AUTHOR,
+          },
         ),
       ).rejects.toThrow("interrupted");
       const paths = workspacePaths(dirs, REPO, 4);
@@ -259,6 +270,98 @@ describe("作業場所", () => {
     });
   });
 
+  describe("コミットの作者", () => {
+    it("ユーザーとシステムのgit設定がなくても、作業場所でコミットできる", async () => {
+      const { repoDir } = await prepare(1);
+      fs.writeFileSync(path.join(repoDir, "work.txt"), "work\n");
+      unconfiguredGit(repoDir, "add", "--", "work.txt");
+
+      unconfiguredGit(repoDir, "commit", "--quiet", "-m", "add work.txt");
+
+      expect(
+        unconfiguredGit(repoDir, "log", "-1", "--format=%an <%ae> / %cn <%ce>"),
+      ).toBe(
+        "Example Worker <worker@example.invalid> / Example Worker <worker@example.invalid>",
+      );
+      expect(unconfiguredGit(repoDir, "status", "--porcelain")).toBe("");
+    });
+
+    it("作者は、渡された値をそのまま使う", async () => {
+      const { repoDir } = await prepareWorkspace(
+        { git },
+        {
+          dirs,
+          repo: REPO,
+          issue: 2,
+          source: { url: source },
+          author: { name: "Other Name", email: "other@example.invalid" },
+        },
+      );
+      expect(unconfiguredGit(repoDir, "config", "--local", "user.name")).toBe(
+        "Other Name",
+      );
+      expect(unconfiguredGit(repoDir, "config", "--local", "user.email")).toBe(
+        "other@example.invalid",
+      );
+    });
+
+    it("やり直しても、すでにある作業場所のgit設定を変えない", async () => {
+      const { repoDir } = await prepare(3);
+      const configPath = path.join(repoDir, ".git", "config");
+      const before = fs.readFileSync(configPath, "utf8");
+
+      await prepare(3);
+      expect(fs.readFileSync(configPath, "utf8")).toBe(before);
+
+      // 作者の設定を後から変えても、すでにある作業場所には書かない。
+      await prepareWorkspace(
+        { git },
+        {
+          dirs,
+          repo: REPO,
+          issue: 3,
+          source: { url: source },
+          author: { name: "Changed", email: "changed@example.invalid" },
+        },
+      );
+      expect(fs.readFileSync(configPath, "utf8")).toBe(before);
+    });
+
+    it("途中で止まった後に作り直した作業場所でも、コミットできる", async () => {
+      const real = createGit();
+      const failing: Git = {
+        run(args, options) {
+          if (args[0] === "config") {
+            return Promise.reject(new Error("interrupted"));
+          }
+          return real.run(args, options);
+        },
+      };
+      await expect(
+        prepareWorkspace(
+          { git: failing },
+          {
+            dirs,
+            repo: REPO,
+            issue: 4,
+            source: { url: source },
+            author: AUTHOR,
+          },
+        ),
+      ).rejects.toThrow("interrupted");
+      // 作者を書く前に止まったものは、準備が終わった作業場所として扱わない。
+      expect(fs.readdirSync(workspacePaths(dirs, REPO, 4).issueDir)).toEqual([
+        "repo.partial",
+      ]);
+
+      const { repoDir } = await prepare(4);
+
+      expect(unconfiguredGit(repoDir, "config", "--local", "user.name")).toBe(
+        AUTHOR.name,
+      );
+    });
+  });
+
   describe("cleanup", () => {
     it("作業場所を消す。ミラーと、ほかのイシューの作業場所は残す", async () => {
       const target = await prepare(1);
@@ -319,7 +422,13 @@ describe("作業場所", () => {
 
       const workspace = await prepareWorkspace(
         { git: recording },
-        { dirs, repo: REPO, issue: 1, source: { url: source, token: TOKEN } },
+        {
+          dirs,
+          repo: REPO,
+          issue: 1,
+          source: { url: source, token: TOKEN },
+          author: AUTHOR,
+        },
       );
 
       for (const needle of [TOKEN, source, workspace.mirrorDir]) {
@@ -496,7 +605,13 @@ describe("作業場所のパス", () => {
       await expect(
         prepareWorkspace(
           { git },
-          { dirs: real, repo: "../..", issue: 1, source: { url: "/nowhere" } },
+          {
+            dirs: real,
+            repo: "../..",
+            issue: 1,
+            source: { url: "/nowhere" },
+            author: AUTHOR,
+          },
         ),
       ).rejects.toThrow("リポジトリ名");
       expect(() =>

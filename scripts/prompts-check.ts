@@ -1,18 +1,19 @@
 /**
  * 指示書(plan、implement、review)の確認。事務局のコンテナの中で実行する。
  *
- * 作業場所に仮の小さな製品と小さなイシューを用意し、起動係を通してワーカーのコンテナで
+ * 仮の小さな製品を取得元にして、prepare で作業場所を用意し、起動係を通してワーカーのコンテナで
  * 3つの指示書を順に1回ずつ実際に呼び出して、形式どおりの結果が返ることを確かめる。
  * 項目ごとに合否を出し、1つでも不合格なら、終了コード1で終わる。
  *
  * 実際のClaudeのトークンを使う(サブスクリプションの枠を使う)。
- * 作業場所に確認用のディレクトリを作るので、稼働中の環境ではなく、
+ * 置き場所に確認用のミラーと作業場所を作るので、稼働中の環境ではなく、
  * scripts/check-prompts.sh が立てる確認用の環境で実行すること。
  *
  * ここに書く製品の中身(ファイル、コマンド、イシュー)は、確認のための仮のものである。
  */
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { DEFAULT_PROMPTS_DIR } from "../src/agents/prompts.ts";
 import { allowedStatuses } from "../src/agents/schemas.ts";
@@ -21,14 +22,17 @@ import {
   type WorkerInvocation,
 } from "../src/agents/worker.ts";
 import { createLauncherClient } from "../src/launcher/client.ts";
-import { issueDirFor } from "../src/launcher/container.ts";
 import { DEFAULT_CONFIG_PATH, loadConfig } from "../src/office/config.ts";
 import { createGit } from "../src/office/git.ts";
 import { parseFactoryYml } from "../src/office/product.ts";
+import {
+  cleanupWorkspace,
+  type PreparedWorkspace,
+  prepareWorkspace,
+} from "../src/office/workspace.ts";
 
 /** 確認に使うイシュー番号。ほかの確認が使う番号と重ならないようにする。 */
 const ISSUE = 960;
-const BRANCH = `agent/issue-${ISSUE}`;
 
 /** 仮の製品。依存がなく、ワーカーのイメージにあるNodeだけでテストできる。 */
 const FACTORY_YML = `version: 1
@@ -115,17 +119,30 @@ function show(result: WorkerInvocation): void {
   }
 }
 
-/** 守りを付けない素のgit。仮の製品を用意するときにだけ使う(ワーカーが触る前)。 */
-function setupGit(cwd: string, ...args: string[]): void {
-  execFileSync("git", args, {
-    cwd,
-    stdio: ["ignore", "pipe", "pipe"],
-    env: {
-      PATH: process.env.PATH ?? "",
-      GIT_CONFIG_NOSYSTEM: "1",
-      GIT_CONFIG_GLOBAL: "/dev/null",
+/**
+ * 守りを付けない素のgit。取得元になる仮の製品を作るときにだけ使う。
+ * ここで渡す作者は、取得元の最初のコミットのもので、作業場所には引き継がれない。
+ */
+function sourceGit(cwd: string, ...args: string[]): void {
+  execFileSync(
+    "git",
+    [
+      "-c",
+      "user.name=Example",
+      "-c",
+      "user.email=example@example.invalid",
+      ...args,
+    ],
+    {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        PATH: process.env.PATH ?? "",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: "/dev/null",
+      },
     },
-  });
+  );
 }
 
 async function main(): Promise<void> {
@@ -142,26 +159,38 @@ async function main(): Promise<void> {
     throw new Error("確認用の factory.yml が、検証を通りません");
   }
 
-  // 作業場所に、仮の製品のリポジトリと、イシュー用のブランチを用意する。
-  const issueDir = path.join(config.work_dir, issueDirFor(first.repo, ISSUE));
-  const repoDir = path.join(issueDir, "repo");
-  fs.rmSync(issueDir, { recursive: true, force: true });
-  fs.mkdirSync(repoDir, { recursive: true });
-  fs.mkdirSync(path.join(issueDir, "home"), { recursive: true });
-  for (const [file, content] of Object.entries(PRODUCT_FILES)) {
-    fs.mkdirSync(path.dirname(path.join(repoDir, file)), { recursive: true });
-    fs.writeFileSync(path.join(repoDir, file), content);
+  // 仮の製品を取得元にして、事務局と同じ方法(prepare)で作業場所を用意する。
+  // コミットの作者も、prepare が設定から入れる。ここでは設定しない。
+  const git = createGit();
+  const input = {
+    dirs: { reposDir: config.repos_dir, workDir: config.work_dir },
+    repo: first.repo,
+    issue: ISSUE,
+  };
+  cleanupWorkspace(input);
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "prompts-check-"));
+  let workspace: PreparedWorkspace;
+  try {
+    const source = path.join(tmp, "source");
+    for (const [file, content] of Object.entries(PRODUCT_FILES)) {
+      fs.mkdirSync(path.dirname(path.join(source, file)), { recursive: true });
+      fs.writeFileSync(path.join(source, file), content);
+    }
+    sourceGit(source, "init", "--quiet", "--initial-branch=main");
+    sourceGit(source, "add", "--all");
+    sourceGit(source, "commit", "--quiet", "-m", "initial");
+    workspace = await prepareWorkspace(
+      { git },
+      { ...input, source: { url: source }, author: config.commit_author },
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
-  setupGit(repoDir, "init", "--quiet", "--initial-branch=main");
-  // コミットの作者。ワーカーはgitの設定を変えないので、用意する側で入れておく。
-  setupGit(repoDir, "config", "user.name", "factory-worker");
-  setupGit(repoDir, "config", "user.email", "factory-worker@example.invalid");
-  setupGit(repoDir, "add", "--all");
-  setupGit(repoDir, "commit", "--quiet", "-m", "initial");
-  setupGit(repoDir, "checkout", "--quiet", "-b", BRANCH);
+  // 確認用に作ったミラーは、作業場所ができれば要らない。
+  fs.rmSync(workspace.mirrorDir, { recursive: true, force: true });
+  const { repoDir, branch } = workspace;
 
   // ここから先は、ワーカーが書き換えられるリポジトリなので、守りを付けたgitで読む。
-  const git = createGit();
   const read = async (...args: string[]): Promise<string> =>
     (await git.run(args, { cwd: repoDir })).trim();
   const state = async () => ({
@@ -198,7 +227,7 @@ async function main(): Promise<void> {
   const afterPlan = await state();
   report(
     afterPlan.head === base &&
-      afterPlan.branch === BRANCH &&
+      afterPlan.branch === branch &&
       afterPlan.dirty === "",
     "plan は、ファイルを変更せず、コミットもしない",
     JSON.stringify(afterPlan),
@@ -232,7 +261,7 @@ async function main(): Promise<void> {
   const afterImplement = await state();
   const commits = await read("rev-list", "--count", `${base}..HEAD`);
   report(
-    Number(commits) >= 1 && afterImplement.branch === BRANCH,
+    Number(commits) >= 1 && afterImplement.branch === branch,
     "イシュー用のブランチに、コミットがある",
     `コミット数=${commits} ブランチ=${afterImplement.branch}`,
   );
@@ -244,6 +273,19 @@ async function main(): Promise<void> {
   report(
     (await read("rev-parse", "main")) === base,
     "既定のブランチは、変わっていない",
+  );
+  const expectedAuthor = `${config.commit_author.name} <${config.commit_author.email}>`;
+  const authors = [
+    ...new Set(
+      (await read("log", "--format=%an <%ae>%n%cn <%ce>", `${base}..HEAD`))
+        .split("\n")
+        .filter((line) => line !== ""),
+    ),
+  ];
+  report(
+    authors.length === 1 && authors[0] === expectedAuthor,
+    `コミットの作者が、設定の値(${expectedAuthor})になっている`,
+    JSON.stringify(authors),
   );
   const messages = (await read("log", "--format=%B%x00", `${base}..HEAD`))
     .split("\0")

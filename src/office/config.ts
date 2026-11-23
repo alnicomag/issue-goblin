@@ -31,6 +31,31 @@ export function isInsideDir(parent: string, child: string): boolean {
   );
 }
 
+/** コミットの作者の既定値。メールアドレスは、実在の宛先に届かない予約済みのドメインにする。 */
+const DEFAULT_AUTHOR_NAME = "factory-worker";
+const DEFAULT_AUTHOR_EMAIL = "factory-worker@example.invalid";
+
+/**
+ * ワーカーのコミットの作者。作業場所のcloneのgit設定に書く。
+ * gitが作者の区切りに使う文字(`<`、`>`、改行)は通さない。
+ */
+const CommitAuthorSchema = z.strictObject({
+  name: z
+    .string()
+    .regex(
+      /^[^<>\r\n]*[^<>\s][^<>\r\n]*$/,
+      "空ではない名前を書いてください(<、>、改行は使えません)",
+    )
+    .default(DEFAULT_AUTHOR_NAME),
+  email: z
+    .string()
+    .regex(
+      /^[^<>@\s]+@[^<>@\s]+$/,
+      "メールアドレスを書いてください(<、>、空白は使えません)",
+    )
+    .default(DEFAULT_AUTHOR_EMAIL),
+});
+
 const RepoConfigSchema = z.strictObject({
   repo: z
     .string()
@@ -75,6 +100,11 @@ const FactoryConfigSchema = z
       .array(z.number().int().min(0))
       .min(1, "待機時間を1つ以上書いてください")
       .default([5, 30, 120]),
+    /** ワーカーのコミットの作者。全製品で同じものを使う。 */
+    commit_author: CommitAuthorSchema.default({
+      name: DEFAULT_AUTHOR_NAME,
+      email: DEFAULT_AUTHOR_EMAIL,
+    }),
     repos: z.array(RepoConfigSchema).min(1),
   })
   .superRefine((config, ctx) => {
@@ -124,6 +154,7 @@ const FactoryConfigSchema = z
   });
 
 export type RepoConfig = z.infer<typeof RepoConfigSchema>;
+export type CommitAuthor = z.infer<typeof CommitAuthorSchema>;
 export type FactoryConfig = z.infer<typeof FactoryConfigSchema>;
 
 /** zodのエラーを「項目名: 内容」の行に直す。 */

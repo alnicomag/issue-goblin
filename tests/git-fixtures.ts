@@ -30,6 +30,25 @@ export function plainGit(cwd: string, ...args: string[]): string {
   ).trim();
 }
 
+/**
+ * 作者を渡さないgit。ユーザーとシステムのgit設定がない、ワーカーのコンテナと同じ条件にする。
+ *
+ * gitは、作者が未設定でも、ユーザー名とホスト名から推測して通すことがある。
+ * 実行する環境で結果が変わらないように、推測を止める(`user.useConfigOnly`)。
+ */
+export function unconfiguredGit(cwd: string, ...args: string[]): string {
+  return execFileSync("git", ["-c", "user.useConfigOnly=true", ...args], {
+    cwd,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    env: {
+      PATH: process.env.PATH ?? "",
+      GIT_CONFIG_NOSYSTEM: "1",
+      GIT_CONFIG_GLOBAL: "/dev/null",
+    },
+  }).trim();
+}
+
 export function makeTempDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "factory-test-"));
 }

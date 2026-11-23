@@ -29,8 +29,54 @@ describe("ファクトリー側の設定", () => {
       logs_dir: "/data/logs",
       worker_image: "factory-worker",
       retry_wait_minutes: [5, 30, 120],
+      commit_author: {
+        name: "factory-worker",
+        email: "factory-worker@example.invalid",
+      },
       repos: [{ repo: "owner/name", token_env: "GITHUB_TOKEN_EXAMPLE" }],
     });
+  });
+
+  it("コミットの作者の既定値は、実在の宛先に届かないメールアドレスになる", () => {
+    const { commit_author } = parseConfig(VALID);
+    expect(commit_author.name).not.toBe("");
+    // `.invalid` は予約済みで、実在のドメインにならない(RFC 2606)。
+    expect(commit_author.email).toMatch(/^[^@\s]+@[^@\s]+\.invalid$/);
+  });
+
+  it("コミットの作者を指定できる。片方だけ書けば、もう片方は既定値になる", () => {
+    expect(
+      parseConfig(
+        `${VALID}commit_author:\n  name: Example Bot\n  email: bot@example.invalid\n`,
+      ).commit_author,
+    ).toEqual({ name: "Example Bot", email: "bot@example.invalid" });
+    expect(
+      parseConfig(`${VALID}commit_author:\n  name: Example Bot\n`)
+        .commit_author,
+    ).toEqual({
+      name: "Example Bot",
+      email: "factory-worker@example.invalid",
+    });
+  });
+
+  it("コミットの作者に、空の値やgitが作者として扱えない文字は通さない", () => {
+    for (const entry of [
+      'name: ""',
+      'name: "  "',
+      'name: "a\\nb"',
+      'name: "a <b>"',
+      'email: ""',
+      "email: no-at-sign",
+      'email: "a b@example.invalid"',
+      'email: "<a@example.invalid>"',
+      'email: "a@example.invalid\\nb"',
+      "nickname: example",
+    ]) {
+      expect(
+        () => parseConfig(`${VALID}commit_author:\n  ${entry}\n`),
+        entry,
+      ).toThrow("commit_author");
+    }
   });
 
   it("置き場所は、名前が前方一致するだけの別の場所なら通す", () => {

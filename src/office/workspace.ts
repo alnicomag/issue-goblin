@@ -9,6 +9,9 @@
  *
  * 作業場所は、ワーカーが中身を書き換えられる。事務局がそこでgitを実行するのは、
  * ワーカーが触る前(作るとき)と、ブランチの有無を読むときだけにする。
+ *
+ * ワーカーのコンテナにはユーザーのgit設定がなく、ワーカーはgitの設定を変えない。
+ * コミットの作者は、作るときに事務局がcloneのgit設定に書いておく。
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -27,6 +30,12 @@ export interface RepoSource {
   readonly url: string;
   /** 取得に使うトークン。gitの実行時にだけ渡し、どこにも保存しない。 */
   readonly token?: string;
+}
+
+/** ワーカーのコミットの作者。ファクトリー側の設定(`commit_author`)から渡す。 */
+export interface WorkspaceAuthor {
+  readonly name: string;
+  readonly email: string;
 }
 
 export interface WorkspacePaths {
@@ -208,6 +217,9 @@ async function hasBranch(
  * 既定ブランチの最新から、ブランチ `agent/issue-<番号>` を持つcloneを作る。
  * やり直して安全で、作業場所がすでにあれば、中身に触れずにそれを使う。
  *
+ * コミットの作者(`author`)は、cloneを作るときにだけ、cloneのgit設定に書く。
+ * すでにある作業場所には書かないので、後から値を変えても、そこには反映されない。
+ *
  * cloneは隣の名前で作り、できあがってから `repo` に改名する。`repo` があれば、
  * 準備は終わっている。途中で止まった場合は、次の呼び出しが作りかけを消して、作り直す。
  */
@@ -218,6 +230,7 @@ export async function prepareWorkspace(
     repo: string;
     issue: number;
     source: RepoSource;
+    author: WorkspaceAuthor;
   },
 ): Promise<PreparedWorkspace> {
   const { git } = deps;
@@ -285,6 +298,13 @@ export async function prepareWorkspace(
     );
     // 取得元(ミラーのパス)の記録を残さない。
     fs.rmSync(path.join(partial, ".git", "FETCH_HEAD"), { force: true });
+    // ワーカーが設定を足さずにコミットできるように、作者を入れておく。
+    for (const [key, value] of [
+      ["user.name", input.author.name],
+      ["user.email", input.author.email],
+    ] as const) {
+      await git.run(["config", "--local", "--", key, value], { cwd: partial });
+    }
 
     fs.renameSync(partial, paths.repoDir);
     created = true;
