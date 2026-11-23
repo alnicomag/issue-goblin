@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ワーカーの隔離を、実際にコンテナを立てて確かめる。
-# あわせて、事務局のコンテナで作業場所の準備と後片付けが通ることを確かめる。
+# あわせて、事務局のコンテナで作業場所の準備と後片付けが通ることと、
+# 検査コマンドの実行(verify)が隔離された環境で動くことを確かめる。
 #
 # 確認用の環境を、稼働中のものとは別の名前(既定: factory-check)で立て、終わったら消す。
 # 稼働中のファクトリーや、同じホストのほかのコンテナには触れない。
@@ -122,13 +123,18 @@ compose run --rm --no-deps -T \
   office node scripts/isolation-check.ts 2>&1 || result=1
 
 echo
+echo "# 検査コマンドの実行(verify)を調べる"
+echo
+compose run --rm --no-deps -T office node scripts/verify-check.ts 2>&1 || result=1
+
+echo
 echo "# 実行の後の状態"
 check() {
   if [ "$1" = "0" ]; then echo "OK  $2"; else echo "NG  $2"; result=1; fi
 }
 
 leftovers="$(docker ps --all --quiet --filter "label=factory.worker=${PROJECT}_factory-work" | wc -l)"
-check "$([ "$leftovers" = "0" ] && echo 0 || echo 1)" "ワーカーのコンテナが残っていない"
+check "$([ "$leftovers" = "0" ] && echo 0 || echo 1)" "ワーカーのコンテナが残っていない(時間切れで止めた検査コマンドを含む)"
 
 logs="$(compose logs --no-color launcher proxy 2>&1)"
 if printf '%s' "$logs" | grep -q -e "$GITHUB_DUMMY" -e "$CLAUDE_DUMMY"; then
