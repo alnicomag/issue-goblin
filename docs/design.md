@@ -48,6 +48,7 @@ Nov 22, 2026 · @tatsuya
 | triage | needs-info | 不明点がある | 司令塔(質問をコメント) |
 | triage | blocked | 依存先が未完了 | 司令塔 |
 | needs-info | triage | 人間がコメントで回答した | 事務局 |
+| needs-info | in-progress | 人間が、保護対象のパスに触れる変更を承認した(`agent:approved`) | 事務局 |
 | blocked | triage | 依存先がクローズされた | 事務局 |
 | ready | in-progress | 司令塔が着手を指示し、同時実行の枠がある | 事務局 |
 | in-progress | in-review | PRが作成され、テストとレビューを通過した | 事務局 |
