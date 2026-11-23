@@ -4,6 +4,7 @@ import {
   findResumableRuns,
   listSteps,
   nextAttempt,
+  recordApproval,
   startRun,
 } from "../src/office/runs.ts";
 import {
@@ -422,8 +423,12 @@ describe("実行の管理", () => {
       touch("docs/guide.md");
       h.putIssue(1);
       await tick();
+      // 状態のラベルの付け替えだけを、途中で失敗させる。
       const removeLabel = h.fake.removeLabel.bind(h.fake);
-      h.fake.removeLabel = () => Promise.reject(new Error("boom"));
+      h.fake.removeLabel = (repo, issue, label) =>
+        label.startsWith("state:")
+          ? Promise.reject(new Error("boom"))
+          : removeLabel(repo, issue, label);
       await tick();
       expect(factoryComments(1)).toHaveLength(1);
       expect(logged("run.settle_failed")).toHaveLength(1);
@@ -502,8 +507,322 @@ describe("実行の管理", () => {
       );
     });
 
+    describe("人間の承認(agent:approved)", () => {
+      const approvals = () =>
+        h.db
+          .prepare(
+            "SELECT run_id, head_commit, used_at IS NOT NULL AS used FROM approvals ORDER BY id",
+          )
+          .all() as { run_id: number; head_commit: string; used: number }[];
+      const stepNames = (runId = 1) =>
+        listSteps(h.db, runId).map((step) => `${step.name}:${step.status}`);
+      const heldCommit = (runId = 1): string => {
+        const step = listSteps(h.db, runId).findLast(
+          (candidate) => candidate.status === "held",
+        );
+        return (JSON.parse(step?.output ?? "{}") as { headCommit: string })
+          .headCommit;
+      };
+      /** 人間が、いまのラベルに `agent:approved` を足す。 */
+      const approveByLabel = (issue = 1) =>
+        h.putIssue(issue, { labels: [...h.labels(issue), "agent:approved"] });
+      /** 保護対象のパスに触れて止まり、needs-info で待っている状態にする。 */
+      const holdForApproval = async () => {
+        touch("docs/guide.md");
+        h.putIssue(1);
+        await tick();
+        await tick();
+        expect(h.labels(1)).toEqual(["state:needs-info"]);
+      };
+
+      it("ラベルを付けると、止まったときのコミットのまま、publish からやり直してPRを作る", async () => {
+        await holdForApproval();
+        const head = heldCommit();
+        const calls = h.worker.calls.length;
+
+        approveByLabel();
+        await tick();
+        await tick();
+        expect(h.labels(1)).toEqual(["state:in-review"]);
+        expect(h.state(1)).toBe("in-review");
+        expect(h.fake.pullRequests).toHaveLength(1);
+        expect(h.fake.pullRequests[0]?.body).toContain(
+          "## 承認された保護対象のパス",
+        );
+        expect(h.fake.pullRequests[0]?.body).toContain("`docs/guide.md`");
+        expect(approvals()).toEqual([
+          { run_id: 1, head_commit: head, used: 1 },
+        ]);
+        // 同じ実行の publish だけをやり直す。plan も implement も呼ばない。
+        expect(h.worker.calls).toHaveLength(calls);
+        expect(runs()).toMatchObject([{ id: 1, status: "running" }]);
+        expect(stepNames()).toEqual([
+          "prepare:done",
+          "plan:done",
+          "implement:done",
+          "verify:done",
+          "review:done",
+          "publish:held",
+          "publish:done",
+        ]);
+        expect(listSteps(h.db, 1).at(-1)?.output).toContain(head);
+        expect(nextAttempt(h.db, REPO, 1)).toBe(1);
+
+        // その後は、何度回しても何も書かない。
+        const before = writes();
+        await tick();
+        await tick();
+        expect(writes()).toEqual(before);
+        expect(factoryComments(1)).toHaveLength(1);
+      });
+
+      it("止まった後にコミットが変わっていれば、承認は効かず、もう一度コメントして待つ。新しいコミットは、もう一度承認できる", async () => {
+        await holdForApproval();
+        const first = heldCommit();
+        const second = h.worker.commitPath(REPO, 1, "docs/more.md");
+
+        approveByLabel();
+        await tick();
+        await tick();
+        expect(h.fake.pullRequests).toEqual([]);
+        expect(h.labels(1)).toEqual(["state:needs-info"]);
+        expect(runs()).toMatchObject([{ id: 1, status: "held" }]);
+        expect(approvals()).toEqual([
+          { run_id: 1, head_commit: first, used: 1 },
+        ]);
+        const comments = factoryComments(1);
+        expect(comments).toHaveLength(2);
+        expect(comments[1]?.body).toContain("`needs_approval`");
+        expect(comments[1]?.body).toContain(`\`${second}\``);
+        expect(comments[1]?.body).toContain(heldMarker(1, 2));
+
+        // 待っている間は、何もしない。
+        const before = writes();
+        await tick();
+        expect(writes()).toEqual(before);
+
+        approveByLabel();
+        await tick();
+        await tick();
+        expect(h.labels(1)).toEqual(["state:in-review"]);
+        expect(h.fake.pullRequests).toHaveLength(1);
+        expect(approvals()).toEqual([
+          { run_id: 1, head_commit: first, used: 1 },
+          { run_id: 1, head_commit: second, used: 1 },
+        ]);
+        expect(factoryComments(1)).toHaveLength(2);
+      });
+
+      it("forbidden で止まった変更は、ラベルを付けても通らない", async () => {
+        touch("generated/out.txt");
+        h.putIssue(1);
+        await tick();
+        await tick();
+        const before = writes();
+
+        approveByLabel();
+        await tick();
+        await tick();
+        expect(writes()).toEqual(before);
+        expect(approvals()).toEqual([]);
+        expect(h.fake.pullRequests).toEqual([]);
+        expect(h.state(1)).toBe("needs-info");
+        expect(runs()).toMatchObject([{ status: "held" }]);
+      });
+
+      it("質問で待っているイシューにラベルを付けても、何も起きない", async () => {
+        h.worker.answer("plan", {
+          status: "question",
+          summary: "どちらですか",
+        });
+        h.putIssue(1);
+        await tick();
+        await tick();
+        const before = writes();
+
+        approveByLabel();
+        await tick();
+        await tick();
+        expect(writes()).toEqual(before);
+        expect(approvals()).toEqual([]);
+        expect(h.state(1)).toBe("needs-info");
+      });
+
+      it("止まる前から付いていたラベルは、承認として扱わず、止まるときに外す", async () => {
+        touch("docs/guide.md");
+        h.putIssue(1, { labels: ["state:ready", "agent:approved"] });
+        await tick();
+        await tick();
+        expect(h.labels(1)).toEqual(["state:needs-info"]);
+        expect(factoryComments(1)).toHaveLength(1);
+
+        await tick();
+        await tick();
+        expect(h.fake.pullRequests).toEqual([]);
+        expect(approvals()).toEqual([]);
+        expect(runs()).toMatchObject([{ status: "held" }]);
+        expect(h.state(1)).toBe("needs-info");
+      });
+
+      it("承認して止まった後に ready へ戻した新しい実行には、前の承認が効かない", async () => {
+        await holdForApproval();
+        h.worker.commitPath(REPO, 1, "docs/more.md");
+        approveByLabel();
+        await tick();
+        await tick();
+        expect(runs()).toMatchObject([{ id: 1, status: "held" }]);
+
+        h.putIssue(1, { labels: ["state:ready"] });
+        await tick();
+        await tick();
+        expect(runs()).toMatchObject([
+          { id: 1, status: "held" },
+          { id: 2, status: "held" },
+        ]);
+        expect(h.fake.pullRequests).toEqual([]);
+        expect(h.labels(1)).toEqual(["state:needs-info"]);
+        expect(approvals()).toHaveLength(1);
+      });
+
+      it("承認を記録した後、状態を変える前に止まっても、承認もPRもコメントも重複しない", async () => {
+        await holdForApproval();
+        approveByLabel();
+        // 状態のラベルの付け替えを、失敗させる。
+        const addLabels = h.fake.addLabels.bind(h.fake);
+        h.fake.addLabels = () => Promise.reject(new Error("boom"));
+        await tick();
+        expect(logged("run.settle_failed")).toHaveLength(1);
+        expect(approvals()).toMatchObject([{ run_id: 1, used: 0 }]);
+        expect(h.state(1)).toBe("needs-info");
+        // ラベルは外し終わっている。記録が残っているので、続きから進む。
+        expect(h.labels(1)).toEqual(["state:needs-info"]);
+
+        h.fake.addLabels = addLabels;
+        await tick();
+        await tick();
+        expect(h.labels(1)).toEqual(["state:in-review"]);
+        expect(h.fake.pullRequests).toHaveLength(1);
+        expect(approvals()).toMatchObject([{ run_id: 1, used: 1 }]);
+        expect(factoryComments(1)).toHaveLength(1);
+      });
+
+      it("in-progress に進めた後、再開の前に止まっても、起動し直すと publish から進む", async () => {
+        await holdForApproval();
+        const head = heldCommit();
+        // 承認を記録し、in-progress に進めたところで、事務局が落ちた状態を作る。
+        recordApproval(h.db, h.clock, { runId: 1, headCommit: head });
+        h.putIssue(1, { labels: ["state:in-progress"] });
+        await supervisor.stop(1000);
+
+        supervisor = h.newSupervisor();
+        await tick();
+        await tick();
+        expect(h.labels(1)).toEqual(["state:in-review"]);
+        expect(h.fake.pullRequests).toHaveLength(1);
+        expect(approvals()).toEqual([
+          { run_id: 1, head_commit: head, used: 1 },
+        ]);
+        expect(factoryComments(1)).toHaveLength(1);
+      });
+
+      it("コメントの後、状態を変える前に付いたラベルは、やり直しで外さず、承認として扱う", async () => {
+        touch("docs/guide.md");
+        h.putIssue(1);
+        await tick();
+        const removeLabel = h.fake.removeLabel.bind(h.fake);
+        h.fake.removeLabel = (repo, issue, label) =>
+          label.startsWith("state:")
+            ? Promise.reject(new Error("boom"))
+            : removeLabel(repo, issue, label);
+        await tick();
+        expect(factoryComments(1)).toHaveLength(1);
+        h.fake.removeLabel = removeLabel;
+
+        // コメントを見た人間が、状態が変わる前に承認した。
+        approveByLabel();
+        await tick();
+        expect(h.labels(1)).toEqual(["state:needs-info", "agent:approved"]);
+        await tick();
+        await tick();
+        expect(h.labels(1)).toEqual(["state:in-review"]);
+        expect(h.fake.pullRequests).toHaveLength(1);
+      });
+
+      it("再開した publish が失敗したら、通常の失敗と同じく ready に戻る。承認は、次の実行には効かない", async () => {
+        await holdForApproval();
+        approveByLabel();
+        // PRの作成を失敗させる。
+        const createPullRequest = h.fake.createPullRequest.bind(h.fake);
+        h.fake.createPullRequest = () => Promise.reject(new Error("boom"));
+        await tick();
+        h.fake.createPullRequest = createPullRequest;
+        expect(h.fake.pullRequests).toEqual([]);
+        expect(runs()).toMatchObject([{ id: 1, status: "failed" }]);
+        // 失敗した実行は、通常の失敗と同じく ready に戻る。承認は使用済みで、次の実行には効かない。
+        await tick();
+        expect(h.labels(1)).toEqual(["state:ready"]);
+        expect(approvals()).toMatchObject([{ run_id: 1, used: 1 }]);
+      });
+
+      it("dry_run の間は、承認を記録せず、ラベルも外さず、状態も変えない", async () => {
+        await holdForApproval();
+        await supervisor.stop(1000);
+        approveByLabel();
+        const before = h.fake.writes.length;
+
+        h.dryRun = true;
+        supervisor = h.newSupervisor();
+        await tick();
+        await tick();
+        expect(h.fake.writes).toHaveLength(before);
+        expect(approvals()).toEqual([]);
+        expect(h.labels(1)).toEqual(["state:needs-info", "agent:approved"]);
+        expect(h.state(1)).toBe("needs-info");
+        expect(runs()).toMatchObject([{ status: "held" }]);
+        expect(logged("run.held").map((line) => line.fields.action)).toContain(
+          "approve",
+        );
+      });
+    });
+
     describe("コメントの本文", () => {
       const hit = (path: string, pattern: string) => ({ path, pattern });
+
+      it("needs_approval では、承認の方法(ラベル)と、効く範囲を書く", () => {
+        const body = heldComment(1, {
+          status: "needs_approval",
+          headCommit: "abc",
+          forbidden: [],
+          protected: [hit("CLAUDE.md", "CLAUDE.md")],
+        });
+        expect(body).toContain("`agent:approved`");
+        expect(body).toContain("承認が効くのは、上のコミットだけ");
+      });
+
+      it("forbidden では、承認の方法を書かない", () => {
+        const body = heldComment(1, {
+          status: "forbidden",
+          headCommit: "abc",
+          forbidden: [hit("a", "a")],
+          protected: [],
+        });
+        expect(body).not.toContain("agent:approved");
+      });
+
+      it("再開した publish がまた止まったときは、回数の入った目印を付ける", () => {
+        const output = {
+          status: "needs_approval" as const,
+          headCommit: "abc",
+          forbidden: [],
+          protected: [hit("a", "a")],
+        };
+        expect(heldComment(5, output, 1)).toContain(
+          "<!-- factory:held run=5 -->",
+        );
+        const second = heldComment(5, output, 2);
+        expect(second).toContain("<!-- factory:held run=5 publish=2 -->");
+        expect(second).not.toContain(heldMarker(5));
+      });
 
       it("結果の種類、コミット、当たったパスとパターン、実行ごとの目印を書く", () => {
         const body = heldComment(12, {

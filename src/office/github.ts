@@ -159,6 +159,37 @@ export async function addLabels(
   return true;
 }
 
+/**
+ * イシューからラベルを1つ外す。付いていなければ、何も変わらない(やり直して安全)。
+ * 状態のラベル(`state:`)は、ここではなく `setStateLabel` で付け替える。
+ * `dry_run` が `true` のときは通信せず、外す予定だったことをログに出して `false` を返す。
+ */
+export async function removeLabel(
+  ctx: WriteContext,
+  repo: string,
+  issueNumber: number,
+  label: string,
+): Promise<boolean> {
+  if (label.startsWith("state:")) {
+    throw new Error(
+      `状態のラベルは、付け替えで変えます(外すだけにはできません): ${label}`,
+    );
+  }
+  const fields = {
+    action: "remove_label",
+    repo,
+    issue: issueNumber,
+    label,
+  };
+  if (ctx.dryRun) {
+    ctx.logger.info("github.write_skipped", { reason: "dry_run", ...fields });
+    return false;
+  }
+  await ctx.api.removeLabel(repo, issueNumber, label);
+  ctx.logger.info("github.write", fields);
+  return true;
+}
+
 /** 状態を表すラベル。`closed` はラベルではなく、イシューのクローズで表す。 */
 function stateLabel(state: IssueState): string {
   if (state === "closed") {

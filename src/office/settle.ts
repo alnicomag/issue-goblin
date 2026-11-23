@@ -19,7 +19,19 @@ export interface SettleInput {
     readonly nextStep: StepName | null;
     /** ステップを1つでも始めたか。 */
     readonly started: boolean;
+    /**
+     * publish が人間の対応待ちで止まって終わった実行(`held`)の、止まり方。それ以外は省く。
+     *
+     * - `reason`: 止まった理由。記録から読めなければ null。
+     * - `approval`: 止まったステップに対する承認の記録。`pending` は、記録したが、まだ再開していない。
+     */
+    readonly held?: {
+      readonly reason: "needs_approval" | "forbidden" | null;
+      readonly approval: "none" | "pending" | "used";
+    };
   } | null;
+  /** イシューに、承認のラベル(`agent:approved`)が付いているか(GitHubの写し)。 */
+  readonly approvedLabel?: boolean;
   /** この事務局のプロセスが、その実行をいま進めているか。 */
   readonly active: boolean;
   /** 試行に数える失敗の数。 */
@@ -36,6 +48,8 @@ export interface SettleInput {
  * - `to_review`: PRができたので、`in-review` に進める。
  * - `ask`: 質問をコメントして、`needs-info` に進める。
  * - `hold`: publish が人間の対応待ちで止まったので、理由をコメントして、`needs-info` に進める。
+ * - `approve`: 人間が承認したので、承認を記録し、ラベルを外し、`in-progress` に進めて、publish から再開する。
+ * - `resume`: 承認を記録して `in-progress` に進めた後で止まっていたので、publish から再開する。
  * - `retry`: 失敗したが試行に余裕があるので、`ready` に戻す。
  * - `give_up`: 試行の上限に達したので、`failed` に進める。
  */
@@ -47,6 +61,8 @@ export type SettleAction =
   | "to_review"
   | "ask"
   | "hold"
+  | "approve"
+  | "resume"
   | "retry"
   | "give_up";
 
@@ -71,7 +87,19 @@ export function decideSettlement(input: SettleInput): SettleAction {
     return "cancel";
   }
 
-  // 実行は終わっている。イシューが in-progress のままなら、終わり方に応じて状態を進める。
+  // 実行は終わっている。
+  // 保護対象のパスで止まり、needs-info で待っている実行は、人間の承認があれば再開する。
+  // 承認として扱うのは、ラベルが付いている場合と、承認を記録した後で止まっていた場合である。
+  // 禁止のパスで止まった実行と、理由を読めない実行は、ラベルがあっても進めない。
+  if (issueState === "needs-info") {
+    const held = run.status === "held" ? run.held : undefined;
+    if (held?.reason !== "needs_approval") return "none";
+    if (held.approval === "pending") return "approve";
+    return held.approval === "none" && input.approvedLabel === true
+      ? "approve"
+      : "none";
+  }
+  // イシューが in-progress のままなら、終わり方に応じて状態を進める。
   if (issueState !== "in-progress") return "none";
   switch (run.status) {
     case "question":
@@ -82,7 +110,8 @@ export function decideSettlement(input: SettleInput): SettleAction {
       }
       return input.failedCount >= input.maxAttempts ? "give_up" : "retry";
     case "held":
-      return "hold";
+      // 承認を記録して in-progress に進めた後、再開の前に止まった場合は、続きを行う。
+      return run.held?.approval === "pending" ? "resume" : "hold";
     case "done":
     case "cancelled":
       return "none";

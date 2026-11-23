@@ -228,6 +228,24 @@ function oneLine(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
 
+/**
+ * パスやパターンを、コメントやPRの本文のコードの中に書ける形にする。
+ *
+ * パスはワーカーが決められる文字列なので、コードの外に抜け出す書き方(バッククォート、改行)と、
+ * 目印に見える書き方(HTMLコメントの始まり)を崩す。コードの中なので、メンションは通知にならない。
+ */
+export function inlineCode(text: string): string {
+  const safe = text
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: 制御文字を空白に置き換える
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replaceAll("`", "'")
+    .replaceAll("<!--", "＜!--");
+  return `\`${safe}\``;
+}
+
+/** PRの本文に挙げる、承認された保護対象のパスの数の上限。残りは件数だけを書く。 */
+export const APPROVED_PATH_LIMIT = 50;
+
 /** PRのタイトル。イシューのタイトルを1行にして使う。空なら、番号から作る。 */
 export function buildPrTitle(issue: number, issueTitle: string): string {
   const title = oneLine(issueTitle);
@@ -351,6 +369,8 @@ export function buildPrBody(input: {
   implementSummary: string | null;
   /** 最後の `review` の要約。記録がなければ null。 */
   reviewSummary: string | null;
+  /** 人間の承認で通した、保護対象のパス。なければ、節を書かない。 */
+  approvedPaths?: readonly PathHit[];
 }): string {
   const lines = [`Closes #${input.issue}`, "", "## 検証結果", ""];
   if (input.verify === null) {
@@ -381,6 +401,23 @@ export function buildPrBody(input: {
       "",
       ...input.unverified.map((entry) => `- ${oneLine(entry)}`),
     );
+  }
+  const approvedPaths = input.approvedPaths ?? [];
+  if (approvedPaths.length > 0) {
+    lines.push(
+      "",
+      "## 承認された保護対象のパス",
+      "",
+      "次のパスは、変更に人間の承認が要ります(`paths.protected`)。このコミットの変更は、イシューの上で承認されています。",
+      "",
+    );
+    for (const hit of approvedPaths.slice(0, APPROVED_PATH_LIMIT)) {
+      lines.push(
+        `- ${inlineCode(hit.path)}(パターン: ${inlineCode(hit.pattern)})`,
+      );
+    }
+    const rest = approvedPaths.length - APPROVED_PATH_LIMIT;
+    if (rest > 0) lines.push(`- (ほか ${rest} 件)`);
   }
   lines.push(
     "",
@@ -480,6 +517,12 @@ export interface PublishInput {
   readonly implementSummary: string | null;
   /** 最後の `review` の要約。PRの本文に、ワーカーの申告として載せる。記録がなければ null。 */
   readonly reviewSummary: string | null;
+  /**
+   * 人間が承認したコミット。取り込んだブランチの先頭がこれと一致するときだけ、
+   * `paths.protected` に当たる変更を通す。承認がなければ null(または省略)。
+   * `paths.forbidden`、作者、そのほかの検査は、承認があっても変わらない。
+   */
+  readonly approvedCommit?: string | null;
 }
 
 function describeHits(hits: readonly PathHit[]): string {
@@ -510,6 +553,7 @@ function describeMismatches(mismatches: readonly CommitIdentity[]): string {
  * 2. ミラーを最新にし、作業場所のcloneから作業用のブランチを取り込む。
  * 3. ミラーで、既定ブランチにないコミットの作者とコミッターが、`author` と一致するかを確かめる。
  * 4. ミラーで既定ブランチとの差分を調べ、`paths.forbidden` と `paths.protected` に照らす。
+ *    `paths.protected` に当たる変更は、先頭が人間の承認したコミット(`approvedCommit`)のときだけ通す。
  * 5. 検査を通ったら、ミラーから push し、PRを作る。同じブランチのオープンなPRがあれば、
  *    作らずに更新する。
  *
@@ -625,7 +669,11 @@ export async function publish(
       checked,
     );
   }
-  if (check.protected.length > 0) {
+  const approved =
+    check.protected.length > 0 &&
+    input.approvedCommit != null &&
+    input.approvedCommit === changes.headCommit;
+  if (check.protected.length > 0 && !approved) {
     return stopped(
       "needs_approval",
       `保護対象のパス(paths.protected)に触れています。人間の承認待ちで、push していません: ${describeHits(check.protected)}`,
@@ -649,6 +697,7 @@ export async function publish(
       unverified: factoryYml.verify.unverified,
       implementSummary: input.implementSummary,
       reviewSummary: input.reviewSummary,
+      approvedPaths: approved ? check.protected : [],
     }),
   };
   const existing = await write.api.findOpenPullRequest(repo, branch);
@@ -691,6 +740,7 @@ export async function publish(
     pr: result.prNumber,
     pr_created: prCreated,
     changed_paths: changes.paths.length,
+    approved_protected: approved ? check.protected.length : 0,
   });
   return result;
 }

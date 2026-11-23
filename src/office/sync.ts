@@ -28,6 +28,11 @@ export const STATE_LABEL_PREFIX = "state:";
 export const TRIAGE_LABEL = "state:triage";
 /** エージェントが触らないイシューに、人間が付けるラベル。 */
 export const AGENT_SKIP_LABEL = "agent:skip";
+/**
+ * 保護対象のパスに触れた変更を承認するときに、人間が付けるラベル。
+ * 承認として扱うかは、止まった実行の記録と合わせて、`supervisor.ts` が決める。
+ */
+export const AGENT_APPROVED_LABEL = "agent:approved";
 
 const PRIORITIES = ["p0", "p1", "p2", "p3"] as const;
 const SIZES = ["s", "m", "l"] as const;
@@ -185,6 +190,7 @@ interface IssueRow {
   author: string | null;
   body: string | null;
   agent_skip: number;
+  approved: number;
   github_updated_at: string;
 }
 
@@ -283,7 +289,7 @@ async function syncIssue(
   const { db, clock, logger } = deps;
   const existing = db
     .prepare(
-      `SELECT title, state, priority, size, author, body, agent_skip,
+      `SELECT title, state, priority, size, author, body, agent_skip, approved,
               github_updated_at
        FROM issues WHERE repo = ? AND number = ?`,
     )
@@ -291,6 +297,7 @@ async function syncIssue(
 
   const derived = deriveIssue(issue);
   const agentSkip = issue.labels.includes(AGENT_SKIP_LABEL) ? 1 : 0;
+  const approvedLabel = issue.labels.includes(AGENT_APPROVED_LABEL) ? 1 : 0;
   // 前回の取り込みより後に更新されたか。取得範囲は前回と重なるので、
   // 同じ内容がもう一度届くことがある(再起動の後も同じ)。
   const fresh =
@@ -347,8 +354,8 @@ async function syncIssue(
       db.prepare(
         `INSERT INTO issues
            (repo, number, title, state, priority, size, author, body, agent_skip,
-            github_updated_at, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            approved, github_updated_at, synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         repo,
         issue.number,
@@ -359,6 +366,7 @@ async function syncIssue(
         issue.author,
         issue.body,
         agentSkip,
+        approvedLabel,
         issue.updatedAt,
         now,
       );
@@ -385,10 +393,13 @@ async function syncIssue(
     // GitHubが変更前の内容を返すことがあり、それを人間の変更と見誤らないためである。
     // 事務局の変更も人間の変更も、更新時刻を進めるので、進んだ内容が届いたときに読めば足りる。
     const state = fresh ? (derived.state ?? existing.state) : existing.state;
+    // 承認のラベルも、同じ理由で、更新時刻が進んだ内容からだけ読む。
+    // 事務局が外した直後に、外す前の内容が届くと、外したラベルを承認と見誤るからである。
+    const approved = fresh ? approvedLabel : existing.approved;
     db.prepare(
       `UPDATE issues
          SET title = ?, state = ?, priority = ?, size = ?,
-             author = ?, body = ?, agent_skip = ?,
+             author = ?, body = ?, agent_skip = ?, approved = ?,
              github_updated_at = ?, synced_at = ?
        WHERE repo = ? AND number = ?`,
     ).run(
@@ -399,6 +410,7 @@ async function syncIssue(
       issue.author,
       issue.body,
       agentSkip,
+      approved,
       fresh ? issue.updatedAt : existing.github_updated_at,
       now,
       repo,

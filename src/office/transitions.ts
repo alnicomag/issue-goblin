@@ -39,6 +39,8 @@ export const TRANSITIONS: readonly Transition[] = [
   { from: "triage", to: "needs-info", actor: "conductor" },
   { from: "triage", to: "blocked", actor: "conductor" },
   { from: "needs-info", to: "triage", actor: "office" },
+  // 人間が、保護対象のパスに触れる変更を承認した(`agent:approved`)。止まった実行を publish から再開する。
+  { from: "needs-info", to: "in-progress", actor: "office" },
   { from: "blocked", to: "triage", actor: "office" },
   { from: "ready", to: "in-progress", actor: "office" },
   { from: "in-progress", to: "in-review", actor: "office" },

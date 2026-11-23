@@ -12,6 +12,7 @@ import {
   createPullRequest,
   FACTORY_MARKER,
   pushBranch,
+  removeLabel,
   setStateLabel,
   updatePullRequest,
   type WriteContext,
@@ -183,6 +184,55 @@ describe("GitHubへの書き込み", () => {
       await expect(
         setStateLabel(ctx(false), REPO, 7, { from: "ready", to: "ready" }),
       ).rejects.toThrow(/同じ状態/);
+      expect(fake.calls).toEqual([]);
+    });
+  });
+
+  describe("ラベルの取り外し", () => {
+    it("dry_run が true なら、書き込まず、予定だったことをログに出す", async () => {
+      fake.putIssue({
+        number: 7,
+        labels: ["agent:approved"],
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      });
+      expect(await removeLabel(ctx(true), REPO, 7, "agent:approved")).toBe(
+        false,
+      );
+      expect(fake.calls).toEqual([]);
+      expect(logs).toEqual([
+        {
+          level: "info",
+          event: "github.write_skipped",
+          fields: {
+            reason: "dry_run",
+            action: "remove_label",
+            repo: REPO,
+            issue: 7,
+            label: "agent:approved",
+          },
+        },
+      ]);
+    });
+
+    it("ラベルを外す。ほかのラベルは残す。2回行っても、同じ結果になる", async () => {
+      fake.putIssue({
+        number: 7,
+        labels: ["state:needs-info", "agent:approved"],
+        updatedAt: "2026-03-01T00:00:00.000Z",
+      });
+      expect(await removeLabel(ctx(false), REPO, 7, "agent:approved")).toBe(
+        true,
+      );
+      expect(await removeLabel(ctx(false), REPO, 7, "agent:approved")).toBe(
+        true,
+      );
+      expect(fake.issues[0]?.labels).toEqual(["state:needs-info"]);
+    });
+
+    it("状態のラベルは、書き込まずに失敗する", async () => {
+      await expect(
+        removeLabel(ctx(false), REPO, 7, "state:ready"),
+      ).rejects.toThrow(/状態のラベル/);
       expect(fake.calls).toEqual([]);
     });
   });

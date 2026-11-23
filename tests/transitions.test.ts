@@ -16,6 +16,8 @@ const TABLE: ReadonlyArray<readonly [TransitionSource, IssueState, Actor]> = [
   ["triage", "needs-info", "conductor"],
   ["triage", "blocked", "conductor"],
   ["needs-info", "triage", "office"],
+  // 人間が、保護対象のパスに触れる変更を承認した(docs/design.md の遷移表で足した行)。
+  ["needs-info", "in-progress", "office"],
   ["blocked", "triage", "office"],
   ["ready", "in-progress", "office"],
   ["in-progress", "in-review", "office"],
