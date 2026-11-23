@@ -177,6 +177,138 @@ Dockerを使わずに動かしている場合は、次のコマンドです。
 pnpm run status
 ```
 
+## 段階1を通して確かめる
+
+実際のリポジトリで、`state:ready` のイシュー1件がPRになるまでを確かめる手順です。`owner/name` は対象のリポジトリ、`<番号>` はイシューの番号に読み替えます。
+
+### 1. 準備
+
+- 対象のリポジトリに `factory.yml` を置き、小さなイシューを1件用意します。起票者は `issues.allowed_authors` に入れます。
+- 製品の検査コマンドに要るツールが、ワーカーのイメージに入っていることを確かめます。基本のイメージにあるのは、Node、git、Claude Code だけです。足りなければ、「ワーカーの実行環境」のとおりに別のイメージを作り、`worker_image` で指定します。
+
+  ```bash
+  docker run --rm --entrypoint sh <イメージ> -c '<ツール> --version'
+  ```
+
+  ワーカーのコンテナは、ルートが読み取り専用で、書けるのは作業場所(`HOME` を含む)と `/tmp` だけです。実行時にツールを入れる作りにはせず、イメージに入れておきます。
+- 稼働中のイメージが、手元のコードから作ったものであることを確かめます。古ければ `docker compose up -d --build` で作り直します。
+
+### 2. `dry_run: true` で動かす
+
+`dry_run: true` のまま起動し、ポーリングを数回待ちます。前後で、イシュー、PR、ブランチに変化がないことを確かめます。
+
+```bash
+gh issue list -R owner/name --state all --json number,state,labels,updatedAt,comments
+gh pr list -R owner/name --state all --json number,state,headRefName,updatedAt
+gh api repos/owner/name/branches --jq '.[].name'
+docker compose logs office | grep -c '"github.write"'    # 0 であること
+```
+
+`dry_run: true` の間は、`state:ready` のイシューがあっても着手しません。
+
+### 3. `dry_run: false` で動かす
+
+GitHubへ実際に書き込みます。イシューを手動で `state:ready` にし、`dry_run` を `false` にして、`docker compose restart office` で読み直します。
+
+```bash
+docker compose logs -f office
+docker compose exec office node src/office/status.ts
+```
+
+ログには、次の順でイベントが出ます。
+
+| イベント | 意味 |
+| --- | --- |
+| `run.started` | 着手した |
+| `transition.applied`(`ready` から `in-progress`) | ラベルを付け替えた |
+| `run.step_started`、`run.step_finished` | ステップ(`prepare`、`plan`、`implement`、`verify`、`review`、`publish`)の開始と終了 |
+| `publish.finished` | ブランチを push し、PRを作った(または更新した) |
+| `run.paused`(`waiting_close`) | PRまで終わり、イシューのクローズを待っている |
+| `transition.applied`(`in-progress` から `in-review`) | 次のポーリングでラベルを付け替えた |
+
+確かめ終えたら、`dry_run` を `true` に戻して読み直します。
+
+### 4. 途中で止めて、続きから進むことを確かめる
+
+ステップの途中で事務局を止め、起動し直します。
+
+```bash
+docker compose stop office
+docker ps --filter label=factory.worker    # ワーカーのコンテナが残っていないこと
+docker compose start office
+```
+
+- 止めたとき、ログに `run.paused`(`aborted`)と `office.stopped` が出ます。実行と、そのステップは、DBに `running` のまま残ります。
+- 起動し直すと、最初の同期の後に、同じステップが `"resumed":true` で始まります。試行回数は増えません。
+- `publish` の途中で止めた場合も、起動し直した後のPRは1つのままです。PRがすでにあれば、作らずに更新します(`"pr_created":false`)。
+
+```bash
+gh pr list -R owner/name --state all --head agent/issue-<番号>    # 1件であること
+```
+
+### 5. 実行の記録を見る
+
+`steps` に、ステップごとの結果、費用、ログの場所が入ります。費用とログがあるのは、Claudeを呼ぶステップ(`plan`、`implement`、`review`)と `verify`(ログだけ)です。
+
+```bash
+docker compose exec office node -e '
+const { DatabaseSync } = require("node:sqlite");
+const db = new DatabaseSync("/data/factory.db", { readOnly: true });
+console.table(db.prepare("SELECT id, repo, issue_number, attempt, status, current_step, pr_number FROM runs").all());
+console.table(db.prepare("SELECT run_id, name, status, cost_usd, log_path, started_at, finished_at FROM steps ORDER BY id").all());
+'
+```
+
+PRまで終わった実行は、イシューがクローズされるまで `running`(`current_step` は `publish`)のまま残ります。状況表示では「クローズ待ちの実行」に出ます。
+
+ログは、事務局のコンテナの `logs_dir`(既定は `/data/logs`)の下にあります。
+
+```bash
+docker compose exec office ls /data/logs/owner/name/issue-<番号>
+```
+
+### 6. トークンが漏れていないことを確かめる
+
+`.env` と `.env.launcher` の値を、DB、ログ、ミラー、作業場所、コンテナのログから探します。値は画面に出しません。どの行も、件数が 0 であることを確かめます。
+
+```bash
+umask 077
+grep -hE '^[A-Z_]*(TOKEN|KEY)[A-Z_]*=' .env .env.launcher | sed 's/^[^=]*=//' > /tmp/factory-secrets
+docker run --rm --network none --user 0 --entrypoint sh \
+  -v "$(docker compose config --format json | jq -r .name)_factory-data:/data:ro" \
+  -v "$(docker compose config --format json | jq -r .name)_factory-work:/work:ro" \
+  -v /tmp/factory-secrets:/secrets:ro \
+  factory-worker -c 'grep -ralF -f /secrets /data /work | wc -l'
+for c in office launcher proxy; do
+  docker compose logs --no-log-prefix "$c" | grep -cF -f /tmp/factory-secrets
+done
+rm /tmp/factory-secrets
+```
+
+### 7. ワーカーの環境からGitHubへ書けないことを確かめる
+
+実行後の作業場所は、イシューがクローズされるまで残ります。これを、ワーカーと同じ条件のコンテナにマウントして確かめます。
+
+```bash
+project="$(docker compose config --format json | jq -r .name)"
+docker run --rm --pull=never --network="${project}_workers" --user=1000:1000 \
+  --cap-drop=ALL --security-opt=no-new-privileges --read-only --tmpfs=/tmp \
+  --mount="type=volume,src=${project}_factory-work,dst=/workspace,volume-subpath=owner/name/issue-<番号>" \
+  --workdir=/workspace/repo --env=HOME=/workspace/home \
+  --env=HTTPS_PROXY=http://proxy:3128 --env=https_proxy=http://proxy:3128 \
+  --env=GIT_TERMINAL_PROMPT=0 --entrypoint sh <イメージ> -c '
+    git remote -v
+    ls -a "$HOME"
+    git push https://github.com/owner/name.git HEAD:refs/heads/factory-push-probe
+  '
+```
+
+- `git remote -v` が何も出さない(作業場所にリモートがない)。
+- `HOME` に `.git-credentials`、`.netrc`、`.ssh` がない。
+- `git push` が、認証できずに失敗する(`could not read Username`)。GitHub上に `factory-push-probe` というブランチができていないことも確かめます。
+
+実行の前の状態で同じことを確かめるには、`scripts/check-isolation.sh` を使います。
+
 ## Dockerを使わずに動かす
 
 `db_path` を手元のパス(例: `./data/factory.db`)に、`repos_dir` と `work_dir` を手元の絶対パスにして、トークンを環境変数に入れて起動します。
