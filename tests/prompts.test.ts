@@ -208,6 +208,27 @@ describe("ワーカーの指示書(plan、implement、review)", () => {
       expect(limits).toContain("`paths.protected`");
     });
 
+    it("途中の状態が残りうることと、そのときの進め方が書いてある", () => {
+      // plan は作業場所を変えないので、対象は implement と review だけである。
+      if (name === "plan") return;
+      const leftover = section(text, "前回の途中の状態");
+      expect(leftover).toContain("コミットしていない変更");
+      expect(leftover).toContain("追跡していないファイル");
+      expect(leftover).toContain("依存");
+      expect(leftover).toContain("`git status`");
+      if (name === "implement") {
+        // 残っていたものは確かめてから使い、壊れた依存は入れ直す。
+        expect(leftover).toContain("`git log`");
+        expect(leftover).toContain("確かめてから");
+        expect(leftover).toContain("`setup`");
+        expect(leftover).toContain("`summary`");
+      } else {
+        // 判定の根拠にせず、手も付けない。
+        expect(leftover).toContain("判定の根拠にしません");
+        expect(leftover).toContain("消さず");
+      }
+    });
+
     it("製品名や、製品固有のコマンドを含まない", () => {
       // 仮の名前も含めて、リポジトリを名指ししない。
       expect(text).not.toMatch(
