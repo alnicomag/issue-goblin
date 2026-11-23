@@ -16,7 +16,10 @@ import {
   type WorkerCall,
   type WorkerInvoker,
 } from "../src/agents/worker.ts";
-import type { WorkerLauncher } from "../src/launcher/client.ts";
+import {
+  LauncherAbortedError,
+  type WorkerLauncher,
+} from "../src/launcher/client.ts";
 import {
   parseRunRequest,
   type RunRequestInput,
@@ -406,6 +409,7 @@ describe("createClaudeWorker", () => {
         costUsd: null,
         numTurns: null,
         logPath: "/nonexistent/log",
+        interrupted: false,
       }),
     };
     expect((await fake.invoke(CALL)).status).toBe("question");
@@ -449,6 +453,7 @@ describe("createClaudeWorker", () => {
       sessionId: "11111111-2222-3333-4444-555555555555",
       costUsd: 0.25,
       numTurns: 3,
+      interrupted: false,
       logPath: path.join(
         logsDir,
         "owner/name/issue-12/20260102T030405.678Z-plan.log",
@@ -517,6 +522,56 @@ describe("createClaudeWorker", () => {
     expect(result.summary).toContain("ワーカーを起動できませんでした");
     expect(result.summary).toContain("設定にないリポジトリです");
     expect(fs.existsSync(result.logPath)).toBe(true);
+  });
+
+  it("起動係に届かない場合も、起動の失敗として残る", async () => {
+    const { worker } = setup(() => {
+      throw new Error("起動係に届きません: /run/launcher.sock");
+    });
+    const result = await worker.invoke(CALL);
+    expect(result.status).toBe("failed");
+    expect(result.interrupted).toBe(false);
+    expect(result.summary).toContain("ワーカーを起動できませんでした");
+    const log = fs.readFileSync(result.logPath, "utf8");
+    expect(log).toContain('"status": "failed"');
+    expect(log).not.toContain("interrupted");
+  });
+
+  it("中断した呼び出しは、起動の失敗ではなく、中断として残る", async () => {
+    const { worker } = setup(() => {
+      throw new LauncherAbortedError();
+    });
+    const result = await worker.invoke(CALL);
+    expect(result.interrupted).toBe(true);
+    expect(result.summary).toContain("中断しました");
+    expect(result.summary).not.toContain("起動できませんでした");
+    expect(result).toMatchObject({
+      sessionId: null,
+      costUsd: null,
+      numTurns: null,
+    });
+
+    const log = fs.readFileSync(result.logPath, "utf8");
+    expect(log).toContain('"status": "interrupted"');
+    expect(log).toContain("中断しました");
+    expect(log).not.toContain("起動できませんでした");
+    expect(log).toContain('"exit_code": null');
+  });
+
+  it("中断のログに、トークンに見える文字列を残さない", async () => {
+    const secret = "sk-ant-oat01-EXAMPLE_ONLY-abc123";
+    const { worker } = setup(() => {
+      throw new LauncherAbortedError({
+        cause: new Error(`socket hang up ${secret}`),
+      });
+    });
+    const result = await worker.invoke({
+      ...CALL,
+      values: { issue: `本文 ${secret}` },
+    });
+    expect(result.interrupted).toBe(true);
+    expect(result.summary).not.toMatch(/sk-ant-oat/);
+    expect(fs.readFileSync(result.logPath, "utf8")).not.toMatch(/sk-ant-oat/);
   });
 
   it("review は rework を返せるが、plan が返すと failed になる", async () => {

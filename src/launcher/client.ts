@@ -18,7 +18,7 @@ export interface WorkerLauncher {
    * コマンドが失敗しても、結果(終了コード)として返る。
    * 依頼が拒否された場合や、起動係に届かない場合は、例外になる。
    *
-   * `signal` が止められたら、結果を待たずに例外で戻る。起動係は、依頼した側がいなくなると
+   * `signal` が止められたら、結果を待たずに `LauncherAbortedError` で戻る。起動係は、依頼した側がいなくなると
    * コンテナを止めるので、ワーカーも残らない。
    */
   run(
@@ -29,7 +29,18 @@ export interface WorkerLauncher {
 
 const ErrorBodySchema = z.object({ error: z.string() });
 
-const ABORTED_MESSAGE = "起動係への依頼を中断しました";
+/**
+ * 依頼した側が `signal` で止めたときの例外。
+ *
+ * 起動係に届かない場合や、依頼を拒否された場合と区別できるように、型を分けてある。
+ * コンテナは、起動していたかもしれないし、まだだったかもしれない。
+ */
+export class LauncherAbortedError extends Error {
+  constructor(options?: ErrorOptions) {
+    super("起動係への依頼を中断しました", options);
+    this.name = "LauncherAbortedError";
+  }
+}
 
 /** 起動係の時間の上限に足す、応答を待つ余裕。 */
 const RESPONSE_MARGIN_MS = 60_000;
@@ -43,7 +54,7 @@ export function createLauncherClient(options: {
       const { signal } = runOptions;
       return new Promise((resolve, reject) => {
         if (signal?.aborted) {
-          reject(new Error(ABORTED_MESSAGE));
+          reject(new LauncherAbortedError());
           return;
         }
         const body = JSON.stringify(request);
@@ -93,12 +104,12 @@ export function createLauncherClient(options: {
         call.setTimeout(request.timeout_sec * 1000 + RESPONSE_MARGIN_MS, () => {
           call.destroy(new Error("起動係の応答がありません"));
         });
-        const abort = () => call.destroy(new Error(ABORTED_MESSAGE));
+        const abort = () => call.destroy(new LauncherAbortedError());
         signal?.addEventListener("abort", abort, { once: true });
         call.on("close", () => signal?.removeEventListener("abort", abort));
         call.on("error", (error) => {
           if (signal?.aborted) {
-            reject(new Error(ABORTED_MESSAGE, { cause: error }));
+            reject(new LauncherAbortedError({ cause: error }));
             return;
           }
           reject(
