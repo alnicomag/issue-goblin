@@ -118,6 +118,25 @@ function section(text: string, heading: string): string {
   return rest.slice(0, end === -1 ? undefined : end).join("\n");
 }
 
+/** `done` のときに、要約に書かせる見出し。この順で書かせる。 */
+const SUMMARY_HEADINGS = {
+  implement: ["変更の内容", "実行したコマンドと結果", "計画との違い", "未検証"],
+  review: ["受け入れ条件ごとの判定", "範囲とパス", "提案"],
+} as const;
+
+/** `done` 以外の状態の行。要約の形を決めたときに、変えないと決めたもの。 */
+const OTHER_ROWS = {
+  implement: [
+    "| `question` | 人間に聞かないと進められない | 質問と、ここまでに行ったこと |",
+    "| `failed` | 終えられなかった(テストを通せないなど) | 理由、試したこと、残っている問題 |",
+  ],
+  review: [
+    "| `rework` | 修正が要る | 直すべき点の一覧。それぞれに、場所(ファイルと箇所)、何が問題か、どうなっていれば合格か |",
+    "| `question` | 人間に聞かないと判定できない | 質問 |",
+    "| `failed` | 判定できなかった(差分が空、テスト結果がないなど) | 理由 |",
+  ],
+} as const;
+
 describe("ワーカーの指示書(plan、implement、review)", () => {
   /** 指示書ごとの、差し込む値の名前。値を組み立てる側は、これに合わせる。 */
   const PROMPTS = [
@@ -226,6 +245,39 @@ describe("ワーカーの指示書(plan、implement、review)", () => {
         // 判定の根拠にせず、手も付けない。
         expect(leftover).toContain("判定の根拠にしません");
         expect(leftover).toContain("消さず");
+      }
+    });
+
+    it("done のときの要約の見出しと順が、決めたとおりである", () => {
+      // plan の要約の形は、決めていない。
+      if (name === "plan") return;
+      const format = section(text, "結果の返し方");
+      const expected = SUMMARY_HEADINGS[name];
+      // 見本として書いた要約が、見出しをこの順で、過不足なく持つ。
+      const sample = /```markdown\n([\s\S]*?)\n```/.exec(format)?.[1] ?? "";
+      const headings = sample
+        .split("\n")
+        .filter((line) => line.startsWith("### "))
+        .map((line) => line.slice(4));
+      expect(headings).toEqual([...expected]);
+      expect(format).toContain("この順で");
+      // 表の `done` の行が、要約の形を指している。
+      expect(format).toMatch(/^\| `done` \|.*「`done` のときの要約の形」/m);
+      if (name === "implement") {
+        // 該当がない見出しも省かせず、「なし」と書かせる。
+        expect(format).toContain("「なし」と書きます");
+      } else {
+        // 受け入れ条件ごとの判定は、条件、判定、根拠の表にさせる。
+        expect(sample).toContain("| 条件 | 判定 | 根拠 |");
+        expect(format).toContain("表にします");
+      }
+    });
+
+    it("done 以外のときに要約へ書くことは、変えていない", () => {
+      if (name === "plan") return;
+      const format = section(text, "結果の返し方");
+      for (const row of OTHER_ROWS[name]) {
+        expect(format).toContain(row);
       }
     });
 

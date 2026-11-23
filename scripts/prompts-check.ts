@@ -3,6 +3,7 @@
  *
  * 仮の小さな製品を取得元にして、prepare で作業場所を用意し、起動係を通してワーカーのコンテナで
  * 3つの指示書を順に1回ずつ実際に呼び出して、形式どおりの結果が返ることを確かめる。
+ * implement と review が done を返したときは、要約が決めた見出しを持つことも確かめる。
  * 項目ごとに合否を出し、1つでも不合格なら、終了コード1で終わる。
  *
  * 実際のClaudeのトークンを使う(サブスクリプションの枠を使う)。
@@ -30,6 +31,12 @@ import {
   type PreparedWorkspace,
   prepareWorkspace,
 } from "../src/office/workspace.ts";
+import {
+  checkJudgementTable,
+  checkSummaryHeadings,
+  SUMMARY_HEADINGS,
+  type SummaryCheck,
+} from "./summary-headings.ts";
 
 /** 確認に使うイシュー番号。ほかの確認が使う番号と重ならないようにする。 */
 const ISSUE = 960;
@@ -117,6 +124,21 @@ function show(result: WorkerInvocation): void {
   for (const line of result.summary.split("\n").slice(0, 40)) {
     console.log(`      | ${line}`);
   }
+}
+
+/** 見出しの確認の結果を、合否として出す。 */
+function reportSummary(
+  check: SummaryCheck,
+  item: string,
+  summary: string,
+): void {
+  report(
+    check.ok,
+    item,
+    check.ok
+      ? ""
+      : `${check.reason} summary=${JSON.stringify(summary.slice(0, 600))}`,
+  );
 }
 
 /**
@@ -258,6 +280,13 @@ async function main(): Promise<void> {
     "実装が終わる(done)",
     describe(implement),
   );
+  if (implement.status === "done") {
+    reportSummary(
+      checkSummaryHeadings(implement.summary, SUMMARY_HEADINGS.implement),
+      `要約が、見出し(${SUMMARY_HEADINGS.implement.join("、")})をこの順で持つ`,
+      implement.summary,
+    );
+  }
   const afterImplement = await state();
   const commits = await read("rev-list", "--count", `${base}..HEAD`);
   report(
@@ -358,6 +387,23 @@ async function main(): Promise<void> {
     "判定が返る(done か rework)",
     describe(review),
   );
+  if (review.status === "done") {
+    reportSummary(
+      checkSummaryHeadings(review.summary, SUMMARY_HEADINGS.review),
+      `要約が、見出し(${SUMMARY_HEADINGS.review.join("、")})をこの順で持つ`,
+      review.summary,
+    );
+    reportSummary(
+      checkJudgementTable(review.summary),
+      "「受け入れ条件ごとの判定」が、条件、判定、根拠の表である",
+      review.summary,
+    );
+  } else {
+    // 見出しを決めているのは done のときだけなので、ここでは確かめられない。
+    console.log(
+      `未確認  review の要約の見出し(状態が ${review.status} なので、確かめていない)`,
+    );
+  }
   const afterReview = await state();
   report(
     afterReview.head === afterImplement.head && afterReview.dirty === "",
