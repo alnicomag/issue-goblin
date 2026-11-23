@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { ACCEPTED_COMMIT_AUTHORS } from "../scripts/commit-author-examples.ts";
 import { parseConfig } from "../src/office/config.ts";
 import { createGit, type Git, type GitRunOptions } from "../src/office/git.ts";
 import {
@@ -11,7 +12,6 @@ import {
   type WorkspaceDirs,
   workspacePaths,
 } from "../src/office/workspace.ts";
-import { ACCEPTED_COMMIT_AUTHORS } from "./commit-author-examples.ts";
 import {
   commitFile,
   makeRepo,
