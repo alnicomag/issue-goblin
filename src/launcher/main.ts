@@ -121,6 +121,9 @@ async function main(): Promise<void> {
   // 設定にあるイメージが手元にあるかを確かめる。なければログに出すだけで、止まらない。
   // ビルドで付けた名前(WORKER_IMAGE)と、設定の worker_image の食い違いに、着手の前に気づける。
   await launcher.checkImages();
+  // 製品のイメージのビルドに使う旧ビルダーが、使えるかを試す。使えなければログに出すだけで、止まらない。
+  // Docker を上げて旧ビルダーがなくなったことに、着手の前に気づける。
+  await launcher.checkBuilder();
 
   // 前回のソケットが残っていると、待ち受けに失敗する。
   fs.rmSync(socketPath, { force: true });

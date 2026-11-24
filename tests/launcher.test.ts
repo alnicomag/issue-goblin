@@ -583,6 +583,25 @@ describe("コマンドの実行", () => {
     expect(result.exitCode).toBe(0);
   });
 
+  it("止める合図で、コマンドを終わらせる", async () => {
+    const stop = new AbortController();
+    const pending = cli.exec(
+      ["-e", "process.stdout.write('started'); setInterval(() => {}, 1000)"],
+      { ...options, signal: stop.signal },
+    );
+    setTimeout(() => stop.abort(), 200);
+    const result = await pending;
+    // シグナルで終わったので、終了コードはない。
+    expect(result.exitCode).toBeNull();
+
+    // すでに止められていれば、すぐに終わらせる。
+    const stopped = await cli.exec(["-e", "setInterval(() => {}, 1000)"], {
+      ...options,
+      signal: stop.signal,
+    });
+    expect(stopped.exitCode).toBeNull();
+  });
+
   it("コマンドがなければ、原因の分かるメッセージで失敗する", async () => {
     await expect(
       createDockerCli("/nonexistent/docker").exec(["version"], options),

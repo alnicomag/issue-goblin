@@ -19,6 +19,8 @@ export interface CommandOptions {
   readonly env: Record<string, string>;
   /** 標準出力と標準エラーの、それぞれの上限。 */
   readonly maxOutputBytes: number;
+  /** 止める合図。止められたら、コマンドを終わらせる(結果は、終了コードとして返る)。 */
+  readonly signal?: AbortSignal;
 }
 
 export interface Docker {
@@ -69,7 +71,12 @@ export function createDockerCli(command = "docker"): Docker {
         child.on("error", (error) => {
           reject(new Error(`${command} を起動できません`, { cause: error }));
         });
+        const { signal } = options;
+        const stop = () => child.kill("SIGTERM");
+        if (signal?.aborted) stop();
+        signal?.addEventListener("abort", stop, { once: true });
         child.on("close", (code) => {
+          signal?.removeEventListener("abort", stop);
           resolve({
             exitCode: code,
             stdout: stdout.text(),

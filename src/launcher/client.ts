@@ -7,6 +7,7 @@
 import http from "node:http";
 import { z } from "zod";
 import {
+  BUILD_TIMEOUT_SEC,
   type RunRequestInput,
   type RunResult,
   RunResultSchema,
@@ -101,7 +102,12 @@ export function createLauncherClient(options: {
             });
           },
         );
-        call.setTimeout(request.timeout_sec * 1000 + RESPONSE_MARGIN_MS, () => {
+        // Dockerfile を添えた依頼は、実行の前にビルドが入ることがある。
+        const buildMs =
+          request.dockerfile === undefined ? 0 : BUILD_TIMEOUT_SEC * 1000;
+        const waitMs =
+          request.timeout_sec * 1000 + buildMs + RESPONSE_MARGIN_MS;
+        call.setTimeout(waitMs, () => {
           call.destroy(new Error("起動係の応答がありません"));
         });
         const abort = () => call.destroy(new LauncherAbortedError());

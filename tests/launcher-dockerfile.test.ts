@@ -58,7 +58,7 @@ describe("製品の Dockerfile の検査", () => {
     ],
     [
       "ほかの引数",
-      "ARG OTHER=example/image\nFROM ${OTHER}\n",
+      `ARG OTHER=example/image\nFROM \${OTHER}\n`,
       "2行目",
       "FROM に書けるのは",
     ],
