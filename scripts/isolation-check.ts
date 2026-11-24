@@ -11,7 +11,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { createLauncherClient } from "../src/launcher/client.ts";
-import { issueDirFor } from "../src/launcher/container.ts";
+import { issueDirFor, preflightDirFor } from "../src/launcher/container.ts";
 import type { RunRequestInput } from "../src/launcher/request.ts";
 import { DEFAULT_CONFIG_PATH, loadConfig } from "../src/office/config.ts";
 
@@ -160,7 +160,13 @@ async function main(): Promise<void> {
     marker: `${place.repo}#${place.issue}`,
     dir: path.join(workDir, issueDirFor(place.repo, place.issue)),
   }));
-  for (const place of places) {
+  // 着手前の確認の作業場所(1つ目の製品のもの)。
+  const preflightPlace = {
+    repo: first.repo,
+    marker: `${first.repo}#preflight`,
+    dir: path.join(workDir, preflightDirFor(first.repo)),
+  };
+  for (const place of [...places, preflightPlace]) {
     fs.mkdirSync(path.join(place.dir, "repo"), { recursive: true });
     fs.mkdirSync(path.join(place.dir, "home"), { recursive: true });
     fs.writeFileSync(path.join(place.dir, "marker.txt"), `${place.marker}\n`);
@@ -188,12 +194,15 @@ async function main(): Promise<void> {
   };
 
   async function probe(
-    place: { repo: string; issue: number },
+    place: { repo: string; issue?: number },
     claudeToken: boolean,
   ): Promise<Probe> {
     const request: RunRequestInput = {
       repo: place.repo,
-      issue: place.issue,
+      // イシュー番号のない場所は、着手前の確認の作業場所として頼む。
+      ...(place.issue === undefined
+        ? { workspace: "preflight" as const }
+        : { issue: place.issue }),
       argv: ["node", "--input-type=module", "-", JSON.stringify(params)],
       stdin: probeScript,
       claude_token: claudeToken,
@@ -243,8 +252,9 @@ async function main(): Promise<void> {
   report(
     fs.existsSync(path.join(placeA1.dir, "repo", "probe.txt")) &&
       fs.readdirSync(path.join(placeA2.dir, "repo")).length === 0 &&
-      fs.readdirSync(path.join(placeB1.dir, "repo")).length === 0,
-    "ワーカーの書き込みは、自分の作業場所にだけ残る(別のイシューと別の製品は空のまま)",
+      fs.readdirSync(path.join(placeB1.dir, "repo")).length === 0 &&
+      fs.readdirSync(path.join(preflightPlace.dir, "repo")).length === 0,
+    "ワーカーの書き込みは、自分の作業場所にだけ残る(別のイシュー、別の製品、着手前の確認の場所は空のまま)",
   );
   const a2 = await probe(placeA2, false);
   report(
@@ -257,6 +267,41 @@ async function main(): Promise<void> {
     b1.marker === placeB1.marker,
     "別の製品のワーカーには、その製品の作業場所だけが見える",
     b1.marker,
+  );
+
+  console.log("\n# 着手前の確認のコンテナ");
+  const preflight = await probe(preflightPlace, false);
+  report(
+    preflight.marker === preflightPlace.marker &&
+      JSON.stringify(preflight.workspaceEntries) ===
+        JSON.stringify(["home", "marker.txt", "repo"]),
+    "着手前の確認のコンテナには、確認用の作業場所だけが見える",
+    `${preflight.marker} / ${preflight.workspaceEntries.join(", ")}`,
+  );
+  report(
+    JSON.stringify(preflight.env) === JSON.stringify(a1.env) &&
+      JSON.stringify(preflight.mounts) === JSON.stringify(a1.mounts) &&
+      preflight.claudeTokenSha256 === null,
+    "環境変数とマウントは、ワーカーと同じである(資格情報がない)",
+    `${preflight.env.join(", ")} / ${preflight.mounts.join(", ")}`,
+  );
+  report(
+    Object.values(preflight.readable).every((visible) => !visible) &&
+      !preflight.rootWritable &&
+      preflight.uid === a1.uid &&
+      preflight.capEff === a1.capEff &&
+      preflight.noNewPrivs === a1.noNewPrivs,
+    "事務局のファイルを読めず、権限も、ワーカーと同じに落ちている",
+  );
+  report(
+    JSON.stringify(preflight.direct) === JSON.stringify(a1.direct) &&
+      JSON.stringify(preflight.viaProxy) === JSON.stringify(a1.viaProxy) &&
+      preflight.defaultRoute === a1.defaultRoute,
+    "外向きの通信の結果が、ワーカーと同じである(直接は出られず、プロキシを通る)",
+  );
+  report(
+    fs.existsSync(path.join(preflightPlace.dir, "repo", "probe.txt")),
+    "書き込みは、確認用の作業場所に残る",
   );
 
   console.log("\n# ワーカーにできること");
@@ -372,6 +417,22 @@ async function main(): Promise<void> {
   await rejected("イメージを指定する依頼を拒否する", {
     ...base,
     image: "busybox",
+  });
+  await rejected("決まっていない種類の作業場所を拒否する", {
+    ...base,
+    workspace: "../second",
+  });
+  await rejected(
+    "着手前の確認の作業場所に、イシュー番号を付けた依頼を拒否する",
+    {
+      ...base,
+      workspace: "preflight",
+    },
+  );
+  await rejected("イシュー番号のない、イシューの作業場所の依頼を拒否する", {
+    repo: first.repo,
+    argv: ["true"],
+    timeout_sec: 30,
   });
   await rejected("細工したイシュー番号を拒否する", {
     ...base,
