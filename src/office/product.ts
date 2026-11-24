@@ -10,7 +10,7 @@ import type { Db } from "./db.ts";
 import { insertEvent } from "./events.ts";
 import type { GitHubApi } from "./github.ts";
 import type { Logger } from "./log.ts";
-import { globPatternError } from "./paths.ts";
+import { globPatternError, type PathRules } from "./paths.ts";
 
 export const FACTORY_YML_PATH = "factory.yml";
 
@@ -24,6 +24,34 @@ const Command = z.string().min(1);
 const PathPattern = z.string().superRefine((pattern, context) => {
   const message = globPatternError(pattern);
   if (message !== null) context.addIssue({ code: "custom", message });
+});
+
+/**
+ * `worker.dockerfile` のパス。リポジトリの直下からの相対パスで書く。
+ *
+ * 使えるのは、英数字と `.`、`_`、`-`、区切りの `/` だけにする。リポジトリの外を指せず、
+ * パスのパターン(`paths.protected`)としても、そのパス1つだけに当たる(`*` や `?` を含まない)。
+ */
+const DockerfilePath = z.string().superRefine((value, context) => {
+  const fail = (reason: string) =>
+    context.addIssue({
+      code: "custom",
+      message: `Dockerfile の場所を読めません: ${JSON.stringify(value)}(${reason})`,
+    });
+  if (value === "") return fail("空です");
+  if (value.length > 255) return fail("長すぎます");
+  if (value.startsWith("/")) {
+    return fail("リポジトリの直下からの相対パスで書いてください");
+  }
+  if (!/^[A-Za-z0-9._/-]+$/.test(value)) {
+    return fail("使えるのは、英数字と . _ - / だけです");
+  }
+  for (const segment of value.split("/")) {
+    if (segment === "") return fail("区切りが続いているか、末尾にあります");
+    if (segment === "." || segment === "..") {
+      return fail(". と .. は使えません");
+    }
+  }
 });
 
 export const FactoryYmlSchema = z.strictObject({
@@ -49,12 +77,37 @@ export const FactoryYmlSchema = z.strictObject({
       max_attempts: z.number().int().min(1).default(3),
     })
     .default({ max_parallel: 1, max_attempts: 3 }),
+  /**
+   * ワーカーの環境。`dockerfile` は、ワーカーのイメージに製品のツールを足す定義の場所。
+   * 省略すると、ファクトリー側の設定のイメージをそのまま使う。
+   */
+  worker: z.strictObject({ dockerfile: DockerfilePath.optional() }).optional(),
   issues: z.strictObject({
     allowed_authors: z.array(z.string().min(1)),
   }),
 });
 
 export type FactoryYml = z.infer<typeof FactoryYmlSchema>;
+
+/** 製品の Dockerfile の場所(`worker.dockerfile`)。書いていなければ null。 */
+export function workerDockerfilePath(factoryYml: FactoryYml): string | null {
+  return factoryYml.worker?.dockerfile ?? null;
+}
+
+/**
+ * 変更されたパスに照らす規則。`paths` に、`worker.dockerfile` のパスを保護対象として足したもの。
+ *
+ * Dockerfile はワーカーの環境を決めるので、製品が `paths.protected` に書いていなくても、
+ * 変更に人間の承認を求める。
+ */
+export function pathRulesOf(factoryYml: FactoryYml): PathRules {
+  const dockerfile = workerDockerfilePath(factoryYml);
+  const { forbidden } = factoryYml.paths;
+  if (dockerfile === null || factoryYml.paths.protected.includes(dockerfile)) {
+    return { forbidden, protected: factoryYml.paths.protected };
+  }
+  return { forbidden, protected: [...factoryYml.paths.protected, dockerfile] };
+}
 
 export type FactoryYmlParseResult =
   | { readonly ok: true; readonly value: FactoryYml }

@@ -1169,6 +1169,28 @@ describe("publish", () => {
     });
   });
 
+  it("worker.dockerfile のパスは、paths.protected に書いていなくても、承認待ちになる", async () => {
+    setFactoryYml(
+      `${VALID_FACTORY_YML}worker:\n  dockerfile: .factory/worker.Dockerfile\n`,
+    );
+    fs.mkdirSync(path.join(paths.repoDir, ".factory"));
+    commitFile(paths.repoDir, ".factory/worker.Dockerfile", "changed\n");
+
+    const result = await run(false);
+    expect(result).toMatchObject({
+      status: "needs_approval",
+      outcome: "held",
+      forbidden: [],
+      protected: [
+        {
+          path: ".factory/worker.Dockerfile",
+          pattern: ".factory/worker.Dockerfile",
+        },
+      ],
+    });
+    expectNothingWritten();
+  });
+
   describe("承認待ちで止まったときの、保護対象のパスの差分", () => {
     const protectedFile = (name: string, content: string): string => {
       fs.mkdirSync(path.join(paths.repoDir, "docs"), { recursive: true });

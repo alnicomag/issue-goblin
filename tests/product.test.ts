@@ -4,8 +4,10 @@ import { silentLogger } from "../src/office/log.ts";
 import { checkPaths } from "../src/office/paths.ts";
 import {
   parseFactoryYml,
+  pathRulesOf,
   readStoredFactoryYml,
   syncFactoryYml,
+  workerDockerfilePath,
 } from "../src/office/product.ts";
 import { FakeGitHub, VALID_FACTORY_YML } from "./fake-github.ts";
 
@@ -46,6 +48,101 @@ issues: { allowed_authors: [] }
         paths: { protected: [], forbidden: [] },
         limits: { max_parallel: 1, max_attempts: 3 },
       },
+    });
+  });
+
+  describe("worker.dockerfile", () => {
+    const withWorker = (worker: string) =>
+      `${VALID_FACTORY_YML}worker:\n${worker}\n`;
+    const parsed = (text: string) => {
+      const result = parseFactoryYml(text);
+      if (!result.ok) throw new Error(result.errors);
+      return result.value;
+    };
+
+    it("書いていなければ、Dockerfile の場所はなく、規則も paths のまま", () => {
+      const value = parsed(VALID_FACTORY_YML);
+      expect(value.worker).toBeUndefined();
+      expect(workerDockerfilePath(value)).toBeNull();
+      expect(pathRulesOf(value)).toEqual(value.paths);
+      // worker だけを書いて、dockerfile を書かない場合も同じ。
+      expect(workerDockerfilePath(parsed(withWorker("  {}")))).toBeNull();
+    });
+
+    it.each([
+      "worker.Dockerfile",
+      ".factory/worker.Dockerfile",
+      "tools/ci_image/Dockerfile-worker.v2",
+    ])("リポジトリの中の相対パス %s を読める", (path) => {
+      const value = parsed(withWorker(`  dockerfile: ${path}`));
+      expect(workerDockerfilePath(value)).toBe(path);
+    });
+
+    it.each([
+      ["", "空です"],
+      ["/etc/worker.Dockerfile", "相対パスで書いてください"],
+      ["../worker.Dockerfile", ". と .. は使えません"],
+      [".factory/../../worker.Dockerfile", ". と .. は使えません"],
+      ["./worker.Dockerfile", ". と .. は使えません"],
+      [".factory//worker.Dockerfile", "区切りが続いているか、末尾にあります"],
+      [".factory/", "区切りが続いているか、末尾にあります"],
+      [".factory/*.Dockerfile", "使えるのは、英数字と . _ - / だけです"],
+      [".factory/worker?.Dockerfile", "使えるのは、英数字と . _ - / だけです"],
+      [".factory\\worker.Dockerfile", "使えるのは、英数字と . _ - / だけです"],
+      ["my worker.Dockerfile", "使えるのは、英数字と . _ - / だけです"],
+      [`${"a".repeat(256)}`, "長すぎます"],
+    ])(
+      "リポジトリの外に出るパスや、読めない書き方 %j は失敗する",
+      (path, reason) => {
+        const result = parseFactoryYml(
+          withWorker(`  dockerfile: ${JSON.stringify(path)}`),
+        );
+        expect(result.ok).toBe(false);
+        if (!result.ok) {
+          expect(result.errors).toContain("worker.dockerfile:");
+          expect(result.errors).toContain(reason);
+        }
+      },
+    );
+
+    it("文字列でない値と、知らない項目は失敗する", () => {
+      expect(parseFactoryYml(withWorker("  dockerfile: [a]")).ok).toBe(false);
+      expect(parseFactoryYml(withWorker("  image: other")).ok).toBe(false);
+    });
+
+    it("Dockerfile のパスは、paths.protected に書いていなくても、保護対象になる", () => {
+      const value = parsed(
+        withWorker("  dockerfile: .factory/worker.Dockerfile"),
+      );
+      const rules = pathRulesOf(value);
+      expect(rules).toEqual({
+        forbidden: ["generated/**"],
+        protected: ["docs/**", ".factory/worker.Dockerfile"],
+      });
+      expect(
+        checkPaths(
+          [".factory/worker.Dockerfile", ".factory/other", "src/a.ts"],
+          rules,
+        ),
+      ).toEqual({
+        forbidden: [],
+        protected: [
+          {
+            path: ".factory/worker.Dockerfile",
+            pattern: ".factory/worker.Dockerfile",
+          },
+        ],
+      });
+    });
+
+    it("すでに paths.protected に書いてあれば、重ねて足さない", () => {
+      const value = parsed(
+        withWorker("  dockerfile: docs/worker.Dockerfile").replace(
+          "- docs/**",
+          "- docs/worker.Dockerfile",
+        ),
+      );
+      expect(pathRulesOf(value).protected).toEqual(["docs/worker.Dockerfile"]);
     });
   });
 
