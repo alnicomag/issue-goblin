@@ -125,23 +125,45 @@ done
 
    確かめるのは起動のときだけです。後からイメージを作った場合、再起動は要りません(次のステップから使われます)。
 
-製品に固有のツール(検査コマンドが使うもの)が要る場合は、基本のイメージを土台にした別のイメージを作り、`config/factory.config.yml` の `worker_image` で指定します。
+製品に固有のツール(検査コマンドが使うもの)が要る場合は、製品リポジトリに Dockerfile を置き、製品の `factory.yml` にその場所を書きます。どのツールが要るかは、検査コマンドと同じく製品の知識だからです。ファクトリーが、基本のイメージを土台にして、そこからワーカーのイメージをビルドします。手でビルドする必要はありません。
 
-イメージの定義(Dockerfile)は、製品リポジトリに置きます。どのツールが要るかは、検査コマンドと同じく製品の知識だからです。置き方は次のとおりです。
+```yaml
+# 製品リポジトリの factory.yml
+worker:
+  dockerfile: .factory/worker.Dockerfile
+```
 
-- 場所は、製品リポジトリの `.factory/worker.Dockerfile` とします。
-- 基本のイメージの名前は、ビルド引数で受け取ります(`ARG FACTORY_BASE_IMAGE` と `FROM ${FACTORY_BASE_IMAGE}`)。ファクトリーの手元の名前を、製品には書きません。
+```dockerfile
+# 製品リポジトリの .factory/worker.Dockerfile
+ARG FACTORY_BASE_IMAGE
+FROM ${FACTORY_BASE_IMAGE}
+USER root
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends <ツール> \
+  && rm -rf /var/lib/apt/lists/*
+USER node
+```
+
+Dockerfile の書き方には、決まりがあります。
+
+- 基本のイメージの名前は、ビルド引数で受け取ります(`ARG FACTORY_BASE_IMAGE` と `FROM ${FACTORY_BASE_IMAGE}`)。ファクトリーの手元の名前を、製品には書きません。`FROM` に、ほかのイメージは書けません。
 - 最後に、基本のイメージと同じユーザー(`USER node`)に戻します。
-- 製品の `factory.yml` の `paths.protected` に、`.factory/**` を入れます。ワーカーの環境を決めるファイルを、ワーカーが承認なしに変えられないようにするためです。
+- ビルドに渡るのは、Dockerfile 1枚だけです。製品のほかのファイルは渡らないので、`COPY` で入れることはできません(前の段からの `COPY --from=<段の名前>` は使えます)。`ADD` は使えません。
+- ビルドの通信は、ワーカーと同じプロキシを通ります。通るのは、443番へのHTTPSだけです。基本のイメージの apt は、取得元をHTTPSにしてあるので、`apt-get` はそのまま使えます。
+- 旧ビルダーでビルドするので、`RUN --mount` とヒアドキュメントは使えません。
+- 場所(`worker.dockerfile`)に使えるのは、英数字と `.`、`_`、`-`、`/` だけです。
 
-ビルドは、ファクトリーのホストで、製品の既定ブランチの内容から行います。作業用のブランチの内容からは作りません。
+ファクトリーの側の動きは、次のとおりです(決めた理由は `docs/design.md` の「製品のイメージのビルド」)。
+
+- **使うのは、既定ブランチの Dockerfile だけです。** 作業用のブランチでワーカーが書き換えても、その実行のイメージは変わりません。Dockerfile のパスは、`paths.protected` に書いていなくても、変更に人間の承認が要るパスとして扱います。
+- **ビルドは、起動係が、必要なときに行います。** Dockerfile か基本のイメージが変わると、次の実行の前にビルドし直します。変わらなければ、ビルドしません。古いイメージは、ビルドし直したときに消します。
+- **ビルドに失敗した製品には、着手しません。** 理由は、状況表示(`pnpm run status`)と、ログ(`preflight.failed`)に出ます。
 
 ```bash
-git clone --depth 1 https://github.com/owner/name.git /tmp/owner-name
-docker build -f /tmp/owner-name/.factory/worker.Dockerfile \
-  --build-arg FACTORY_BASE_IMAGE=factory-worker \
-  -t owner-name-worker /tmp/owner-name/.factory
+docker image ls --filter label=factory.repo=owner/name   # ビルドされた、製品のイメージ
 ```
+
+`factory.yml` に `worker.dockerfile` を書かない製品は、設定(`config/factory.config.yml`)の `worker_image` のイメージで、そのまま動きます。手でビルドしたイメージを使いたい場合は、製品ごとに `worker_image` を書けます。`worker.dockerfile` と両方を書いた場合は、`worker_image` のイメージが、ビルドの土台になります。
 
 ```yaml
 worker_image: factory-worker          # 既定のイメージ
@@ -215,6 +237,7 @@ scripts/check-isolation.sh
 | 起動係 | 事務局がDockerソケットを持たない。不正な依頼を拒否する。時間の上限を過ぎた実行を止める。コンテナを残さない |
 | 事務局のgit | 事務局のコンテナにgitがあり、作業場所の準備(prepare)と後片付け(cleanup)が通る。起動係とプロキシのコンテナにはgitがない |
 | 検査コマンド | verify が、製品のコマンドを作業場所で順に実行し、合否、終了コード、所要時間を記録する。コンテナに事務局の環境変数とClaudeのトークンが渡らない。時間切れのコマンドが止まり、不合格になる。ログでトークンが伏せられる |
+| 製品のイメージのビルド | `worker.dockerfile` を書いた製品の Dockerfile を実際にビルドし、ワーカーと verify がそのイメージで動く。ビルドの環境(`RUN` の中)に、GitHubのトークン、Claudeのトークン、DB、ソケット、作業場所がない。ビルドから、インスタンスメタデータ、ホスト、ほかのコンテナに、直接にもプロキシ経由でも届かない。変わらなければビルドし直さない。作業用のブランチの Dockerfile は使われない。`ADD` やほかのイメージを使う Dockerfile は断る。プロキシを通して apt を使える。古いイメージが残らない |
 | コミットの作者 | 設定の検証を通る作者の例(`scripts/commit-author-examples.ts`)それぞれについて、ワーカーのイメージのgitで作ったコミットの作者とコミッターが、設定の値と完全に一致する。一致しなければ、設定の値とコミットに書かれた値を出す |
 
 環境を残して調べたいときは、`CHECK_KEEP=1 scripts/check-isolation.sh` で実行します。
@@ -248,7 +271,7 @@ pnpm run status
 
 - 対象のリポジトリに、「製品のリポジトリに用意するラベル」のとおりにラベルを作ります。`state:ready` は人間が手で付けるので、先に作っておかないと選べません。
 - 対象のリポジトリに `factory.yml` を置き、小さなイシューを1件用意します。起票者は `issues.allowed_authors` に入れます。
-- 製品の検査コマンドに要るツールが、ワーカーのイメージに入っていることを確かめます。基本のイメージにあるのは、Node、git、Claude Code だけです。足りなければ、「ワーカーの実行環境」のとおりに別のイメージを作り、`worker_image` で指定します。
+- 製品の検査コマンドに要るツールが、ワーカーのイメージに入っていることを確かめます。基本のイメージにあるのは、Node、git、Claude Code だけです。足りなければ、「ワーカーの実行環境」のとおりに、製品リポジトリに Dockerfile を置き、`factory.yml` の `worker.dockerfile` に場所を書きます。
 
   ```bash
   docker run --rm --entrypoint sh <イメージ> -c '<ツール> --version'
