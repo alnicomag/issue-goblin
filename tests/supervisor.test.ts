@@ -606,6 +606,37 @@ describe("実行の管理", () => {
       );
     });
 
+    it("dry_run の間、行うはずだったことが変わったら、もう一度ログに出す。変わらない間は出さない", async () => {
+      touch("docs/guide.md");
+      h.putIssue(1);
+      await tick();
+      await supervisor.stop(1000);
+      const before = h.fake.writes.length;
+      const calls = h.worker.calls.length;
+      const heldActions = () =>
+        logged("run.held").map((line) => ({
+          run: line.fields.run,
+          action: line.fields.action,
+        }));
+
+      h.dryRun = true;
+      supervisor = h.newSupervisor();
+      for (let i = 0; i < 3; i += 1) await tick();
+      expect(heldActions()).toEqual([{ run: 1, action: "hold" }]);
+
+      // 人間が needs-info にして、承認のラベルを付けた。同じ実行で、行うはずのことが変わる。
+      h.putIssue(1, { labels: ["state:needs-info", "agent:approved"] });
+      for (let i = 0; i < 3; i += 1) await tick();
+      expect(heldActions()).toEqual([
+        { run: 1, action: "hold" },
+        { run: 1, action: "approve" },
+      ]);
+      expect(h.fake.writes).toHaveLength(before);
+      expect(h.worker.calls).toHaveLength(calls);
+      expect(h.state(1)).toBe("needs-info");
+      expect(runs()).toMatchObject([{ status: "held" }]);
+    });
+
     describe("人間の承認(agent:approved)", () => {
       const approvals = () =>
         h.db
@@ -1525,6 +1556,111 @@ describe("実行の管理", () => {
       expect(logged("run.held").map((line) => line.fields.action)).toContain(
         "ask",
       );
+    });
+
+    describe("進めなかった実行のログ", () => {
+      const held = () =>
+        logged("run.held").map((line) => ({
+          repo: line.fields.repo,
+          issue: line.fields.issue,
+          run: line.fields.run,
+          reason: line.fields.reason,
+          action: line.fields.action,
+        }));
+      const ask = {
+        repo: REPO,
+        issue: 1,
+        run: 1,
+        reason: "dry_run",
+        action: "ask",
+      };
+      const advance = {
+        repo: REPO,
+        issue: 2,
+        run: 2,
+        reason: "dry_run",
+        action: "advance",
+      };
+
+      /** dry_run でない間に、質問で終わった実行(1)と、途中の実行(2)を作ってから、dry_run にする。 */
+      const leaveRuns = async () => {
+        setFactoryYml(["max_parallel: 1", "max_parallel: 2"]);
+        const hold = gate();
+        h.worker.scripts.set("plan", async (call) => {
+          if (call.issue === 1) {
+            return { status: "question", summary: "どちらですか" };
+          }
+          await hold.wait();
+          return undefined;
+        });
+        h.putIssue(1);
+        h.putIssue(2);
+        await tickNoWait();
+        await hold.entered;
+        await expect.poll(() => runs()[0]?.status).toBe("question");
+        const stopping = supervisor.stop(1000);
+        hold.open();
+        await stopping;
+        expect(held()).toEqual([]);
+        h.dryRun = true;
+        supervisor = h.newSupervisor();
+      };
+
+      it("進めなかった実行が、行うはずだったこととあわせて出る。対象が変わらない間は、出し続けない", async () => {
+        await leaveRuns();
+        const before = h.fake.writes.length;
+        const calls = h.worker.calls.length;
+        await tick();
+        expect(held()).toEqual([ask, advance]);
+        for (let i = 0; i < 3; i += 1) await tick();
+        expect(held()).toEqual([ask, advance]);
+        expect(h.fake.writes).toHaveLength(before);
+        expect(h.worker.calls).toHaveLength(calls);
+        expect(h.state(1)).toBe("in-progress");
+        expect(runs().map((run) => run.status)).toEqual([
+          "question",
+          "running",
+        ]);
+      });
+
+      it("同期できなかったリポジトリの分は、次に同期できたときに出し直さない", async () => {
+        await leaveRuns();
+        await tick();
+        // 同期に失敗した回は、そのリポジトリを渡さずに呼ばれる。
+        await supervisor.tick([]);
+        await tick();
+        expect(held()).toEqual([ask, advance]);
+      });
+
+      it("対象から外れた後で、もう一度対象になったら、もう一度出す", async () => {
+        await leaveRuns();
+        await tick();
+        h.putIssue(1, { labels: ["state:triage"] });
+        await tick();
+        expect(held()).toEqual([ask, advance]);
+        h.putIssue(1, { labels: ["state:in-progress"] });
+        await tick();
+        await tick();
+        expect(held()).toEqual([ask, advance, ask]);
+      });
+
+      it("起動し直すと、1回だけ出し直す", async () => {
+        await leaveRuns();
+        await tick();
+        await supervisor.stop(1000);
+        supervisor = h.newSupervisor();
+        await tick();
+        await tick();
+        expect(held()).toEqual([ask, advance, ask, advance]);
+      });
+
+      it("dry_run でないときは、出ない", async () => {
+        h.putIssue(1);
+        await tick();
+        await tick();
+        expect(h.labels(1)).toEqual(["state:in-review"]);
+        expect(held()).toEqual([]);
+      });
     });
 
     it("dry_run の間も、人間が状態を変えた実行は取り消す", async () => {
