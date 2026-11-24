@@ -18,6 +18,10 @@ import { type Db, migrate, openDb } from "../src/office/db.ts";
 import { createGit } from "../src/office/git.ts";
 import { createRepoLocks, type RepoLocks } from "../src/office/locks.ts";
 import type { LogFields, Logger } from "../src/office/log.ts";
+import {
+  createPreflightGate,
+  type PreflightGate,
+} from "../src/office/preflight.ts";
 import type { RunnerDeps } from "../src/office/runner.ts";
 import { createSupervisor, type Supervisor } from "../src/office/supervisor.ts";
 import { syncAll } from "../src/office/sync.ts";
@@ -36,6 +40,20 @@ export const AUTHOR = {
 };
 /** `VALID_FACTORY_YML` の `allowed_authors` にいる起票者。 */
 export const ALLOWED_AUTHOR = "example-login";
+
+/** 偽の設定での、ワーカーのイメージの名前。 */
+export const WORKER_IMAGE = "example-worker-image";
+
+/**
+ * 着手前の確認を、いつも通っているものとして扱う関門。
+ * 確認そのものを見ないテスト(着手の後の動きを見るもの)で使う。
+ */
+export const PASSED_PREFLIGHT: PreflightGate = {
+  statusOf: () => "passed",
+  ensure: () => {},
+  stop: () => Promise.resolve(),
+  idle: () => Promise.resolve(),
+};
 
 export interface LogLine {
   level: string;
@@ -143,7 +161,9 @@ export class FakeLauncher implements WorkerLauncher {
       exit_code: 0,
       timed_out: false,
       stdout:
-        request.argv[0] === "git" ? `## ${branchFor(request.issue)}\0` : "",
+        request.argv[0] === "git" && request.issue !== undefined
+          ? `## ${branchFor(request.issue)}\0`
+          : "",
       stderr: "",
       truncated: false,
       ...next,
@@ -192,7 +212,18 @@ export interface Harness {
   labels(number: number): readonly string[];
   /** DBにある、イシューの状態。 */
   state(number: number): string;
-  newSupervisor(options?: { dailyRunLimit?: number }): Supervisor;
+  /**
+   * `preflight` を true にすると、着手前の確認を本物の関門で行う(起動係は偽のまま)。
+   * 省略すると、いつも通っているものとして扱う。
+   */
+  newSupervisor(options?: {
+    dailyRunLimit?: number;
+    preflight?: boolean;
+  }): Supervisor;
+  /** 本物の、着手前の確認の関門を作る。 */
+  newPreflightGate(options?: {
+    imageFor?: (repo: string) => string;
+  }): PreflightGate;
   cleanup(): void;
 }
 
@@ -314,6 +345,25 @@ export function createHarness(
         locks,
         dailyRunLimit: supervisorOptions.dailyRunLimit ?? 20,
         dryRun: self.dryRun,
+        preflight:
+          supervisorOptions.preflight === true
+            ? self.newPreflightGate()
+            : PASSED_PREFLIGHT,
+      });
+    },
+    newPreflightGate(gateOptions = {}) {
+      return createPreflightGate({
+        db,
+        clock,
+        logger,
+        git: self.runner.git,
+        launcher,
+        dirs,
+        logsDir: self.runner.logsDir,
+        sourceFor: self.runner.sourceFor,
+        commitAuthor: AUTHOR,
+        imageFor: gateOptions.imageFor ?? (() => WORKER_IMAGE),
+        timeoutSec: 600,
       });
     },
     cleanup() {

@@ -31,6 +31,7 @@ function repo(overrides: Partial<IntakeRepo> = {}): IntakeRepo {
     allowedAuthors: ["example-login"],
     maxParallel: 1,
     active: 0,
+    preflight: "passed",
     ...overrides,
   };
 }
@@ -150,6 +151,32 @@ describe("着手の条件", () => {
   it("条件を読めないリポジトリのイシューには着手しない", () => {
     expect(intakeBlocker(issue(1), undefined, NOW)).toBe("unknown_repo");
   });
+
+  it("着手前の確認が済んでいない製品、通らなかった製品のイシューには着手しない", () => {
+    expect(intakeBlocker(issue(1), repo({ preflight: "pending" }), NOW)).toBe(
+      "preflight_pending",
+    );
+    expect(intakeBlocker(issue(1), repo({ preflight: "failed" }), NOW)).toBe(
+      "preflight_failed",
+    );
+  });
+
+  it("着手前の確認は、最後に見る(ほかの理由があれば、そちらを返す)", () => {
+    const pending = repo({ preflight: "pending" });
+    expect(intakeBlocker(issue(1, { agentSkip: true }), pending, NOW)).toBe(
+      "agent_skip",
+    );
+    expect(intakeBlocker(issue(1, { author: "other" }), pending, NOW)).toBe(
+      "author_not_allowed",
+    );
+    expect(
+      intakeBlocker(
+        issue(1, { retryAt: "2099-01-01T00:00:00.000Z" }),
+        pending,
+        NOW,
+      ),
+    ).toBe("waiting_retry");
+  });
 });
 
 describe("着手するイシューの決定", () => {
@@ -222,6 +249,29 @@ describe("着手するイシューの決定", () => {
     );
     expect(numbers(result.starts)).toEqual([`${REPO}#1`, `${OTHER}#1`]);
     expect(result.skipped.map((s) => s.reason)).toEqual(["daily_limit"]);
+  });
+
+  it("着手前の確認が通っていない製品のイシューは、1日の上限を使わず、ほかの製品の着手を止めない", () => {
+    const result = plan(
+      [
+        issue(1, { priority: "p0" }),
+        issue(2, { repo: OTHER }),
+        issue(3, { repo: "owner/third", priority: "p0" }),
+      ],
+      {
+        repos: [
+          repo({ preflight: "failed" }),
+          repo({ repo: OTHER }),
+          repo({ repo: "owner/third", preflight: "pending" }),
+        ],
+        dailyLimit: 1,
+      },
+    );
+    expect(numbers(result.starts)).toEqual([`${OTHER}#2`]);
+    expect(result.skipped.map((s) => [s.issue.repo, s.reason])).toEqual([
+      [REPO, "preflight_failed"],
+      ["owner/third", "preflight_pending"],
+    ]);
   });
 
   it("同時実行の枠は、リポジトリごとに数える", () => {

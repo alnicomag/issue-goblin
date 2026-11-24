@@ -2,11 +2,12 @@
  * ステップのログの書き出し。ワーカーの呼び出しと、検査コマンドの実行で共用する。
  *
  * 置き場所は `<logs_dir>/<owner>/<name>/issue-<番号>/<開始時刻>-<ステップ>.log`。
+ * 着手前の確認のログは、`<logs_dir>/<owner>/<name>/preflight/<開始時刻>-preflight.log`。
  * ワーカーが書き換えられないように、作業場所の外(事務局のデータの置き場所)に置く。
  */
 import fs from "node:fs";
 import path from "node:path";
-import { issueDirFor } from "../launcher/container.ts";
+import { issueDirFor, preflightDirFor } from "../launcher/container.ts";
 
 /**
  * Claudeのトークンに見える文字列を伏せる。
@@ -25,6 +26,11 @@ export function stepLogDir(
   issue: number,
 ): string {
   return path.join(logsDir, issueDirFor(repo, issue));
+}
+
+/** 着手前の確認のログを置くディレクトリ。`repo` は設定にある書き方で渡す。 */
+export function preflightLogDir(logsDir: string, repo: string): string {
+  return path.join(logsDir, preflightDirFor(repo));
 }
 
 /** ログのファイル名に使う時刻(例: 20260102T030405.678Z)。 */

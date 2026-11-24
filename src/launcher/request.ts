@@ -14,6 +14,10 @@ export const MAX_ARGV_BYTES = 128 * 1024;
 /** 1回の実行の、時間の上限の最大値。 */
 export const MAX_TIMEOUT_SEC = 4 * 60 * 60;
 
+/** 依頼で選べる、作業場所の種類。 */
+export const WORKSPACE_KINDS = ["issue", "preflight"] as const;
+export type WorkspaceKind = (typeof WORKSPACE_KINDS)[number];
+
 const Argument = z
   .string()
   .refine((value) => !value.includes("\0"), "NUL文字は使えません");
@@ -24,8 +28,18 @@ export const RunRequestSchema = z
     repo: z
       .string()
       .regex(/^[\w.-]+\/[\w.-]+$/, "owner/name の形式ではありません"),
-    /** イシュー番号。作業場所は、リポジトリとこの番号から起動係が決める。 */
-    issue: z.number().int().min(1).max(2_147_483_647),
+    /**
+     * マウントする作業場所の種類。パスは、起動係が自分で組み立てる。
+     *
+     * - `issue`: イシューの作業場所(リポジトリと `issue` から決まる)。
+     * - `preflight`: 着手前の確認のための、製品ごとの作業場所(リポジトリだけから決まる)。
+     */
+    workspace: z.enum(WORKSPACE_KINDS).default("issue"),
+    /**
+     * イシュー番号。イシューの作業場所は、リポジトリとこの番号から起動係が決める。
+     * `workspace` が `issue` のときは必ず指定し、`preflight` のときは指定しない。
+     */
+    issue: z.number().int().min(1).max(2_147_483_647).optional(),
     /** ワーカーのコンテナの中で実行するコマンド。 */
     argv: z.array(Argument).min(1).max(256),
     /** コマンドの標準入力に渡す文字列。 */
@@ -36,6 +50,20 @@ export const RunRequestSchema = z
     timeout_sec: z.number().int().min(1).max(MAX_TIMEOUT_SEC),
   })
   .superRefine((request, ctx) => {
+    if (request.workspace === "issue" && request.issue === undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["issue"],
+        message: "イシューの作業場所には、イシュー番号が要ります",
+      });
+    }
+    if (request.workspace === "preflight" && request.issue !== undefined) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["issue"],
+        message: "着手前の確認の作業場所には、イシュー番号を指定できません",
+      });
+    }
     if (Buffer.byteLength(request.stdin) > MAX_STDIN_BYTES) {
       ctx.addIssue({
         code: "custom",

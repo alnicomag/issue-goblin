@@ -2,7 +2,8 @@
  * ワーカーのコンテナの形。`docker run` の引数を組み立てる純粋関数。
  *
  * ワーカーから見えるものは、ここで決まる。依頼から来る値が入るのは、
- * 作業場所のパス(リポジトリとイシュー番号から組み立てる)と、実行するコマンドだけである。
+ * 作業場所のパス(リポジトリと、イシュー番号または決まった名前から組み立てる)と、
+ * 実行するコマンドだけである。
  */
 import path from "node:path";
 import type { RunRequest } from "./request.ts";
@@ -46,12 +47,10 @@ export interface ContainerSettings {
 }
 
 /**
- * 作業場所の、ボリュームの中での相対パス(`<owner>/<name>/issue-<番号>`)。
- *
- * `repo` は設定にある書き方をそのまま渡すこと。`.` や `..` を含むなど、
- * 置き場所の外に出るパスになる場合は失敗する。
+ * リポジトリの、ボリュームの中での相対パス(`<owner>/<name>`)の部分を確かめて返す。
+ * `.` や `..` を含むなど、置き場所の外に出る名前なら失敗する。
  */
-export function issueDirFor(repo: string, issue: number): string {
+function repoSegments(repo: string): [string, string] {
   const segments = repo.split("/");
   const [owner, name] = segments;
   if (
@@ -65,10 +64,13 @@ export function issueDirFor(repo: string, issue: number): string {
   ) {
     throw new Error(`リポジトリ名から作業場所を決められません: ${repo}`);
   }
-  if (!Number.isSafeInteger(issue) || issue < 1) {
-    throw new Error(`イシュー番号が不正です: ${issue}`);
-  }
-  const relative = path.posix.join(owner, name, `issue-${issue}`);
+  return [owner, name];
+}
+
+/** リポジトリの下の、決まった名前の場所の相対パス。組み立てた結果でも確かめる。 */
+function dirUnderRepo(repo: string, leaf: string): string {
+  const [owner, name] = repoSegments(repo);
+  const relative = path.posix.join(owner, name, leaf);
   // 念のため、組み立てた結果でも確かめる。
   if (
     path.posix.isAbsolute(relative) ||
@@ -78,6 +80,43 @@ export function issueDirFor(repo: string, issue: number): string {
     throw new Error(`作業場所が置き場所の外に出ます: ${relative}`);
   }
   return relative;
+}
+
+/**
+ * 作業場所の、ボリュームの中での相対パス(`<owner>/<name>/issue-<番号>`)。
+ *
+ * `repo` は設定にある書き方をそのまま渡すこと。`.` や `..` を含むなど、
+ * 置き場所の外に出るパスになる場合は失敗する。
+ */
+export function issueDirFor(repo: string, issue: number): string {
+  repoSegments(repo);
+  if (!Number.isSafeInteger(issue) || issue < 1) {
+    throw new Error(`イシュー番号が不正です: ${issue}`);
+  }
+  return dirUnderRepo(repo, `issue-${issue}`);
+}
+
+/** 着手前の確認の作業場所の名前。イシューの作業場所(`issue-<番号>`)とは重ならない。 */
+export const PREFLIGHT_DIR = "preflight";
+
+/**
+ * 着手前の確認の作業場所の、ボリュームの中での相対パス(`<owner>/<name>/preflight`)。
+ * 製品ごとに1つで、イシューの作業場所とは別の場所になる。`repo` の扱いは `issueDirFor` と同じ。
+ */
+export function preflightDirFor(repo: string): string {
+  return dirUnderRepo(repo, PREFLIGHT_DIR);
+}
+
+/** 依頼の作業場所の、ボリュームの中での相対パス。 */
+export function workspaceDirFor(
+  repo: string,
+  request: Pick<RunRequest, "workspace" | "issue">,
+): string {
+  if (request.workspace === "preflight") return preflightDirFor(repo);
+  if (request.issue === undefined) {
+    throw new Error("イシューの作業場所には、イシュー番号が要ります");
+  }
+  return issueDirFor(repo, request.issue);
 }
 
 /**
@@ -109,7 +148,7 @@ export function buildRunArgs(input: {
   settings: ContainerSettings;
 }): string[] {
   const { request, repo, image, containerName, settings } = input;
-  const subpath = issueDirFor(repo, request.issue);
+  const subpath = workspaceDirFor(repo, request);
   if (image.startsWith("-") || image === "") {
     throw new Error(`イメージ名が不正です: ${image}`);
   }

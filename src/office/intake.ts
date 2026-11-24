@@ -30,6 +30,11 @@ export interface IntakeRepo {
   readonly maxParallel: number;
   /** いま進んでいる実行の数。 */
   readonly active: number;
+  /**
+   * 着手前の確認(`preflight.ts`)の状態。
+   * `passed` は通っている、`pending` は確認が済んでいない、`failed` は通らなかった。
+   */
+  readonly preflight: "passed" | "pending" | "failed";
 }
 
 /**
@@ -40,6 +45,8 @@ export interface IntakeRepo {
  * - `agent_skip`: `agent:skip` が付いている。
  * - `author_not_allowed`: 起票者が `allowed_authors` にいない(分からない場合を含む)。
  * - `waiting_retry`: 失敗の後の待機時間が過ぎていない。
+ * - `preflight_pending`: 着手前の確認が済んでいない(確かめている途中を含む)。
+ * - `preflight_failed`: 着手前の確認で、`commands.setup` がワーカーのイメージで通らなかった。
  * - `no_slot`: 同時実行の枠がない。
  * - `daily_limit`: 1日の実行数の上限に達した。
  */
@@ -49,6 +56,8 @@ export type SkipReason =
   | "agent_skip"
   | "author_not_allowed"
   | "waiting_retry"
+  | "preflight_pending"
+  | "preflight_failed"
   | "no_slot"
   | "daily_limit";
 
@@ -85,8 +94,11 @@ export function orderForIntake<T extends IntakeIssue>(
 }
 
 /**
- * イシューそのものの条件で、着手できない理由を返す。着手できるなら null。
+ * イシューそのものと、その製品の条件で、着手できない理由を返す。着手できるなら null。
  * 枠(同時実行、1日の上限)は、ここでは見ない。
+ *
+ * 着手前の確認は、最後に見る。ほかの理由で着手しないイシューしかない製品では、
+ * 確認が要るとはみなさない。
  */
 export function intakeBlocker(
   issue: IntakeIssue,
@@ -107,6 +119,8 @@ export function intakeBlocker(
   if (issue.retryAt !== null && Date.parse(issue.retryAt) > now.getTime()) {
     return "waiting_retry";
   }
+  if (repo.preflight === "pending") return "preflight_pending";
+  if (repo.preflight === "failed") return "preflight_failed";
   return null;
 }
 
@@ -124,6 +138,7 @@ export interface IntakePlan<T extends IntakeIssue> {
  * 着手するイシューを決める。
  *
  * 着手の順に見ていき、条件を満たし、枠に収まるものを拾う。
+ * 着手前の確認が通っていない製品のイシューは、枠を数える前に外すので、ほかの製品の枠を取らない。
  * 枠は、リポジトリごとの同時実行数(`maxParallel`)と、全体の1日の実行数(`dailyLimit`)の2つ。
  */
 export function planIntake<T extends IntakeIssue>(input: {

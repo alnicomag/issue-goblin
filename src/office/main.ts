@@ -19,12 +19,15 @@ import {
   loadConfig,
   resolveToken,
   stepLimitsFrom,
+  workerImageFor,
 } from "./config.ts";
 import { migrate, openDb } from "./db.ts";
 import { createGit } from "./git.ts";
 import { createOctokitApi, type GitHubApi } from "./github.ts";
 import { createRepoLocks } from "./locks.ts";
 import { createLogger, errorFields, type Logger } from "./log.ts";
+import { createPreflightGate } from "./preflight.ts";
+import type { RunnerDeps } from "./runner.ts";
 import { createSupervisor, type Supervisor } from "./supervisor.ts";
 import { type SyncDeps, syncAll } from "./sync.ts";
 import { githubSourceUrl } from "./workspace.ts";
@@ -167,36 +170,52 @@ async function main(): Promise<boolean> {
     const launcher = createLauncherClient({
       socketPath: process.env.LAUNCHER_SOCKET ?? DEFAULT_LAUNCHER_SOCKET,
     });
+    const limits = stepLimitsFrom(config);
+    const runner: RunnerDeps = {
+      db,
+      clock,
+      logger,
+      git: createGit(),
+      dirs: { reposDir: config.repos_dir, workDir: config.work_dir },
+      logsDir: config.logs_dir,
+      commitAuthor: config.commit_author,
+      retryWaitMinutes: config.retry_wait_minutes,
+      limits,
+      launcher,
+      createWorker: (bound) =>
+        createClaudeWorker({
+          launcher: bound,
+          promptsDir: DEFAULT_PROMPTS_DIR,
+          logsDir: config.logs_dir,
+          clock,
+        }),
+      // トークンは、gitの実行時にだけ渡す。
+      sourceFor: (repo) => ({
+        url: githubSourceUrl(repo),
+        token: tokenFor(repo),
+      }),
+      writeFor: (repo) => ({
+        api: apiFor(repo),
+        dryRun: config.dry_run,
+        logger,
+      }),
+    };
     const supervisor = createSupervisor({
-      runner: {
+      runner,
+      // 着手の前に、製品の commands.setup が、その製品のワーカーのイメージで通ることを確かめる。
+      preflight: createPreflightGate({
         db,
         clock,
         logger,
-        git: createGit(),
-        dirs: { reposDir: config.repos_dir, workDir: config.work_dir },
-        logsDir: config.logs_dir,
-        commitAuthor: config.commit_author,
-        retryWaitMinutes: config.retry_wait_minutes,
-        limits: stepLimitsFrom(config),
+        git: runner.git,
         launcher,
-        createWorker: (bound) =>
-          createClaudeWorker({
-            launcher: bound,
-            promptsDir: DEFAULT_PROMPTS_DIR,
-            logsDir: config.logs_dir,
-            clock,
-          }),
-        // トークンは、gitの実行時にだけ渡す。
-        sourceFor: (repo) => ({
-          url: githubSourceUrl(repo),
-          token: tokenFor(repo),
-        }),
-        writeFor: (repo) => ({
-          api: apiFor(repo),
-          dryRun: config.dry_run,
-          logger,
-        }),
-      },
+        dirs: runner.dirs,
+        logsDir: config.logs_dir,
+        sourceFor: runner.sourceFor,
+        commitAuthor: config.commit_author,
+        imageFor: (repo) => workerImageFor(config, repo),
+        timeoutSec: limits.verifyTimeoutSec,
+      }),
       locks,
       dailyRunLimit: config.daily_run_limit,
       dryRun: config.dry_run,

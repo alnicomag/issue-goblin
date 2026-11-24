@@ -156,7 +156,8 @@ export function createLauncher(deps: LauncherDeps): Launcher {
       // 引数、標準入力、出力は記録しない(製品のコードやイシューの文章が入りうる)。
       const fields = {
         repo: entry.repo,
-        issue: request.issue,
+        workspace: request.workspace,
+        issue: request.issue ?? null,
         container: containerName,
         claude_token: request.claude_token,
       };

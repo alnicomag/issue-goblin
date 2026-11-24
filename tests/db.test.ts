@@ -14,6 +14,7 @@ const EXPECTED_TABLES = [
   "decisions",
   "events",
   "issues",
+  "preflights",
   "reports",
   "repos",
   "runs",
@@ -68,9 +69,9 @@ describe("マイグレーション", () => {
   it("空のDBに適用できる", () => {
     const result = migrate(db, { clock });
 
-    expect(result.applied).toEqual([1, 2, 3, 4, 5]);
+    expect(result.applied).toEqual([1, 2, 3, 4, 5, 6]);
     expect(tableNames(db)).toEqual(EXPECTED_TABLES);
-    expect(currentVersion(db)).toBe(5);
+    expect(currentVersion(db)).toBe(6);
   });
 
   it("実行中の実行とステップの重複を防ぐ索引がある", () => {
@@ -128,6 +129,23 @@ describe("マイグレーション", () => {
     ]);
   });
 
+  it("着手前の確認の結果は、製品ごとに1行で、結果は passed か failed だけ", () => {
+    migrate(db, { clock });
+    const insert = db.prepare(
+      `INSERT INTO preflights (repo, status, image, factory_yml_sha, command, log_path, checked_at)
+       VALUES ('owner/name', ?, 'image', 'sha', 'example-setup', '/logs/a.log', '2026-01-01T00:00:00.000Z')`,
+    );
+    insert.run("passed");
+    expect(() => insert.run("failed")).toThrow(/UNIQUE/);
+    expect(
+      db
+        .prepare("SELECT exit_code, timed_out, output_tail FROM preflights")
+        .all(),
+    ).toEqual([{ exit_code: null, timed_out: 0, output_tail: "" }]);
+    db.prepare("DELETE FROM preflights").run();
+    expect(() => insert.run("unknown")).toThrow(/CHECK/);
+  });
+
   it("状態を持つテーブルはリポジトリの列を持つ", () => {
     migrate(db, { clock });
     for (const table of [
@@ -137,6 +155,7 @@ describe("マイグレーション", () => {
       "decisions",
       "runs",
       "approvals",
+      "preflights",
       "schedules",
       "reports",
     ]) {
@@ -157,7 +176,7 @@ describe("マイグレーション", () => {
 
     expect(second).toEqual({ applied: [], backupPath: null });
     expect(schemaDump(db)).toEqual(before);
-    expect(currentVersion(db)).toBe(5);
+    expect(currentVersion(db)).toBe(6);
     expect(backups()).toEqual(backupsBefore);
   });
 
