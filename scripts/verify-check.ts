@@ -17,7 +17,11 @@ import { type Db, migrate, openDb } from "../src/office/db.ts";
 import { createGit } from "../src/office/git.ts";
 import { FactoryYmlSchema } from "../src/office/product.ts";
 import { runVerify } from "../src/office/verify.ts";
-import { cleanupWorkspace, workspacePaths } from "../src/office/workspace.ts";
+import {
+  branchFor,
+  cleanupWorkspace,
+  workspacePaths,
+} from "../src/office/workspace.ts";
 
 /** 確認に使うイシュー番号。ほかの確認が使う番号と重ならないようにする。 */
 const ISSUE = 901;
@@ -91,11 +95,13 @@ async function main(): Promise<void> {
 
   // 確認用のcloneを作る。ワーカーが触る前なので、事務局の側でgitを実行してよい(prepare と同じ)。
   // verify は、コミットされていない内容が残っていると止まるので、使うファイルはコミットしておく。
+  // 作業用のブランチ以外が取り出されていても止まるので、ブランチは prepare と同じ名前にする。
+  const branch = branchFor(ISSUE);
   const git = createGit();
   cleanupWorkspace({ dirs, repo, issue: ISSUE });
   fs.mkdirSync(paths.repoDir, { recursive: true });
   fs.mkdirSync(paths.homeDir, { recursive: true });
-  await git.run(["init", "--quiet", "--initial-branch=check", "--", "."], {
+  await git.run(["init", "--quiet", `--initial-branch=${branch}`, "--", "."], {
     cwd: paths.repoDir,
   });
   fs.writeFileSync(`${paths.repoDir}/leak.txt`, `${FAKE_TOKEN}\n`);
@@ -239,6 +245,34 @@ async function main(): Promise<void> {
     );
     fs.rmSync(`${paths.repoDir}/untracked.txt`);
     fs.writeFileSync(`${paths.repoDir}/leak.txt`, `${FAKE_TOKEN}\n`);
+
+    console.log("\n# 作業用のブランチ以外が取り出されている場合");
+    // 取り出されているものだけを変える。gitを実行せずに、HEADを書き換える。
+    const headFile = `${paths.repoDir}/.git/HEAD`;
+    const originalHead = fs.readFileSync(headFile, "utf8");
+    const tip = fs
+      .readFileSync(`${paths.repoDir}/.git/refs/heads/${branch}`, "utf8")
+      .trim();
+    fs.writeFileSync(`${paths.repoDir}/.git/refs/heads/other`, `${tip}\n`);
+    for (const [name, head, checkedOut] of [
+      ["別のブランチ", "ref: refs/heads/other", "other"],
+      ["ブランチなしの取り出し", tip, "HEAD (no branch)"],
+    ] as const) {
+      fs.writeFileSync(headFile, `${head}\n`);
+      const wrong = await runVerify(deps, input);
+      logs.push(wrong.logPath);
+      report(
+        wrong.outcome === "rework" &&
+          wrong.commands.every((command) => command.status === "skipped") &&
+          !fs.existsSync(`${paths.repoDir}/ran-setup.txt`) &&
+          wrong.wrongBranch?.checkedOut === checkedOut &&
+          wrong.wrongBranch.expected === branch,
+        `${name}になっていると、コマンドを1つも実行せずに差し戻す`,
+        `${wrong.outcome} ${JSON.stringify(wrong.wrongBranch)} ${wrong.summary}`,
+      );
+    }
+    fs.writeFileSync(headFile, originalHead);
+    fs.rmSync(`${paths.repoDir}/.git/refs/heads/other`);
 
     console.log("\n# 時間切れになる場合");
     setCommands(db, repo, {

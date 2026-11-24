@@ -244,6 +244,10 @@ const VerifyOutputSchema = z.object({
   /** 作業場所に残っていた、コミットされていないパス。以前の記録にはない。 */
   uncommittedPaths: z.array(z.string()).optional(),
   uncommittedCount: z.number().optional(),
+  /** 作業用のブランチ以外が取り出されていた場合の記録。以前の記録にはない。 */
+  wrongBranch: z
+    .object({ checkedOut: z.string(), expected: z.string() })
+    .nullish(),
 });
 type VerifyOutput = z.infer<typeof VerifyOutputSchema>;
 
@@ -269,6 +273,15 @@ export function formatVerify(verify: VerifyOutput | null): string {
   for (const command of verify.commands) {
     const code = command.exitCode === null ? "なし" : String(command.exitCode);
     lines.push(`- ${command.name}: ${command.status}(終了コード: ${code})`);
+  }
+  if (verify.wrongBranch != null) {
+    lines.push(
+      "",
+      "### 取り出されているブランチ",
+      "",
+      `- 取り出されていたもの: ${verify.wrongBranch.checkedOut}`,
+      `- 戻すべきブランチ(作業用のブランチ): ${verify.wrongBranch.expected}`,
+    );
   }
   const paths = verify.uncommittedPaths ?? [];
   if (paths.length > 0) {
@@ -440,6 +453,7 @@ async function executeStep(
           commands: result.commands,
           uncommittedPaths: result.uncommittedPaths,
           uncommittedCount: result.uncommittedCount,
+          wrongBranch: result.wrongBranch,
         },
         logPath: result.logPath,
         interrupted: result.interrupted,

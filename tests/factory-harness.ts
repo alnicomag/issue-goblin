@@ -21,7 +21,11 @@ import type { LogFields, Logger } from "../src/office/log.ts";
 import type { RunnerDeps } from "../src/office/runner.ts";
 import { createSupervisor, type Supervisor } from "../src/office/supervisor.ts";
 import { syncAll } from "../src/office/sync.ts";
-import { type WorkspaceDirs, workspacePaths } from "../src/office/workspace.ts";
+import {
+  branchFor,
+  type WorkspaceDirs,
+  workspacePaths,
+} from "../src/office/workspace.ts";
 import { FakeGitHub, VALID_FACTORY_YML } from "./fake-github.ts";
 import { makeRepo, makeTempDir, unconfiguredGit } from "./git-fixtures.ts";
 
@@ -114,7 +118,10 @@ export class FakeWorker implements WorkerInvoker {
   }
 }
 
-/** 偽の起動係。検査コマンド(`sh -c` の中身)ごとに決めた結果を、順に返す。 */
+/**
+ * 偽の起動係。検査コマンド(`sh -c` の中身)ごとに決めた結果を、順に返す。
+ * 作業場所の状態の確認(`git status`)には、作業用のブランチが取り出されていて、きれいだと返す。
+ */
 export class FakeLauncher implements WorkerLauncher {
   readonly requests: RunRequestInput[] = [];
   private readonly answers = new Map<string, Partial<RunResult>[]>();
@@ -130,7 +137,8 @@ export class FakeLauncher implements WorkerLauncher {
     return Promise.resolve({
       exit_code: 0,
       timed_out: false,
-      stdout: "",
+      stdout:
+        request.argv[0] === "git" ? `## ${branchFor(request.issue)}\0` : "",
       stderr: "",
       truncated: false,
       ...next,

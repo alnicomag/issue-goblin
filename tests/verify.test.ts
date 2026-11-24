@@ -19,9 +19,10 @@ import type { Step } from "../src/office/runs.ts";
 import {
   buildVerifyArgv,
   interpretStatus,
+  isOnBranch,
   judgeVerify,
   MAX_UNCOMMITTED_PATHS,
-  parseStatusPaths,
+  parseStatus,
   runVerify,
   STATUS_ARGV,
   shouldRun,
@@ -34,6 +35,12 @@ import { commitFile, makeRepo, plainGit } from "./git-fixtures.ts";
 const REPO = "owner/name";
 const ISSUE = 7;
 const INPUT = { repo: REPO, issue: ISSUE, timeoutSec: 60 };
+const BRANCH = "agent/issue-7";
+
+/** 状態の確認の出力。作業用のブランチが取り出されていて、`entries` が残っている。 */
+function statusOf(...entries: string[]): string {
+  return [`## ${BRANCH}`, ...entries].map((entry) => `${entry}\0`).join("");
+}
 
 function ok(overrides: Partial<RunResult> = {}): RunResult {
   return {
@@ -48,12 +55,13 @@ function ok(overrides: Partial<RunResult> = {}): RunResult {
 
 /**
  * 依頼を記録し、コマンド(`sh -c` の中身)ごとに決めた結果を返す、偽の起動係。
- * 作業場所の状態の確認(`git status`)には、`status` を返す。既定は「きれい」。
+ * 作業場所の状態の確認(`git status`)には、`status` を返す。
+ * 既定は「作業用のブランチが取り出されていて、きれい」。
  */
 class FakeLauncher implements WorkerLauncher {
   readonly requests: RunRequestInput[] = [];
   readonly answers = new Map<string, RunResult | Error>();
-  status: RunResult | Error = ok();
+  status: RunResult | Error = ok({ stdout: statusOf() });
 
   run(request: RunRequestInput): Promise<RunResult> {
     this.requests.push(request);
@@ -303,7 +311,9 @@ describe("検査コマンドの実行(verify)", () => {
   });
 
   it("コミットされていないパスが残っていれば、コマンドを実行せずに差し戻す", async () => {
-    launcher.status = ok({ stdout: " M src/a.txt\0?? new file.txt\0" });
+    launcher.status = ok({
+      stdout: statusOf(" M src/a.txt", "?? new file.txt"),
+    });
     const result = await runVerify(deps, INPUT);
     expect(launcher.commands).toEqual([]);
     expect(result).toMatchObject({
@@ -327,8 +337,8 @@ describe("検査コマンドの実行(verify)", () => {
   it("残っているパスが多いときは、先頭だけを結果に載せ、件数を残す", async () => {
     const count = MAX_UNCOMMITTED_PATHS + 5;
     launcher.status = ok({
-      stdout: Array.from({ length: count }, (_, i) => `?? f${i}.txt\0`).join(
-        "",
+      stdout: statusOf(
+        ...Array.from({ length: count }, (_, i) => `?? f${i}.txt`),
       ),
     });
     const result = await runVerify(deps, INPUT);
@@ -337,10 +347,96 @@ describe("検査コマンドの実行(verify)", () => {
   });
 
   it("残っているパスにトークンに見える文字列があっても、結果には残らない", async () => {
-    launcher.status = ok({ stdout: "?? sk-ant-oat01-abcDEF_123.txt\0" });
+    launcher.status = ok({
+      stdout: statusOf("?? sk-ant-oat01-abcDEF_123.txt"),
+    });
     const result = await runVerify(deps, INPUT);
     expect(result.uncommittedPaths).toEqual(["sk-ant-***.txt"]);
     expect(fs.readFileSync(result.logPath, "utf8")).not.toMatch(/sk-ant-oat/);
+  });
+
+  it.each([
+    ["別のブランチ", "## other\0", "other"],
+    ["追跡先のある別のブランチ", "## other...origin/main [ahead 1]\0", "other"],
+    ["ブランチなしの取り出し", "## HEAD (no branch)\0", "HEAD (no branch)"],
+    [
+      "コミットのないブランチ",
+      "## No commits yet on other\0",
+      "No commits yet on other",
+    ],
+    [
+      "名前が作業用のブランチで始まる別のブランチ",
+      `## ${BRANCH}0\0`,
+      `${BRANCH}0`,
+    ],
+  ] as const)(
+    "%sが取り出されていれば、コマンドを実行せずに差し戻し、両方のブランチを結果に残す",
+    async (_name, stdout, checkedOut) => {
+      launcher.status = ok({ stdout });
+      const result = await runVerify(deps, INPUT);
+      expect(launcher.commands).toEqual([]);
+      expect(launcher.requests).toHaveLength(1);
+      expect(result).toMatchObject({
+        outcome: "rework",
+        passed: false,
+        failedCommands: [],
+        wrongBranch: { checkedOut, expected: BRANCH },
+        uncommittedPaths: [],
+        uncommittedCount: 0,
+      });
+      expect(result.summary).toContain(`「${checkedOut}」`);
+      expect(result.summary).toContain(`「${BRANCH}」`);
+      expect(result.commands.map((command) => command.status)).toEqual([
+        "skipped",
+        "skipped",
+        "skipped",
+      ]);
+      const log = fs.readFileSync(result.logPath, "utf8");
+      expect(log).toContain('"outcome": "rework"');
+      expect(log).toContain('"status": "wrong_branch"');
+      expect(log).toContain(`"checked_out": "${checkedOut}"`);
+    },
+  );
+
+  it("別のブランチに、コミットされていないパスも残っていれば、同じ差し戻しで両方を渡す", async () => {
+    launcher.status = ok({ stdout: "## other\0?? left.txt\0" });
+    const result = await runVerify(deps, INPUT);
+    expect(result).toMatchObject({
+      outcome: "rework",
+      wrongBranch: { checkedOut: "other", expected: BRANCH },
+      uncommittedPaths: ["left.txt"],
+      uncommittedCount: 1,
+    });
+    expect(result.summary).toContain("1件");
+  });
+
+  it("作業用のブランチが取り出されていれば、追跡先の表示があっても、合格になる", async () => {
+    launcher.status = ok({
+      stdout: `## ${BRANCH}...origin/main [ahead 2]\0`,
+    });
+    const result = await runVerify(deps, INPUT);
+    expect(result).toMatchObject({ outcome: "done", wrongBranch: null });
+    expect(launcher.commands).toHaveLength(3);
+  });
+
+  it("取り出されているブランチの名前にトークンに見える文字列があっても、結果には残らない", async () => {
+    launcher.status = ok({ stdout: "## sk-ant-oat01-abcDEF_123\0" });
+    const result = await runVerify(deps, INPUT);
+    expect(result.wrongBranch?.checkedOut).toBe("sk-ant-***");
+    expect(JSON.stringify(result)).not.toMatch(/sk-ant-oat/);
+    expect(fs.readFileSync(result.logPath, "utf8")).not.toMatch(/sk-ant-oat/);
+  });
+
+  it("状態の確認の出力にブランチの項目がなければ、差し戻しではなく失敗になり、コマンドは実行しない", async () => {
+    launcher.status = ok({ stdout: "" });
+    const result = await runVerify(deps, INPUT);
+    expect(result).toMatchObject({
+      outcome: "failed",
+      passed: false,
+      wrongBranch: null,
+    });
+    expect(result.summary).toContain("作業場所の状態を確かめられません");
+    expect(launcher.commands).toEqual([]);
   });
 
   it.each([
@@ -634,6 +730,7 @@ describe("コミットされていない内容が残った作業場所での ver
         commands: result.commands,
         uncommittedPaths: result.uncommittedPaths,
         uncommittedCount: result.uncommittedCount,
+        wrongBranch: result.wrongBranch,
       }),
     } as Step;
     return feedbackFor([step]);
@@ -646,6 +743,7 @@ describe("コミットされていない内容が残った作業場所での ver
       passed: true,
       uncommittedPaths: [],
       uncommittedCount: 0,
+      wrongBranch: null,
     });
     expect(launcher.commands).toEqual([
       "example-setup",
@@ -698,6 +796,55 @@ describe("コミットされていない内容が残った作業場所での ver
     expect(launcher.commands).toHaveLength(3);
   });
 
+  it("別のブランチが取り出されていれば、そこでテストが通る内容でも、コマンドを1つも実行せずに差し戻す", async () => {
+    // 作業用のブランチには通らない内容、別のブランチには通る内容がある(検査コマンドは成功を返す)。
+    commitFile(repoDir, "broken.txt", "does not pass\n");
+    plainGit(repoDir, "checkout", "--quiet", "-b", "other");
+    commitFile(repoDir, "broken.txt", "passes\n");
+    const result = await runVerify(deps, INPUT);
+    expect(result).toMatchObject({
+      outcome: "rework",
+      passed: false,
+      wrongBranch: { checkedOut: "other", expected: BRANCH },
+      uncommittedPaths: [],
+    });
+    expect(launcher.commands).toEqual([]);
+    expect(launcher.requests).toHaveLength(1);
+    const feedback = feedbackOf(result);
+    expect(feedback).toContain("- 取り出されていたもの: other");
+    expect(feedback).toContain(
+      `- 戻すべきブランチ(作業用のブランチ): ${BRANCH}`,
+    );
+  });
+
+  it("ブランチなしの取り出しになっていれば、コマンドを1つも実行せずに差し戻す", async () => {
+    plainGit(repoDir, "checkout", "--quiet", "--detach");
+    commitFile(repoDir, "detached.txt", "passes\n");
+    const result = await runVerify(deps, INPUT);
+    expect(result).toMatchObject({
+      outcome: "rework",
+      passed: false,
+      wrongBranch: { checkedOut: "HEAD (no branch)", expected: BRANCH },
+    });
+    expect(launcher.commands).toEqual([]);
+    expect(launcher.requests).toHaveLength(1);
+    const feedback = feedbackOf(result);
+    expect(feedback).toContain("- 取り出されていたもの: HEAD (no branch)");
+    expect(feedback).toContain(
+      `- 戻すべきブランチ(作業用のブランチ): ${BRANCH}`,
+    );
+  });
+
+  it("作業用のブランチに戻せば、合格になる", async () => {
+    plainGit(repoDir, "checkout", "--quiet", "-b", "other");
+    expect((await runVerify(deps, INPUT)).outcome).toBe("rework");
+    plainGit(repoDir, "checkout", "--quiet", BRANCH);
+    expect(await runVerify(deps, INPUT)).toMatchObject({
+      outcome: "done",
+      wrongBranch: null,
+    });
+  });
+
   it("状態の確認は、作業場所を書き換えない", async () => {
     fs.writeFileSync(path.join(repoDir, "left.txt"), "left\n");
     const before = plainGit(repoDir, "rev-parse", "HEAD");
@@ -710,31 +857,79 @@ describe("コミットされていない内容が残った作業場所での ver
 });
 
 describe("作業場所の状態の読み取り(純粋関数)", () => {
-  it("NUL区切りの出力から、パスを取り出す", () => {
-    expect(parseStatusPaths("")).toEqual([]);
-    expect(parseStatusPaths(" M a.txt\0?? dir/b c.txt\0D  gone.txt\0")).toEqual(
-      ["a.txt", "dir/b c.txt", "gone.txt"],
-    );
+  it("NUL区切りの出力を、ブランチの項目とパスに分ける", () => {
+    expect(parseStatus("")).toEqual({ head: null, paths: [] });
+    expect(parseStatus("## main\0")).toEqual({ head: "main", paths: [] });
+    expect(
+      parseStatus("## main\0 M a.txt\0?? dir/b c.txt\0D  gone.txt\0"),
+    ).toEqual({ head: "main", paths: ["a.txt", "dir/b c.txt", "gone.txt"] });
+  });
+
+  it("ブランチの項目がなければ、項目はすべてパスとして残す", () => {
+    expect(parseStatus(" M a.txt\0")).toEqual({ head: null, paths: ["a.txt"] });
+  });
+
+  it("`## ` で始まる名前の追跡していないファイルを、ブランチの項目と取り違えない", () => {
+    expect(parseStatus("## main\0?? ## other\0")).toEqual({
+      head: "main",
+      paths: ["## other"],
+    });
   });
 
   it("想定外の形の項目は、捨てずにそのまま残す", () => {
-    expect(parseStatusPaths("xy\0")).toEqual(["xy"]);
+    expect(parseStatus("## main\0xy\0").paths).toEqual(["xy"]);
   });
 
-  it("出力がなければきれい、あれば残っている、実行できなければ確認できない", () => {
-    expect(interpretStatus(ok())).toEqual({ status: "clean" });
-    expect(interpretStatus(ok({ stdout: "?? a\0" }))).toEqual({
+  it("ブランチ名そのものか、追跡先の表示が続く場合だけを、そのブランチの取り出しとみなす", () => {
+    expect(isOnBranch("agent/issue-7", "agent/issue-7")).toBe(true);
+    expect(isOnBranch("agent/issue-7...origin/main", "agent/issue-7")).toBe(
+      true,
+    );
+    expect(
+      isOnBranch("agent/issue-7...origin/main [ahead 1]", "agent/issue-7"),
+    ).toBe(true);
+    expect(isOnBranch("agent/issue-70", "agent/issue-7")).toBe(false);
+    expect(isOnBranch("agent/issue-7/x", "agent/issue-7")).toBe(false);
+    expect(isOnBranch("other...agent/issue-7", "agent/issue-7")).toBe(false);
+    expect(isOnBranch("HEAD (no branch)", "agent/issue-7")).toBe(false);
+    expect(isOnBranch("No commits yet on agent/issue-7", "agent/issue-7")).toBe(
+      false,
+    );
+  });
+
+  it("作業用のブランチで出力がなければきれい、あれば残っている、実行できなければ確認できない", () => {
+    const status = (run: RunResult) => interpretStatus(run, BRANCH);
+    expect(status(ok({ stdout: statusOf() }))).toEqual({ status: "clean" });
+    expect(status(ok({ stdout: statusOf("?? a") }))).toEqual({
       status: "dirty",
       paths: ["a"],
     });
-    expect(interpretStatus(ok({ exit_code: 128, stderr: "boom" }))).toEqual({
+    expect(status(ok({ exit_code: 128, stderr: "boom" }))).toEqual({
       status: "unknown",
       reason: expect.stringContaining("boom"),
     });
-    expect(interpretStatus(ok({ exit_code: 0, timed_out: true })).status).toBe(
+    expect(status(ok({ exit_code: 0, timed_out: true })).status).toBe(
       "unknown",
     );
-    expect(interpretStatus(ok({ exit_code: null })).status).toBe("unknown");
+    expect(status(ok({ exit_code: null })).status).toBe("unknown");
+  });
+
+  it("作業用のブランチ以外なら、取り出されていたものと、戻すべきブランチを返す", () => {
+    expect(
+      interpretStatus(ok({ stdout: "## other...origin/x\0?? a\0" }), BRANCH),
+    ).toEqual({
+      status: "wrong_branch",
+      checkedOut: "other",
+      expected: BRANCH,
+      paths: ["a"],
+    });
+  });
+
+  it("ブランチの項目がなければ、きれいとはみなさず、確認できないとする", () => {
+    expect(interpretStatus(ok(), BRANCH).status).toBe("unknown");
+    expect(interpretStatus(ok({ stdout: "?? a\0" }), BRANCH).status).toBe(
+      "unknown",
+    );
   });
 });
 

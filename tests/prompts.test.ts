@@ -221,6 +221,27 @@ describe("ワーカーの指示書(plan、implement、review)", () => {
       expect(limits).toContain("ラベルを変えず");
     });
 
+    it("ブランチを作らず、切り替えないと書いてあり、作業用のブランチに戻すことだけは implement に許している", () => {
+      const limits = section(text, "触れてはいけない範囲");
+      expect(limits).toContain("ブランチを作らず、切り替えず");
+      const allowed = "「戻すべきブランチ」に切り替えます";
+      if (name !== "implement") {
+        expect(text).not.toContain(allowed);
+        return;
+      }
+      // 例外は、verify の指摘がある場合に、指摘にあるブランチへ戻すことだけである。
+      expect(limits).toContain("作業用のブランチ以外が取り出されている");
+      expect(limits).toContain(allowed);
+      expect(limits).toContain("このブランチへだけ");
+      const back = section(text, "作業用のブランチに戻す");
+      // 見出しの名前は、verify の指摘(`formatVerify`)に載るものと同じである。
+      expect(back).toContain("「取り出されているブランチ」の見出し");
+      expect(back).toContain("「戻すべきブランチ」");
+      expect(back).toContain("`git rev-parse HEAD`");
+      expect(back).toContain("既存のコミットは書き換えない");
+      expect(back).toContain("ブランチを新しく作ること");
+    });
+
     it("paths.forbidden と paths.protected の扱いが書いてある", () => {
       const limits = section(text, "触れてはいけない範囲");
       expect(limits).toContain("`paths.forbidden`");
