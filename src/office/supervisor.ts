@@ -13,6 +13,7 @@
  * 人間が状態を変えた実行の取り消しと、試行回数のリセットは、DBだけの操作なので行う。
  * 作業場所の後片付けは、実行の cleanup と同じく、`dry_run` の間は行わない。
  * 着手するはずだったイシューは、ログに出す(`intake.held`)。同じイシューを、毎回は出さない。
+ * 進めなかった実行も、行うはずだったこととあわせてログに出す(`run.held`)。同じ内容を、毎回は出さない。
  */
 import { z } from "zod";
 import { isoNow } from "./clock.ts";
@@ -222,6 +223,11 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
    * 同じ行を、ポーリングのたびに出さないために持つ。起動し直すと空になり、1回だけ出し直す。
    */
   const heldAnnounced = new Map<string, Set<number>>();
+  /**
+   * `dry_run` のために進めなかったことを、すでにログに出した実行と、そのとき行うはずだったこと
+   * (リポジトリごとの、実行の番号から `action` への対応)。`heldAnnounced` と同じ目的で持つ。
+   */
+  const runHeldAnnounced = new Map<string, Map<number, SettleAction>>();
 
   const transitionDeps = (repo: string): TransitionDeps => ({
     db,
@@ -419,10 +425,17 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     }
   }
 
+  /**
+   * 決まったことを行う。
+   *
+   * `dry_run` のために行わなかった場合は、`heldNow` に、実行と、行うはずだったことを入れる。
+   * ログに出すのは、前に出したときと、行うはずだったことが違う場合だけである。
+   */
   async function perform(
     action: SettleAction,
     run: Run,
     issueState: string,
+    heldNow: Map<number, SettleAction>,
   ): Promise<void> {
     if (action === "none") return;
     if (action === "cancel") {
@@ -431,11 +444,14 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     }
     // ここから下は、GitHubに書くか、ワーカーを動かす。dry_run の間は行わない。
     if (dryRun) {
-      logger.info("run.held", {
-        ...fieldsOf(run),
-        reason: "dry_run",
-        action,
-      });
+      if (runHeldAnnounced.get(run.repo)?.get(run.id) !== action) {
+        logger.info("run.held", {
+          ...fieldsOf(run),
+          reason: "dry_run",
+          action,
+        });
+      }
+      heldNow.set(run.id, action);
       return;
     }
     switch (action) {
@@ -487,7 +503,14 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     };
   }
 
-  /** リポジトリの中で、実行に関わるイシューを1件ずつ見て、行うべきことを行う。 */
+  /**
+   * リポジトリの中で、実行に関わるイシューを1件ずつ見て、行うべきことを行う。
+   *
+   * 見終えたら、`dry_run` のために進めなかった実行の覚えを、今回の分に置き換える。
+   * 今回進めなかった実行に入らなかったもの(取り消した、対象から外れた)は、出したことを忘れる
+   * (もう一度対象になったら、もう一度出す)。呼ばれなかったリポジトリ(同期できなかったもの)の
+   * 分は、そのまま覚えておく。
+   */
   async function reconcile(repo: string): Promise<void> {
     const rows = db
       .prepare(
@@ -508,7 +531,11 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
          ORDER BY number`,
       )
       .all(repo) as { number: number; state: string; approved: number }[];
-    if (rows.length === 0) return;
+    const heldNow = new Map<number, SettleAction>();
+    if (rows.length === 0) {
+      runHeldAnnounced.set(repo, heldNow);
+      return;
+    }
 
     const resumable = new Map(
       findResumableRuns(db)
@@ -538,7 +565,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
             ? readStoredFactoryYml(db, repo).limits.max_attempts
             : 1,
         });
-        await perform(action, run, row.state);
+        await perform(action, run, row.state, heldNow);
       } catch (error) {
         logger.error("run.settle_failed", {
           repo,
@@ -547,6 +574,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         });
       }
     }
+    runHeldAnnounced.set(repo, heldNow);
   }
 
   /**
