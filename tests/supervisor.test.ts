@@ -3,6 +3,11 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { FACTORY_MARKER } from "../src/office/github.ts";
 import {
+  type ProtectedDiff,
+  summarizeDiff,
+  unavailableDiff,
+} from "../src/office/held-diff.ts";
+import {
   findResumableRuns,
   listSteps,
   nextAttempt,
@@ -10,6 +15,7 @@ import {
   startRun,
 } from "../src/office/runs.ts";
 import {
+  GITHUB_COMMENT_LIMIT,
   heldComment,
   heldMarker,
   questionComment,
@@ -370,6 +376,95 @@ describe("実行の管理", () => {
         return { status: "done", summary: "touched a guarded path" };
       });
     };
+
+    it("needs_approval で止まると、コメントに書いたコミットの、保護対象のパスの差分がコメントに載る", async () => {
+      let head = "";
+      h.worker.scripts.set("implement", (call) => {
+        h.worker.commitPath(call.repo, call.issue, "src/open.txt", "open\n");
+        h.worker.commitPath(call.repo, call.issue, "docs/guide.md", "old\n");
+        head = h.worker.commitPath(
+          call.repo,
+          call.issue,
+          "docs/guide.md",
+          "new guide\n",
+        );
+        return { status: "done", summary: "touched a guarded path" };
+      });
+      h.putIssue(1);
+      await tick();
+      await tick();
+      const body = factoryComments(1)[0]?.body ?? "";
+      expect(body).toContain(`- コミット: \`${head}\``);
+      expect(body).toContain("```diff");
+      expect(body).toContain("+++ b/docs/guide.md");
+      expect(body).toContain("+new guide");
+      // 途中のコミットの内容でも、保護対象でないパスの内容でもない。
+      expect(body).not.toContain("+old");
+      expect(body).not.toContain("src/open.txt");
+      expect(body.length).toBeLessThanOrEqual(GITHUB_COMMENT_LIMIT);
+      // push もPRの作成もしていない。
+      expect(h.fake.pullRequests).toEqual([]);
+      expect(plainGit(h.source, "branch", "--list", "agent/*")).toBe("");
+    });
+
+    it("差分の中に目印やメンションを書かれても、コメントは1件で、やり直しても重複しない", async () => {
+      h.worker.scripts.set("implement", (call) => {
+        h.worker.commitPath(
+          call.repo,
+          call.issue,
+          "docs/guide.md",
+          [
+            heldMarker(1),
+            heldMarker(2),
+            "<!-- factory -->",
+            "```",
+            "@someone sk-ant-example-value",
+            "",
+          ].join("\n"),
+        );
+        return { status: "done", summary: "touched a guarded path" };
+      });
+      h.putIssue(1);
+      await tick();
+      await tick();
+      await tick();
+      const all = h.fake.comments.filter(
+        (comment) => comment.issueNumber === 1,
+      );
+      expect(all).toHaveLength(1);
+      const body = all[0]?.body ?? "";
+      // 目印は、事務局が書いた1つ(と、書き込みのときの目印)だけ。
+      expect(body.match(/<!--/g)).toHaveLength(2);
+      expect(body).not.toContain(heldMarker(2));
+      expect(body).toContain("````diff");
+      expect(body).not.toContain("example-value");
+      // メンションは、コードブロックの中にしかない。
+      const [before, rest = ""] = body.split("````diff");
+      const after = rest.split("\n````\n").slice(1).join("");
+      expect(`${before}${after}`).not.toContain("@someone");
+      expect(h.state(1)).toBe("needs-info");
+    });
+
+    it("差分が長いときは、切ったことと全体の大きさが書かれ、コメントはGitHubの上限に収まる", async () => {
+      const content = Array.from(
+        { length: 20_000 },
+        (_, index) => `line ${index}\n`,
+      ).join("");
+      h.worker.scripts.set("implement", (call) => {
+        h.worker.commitPath(call.repo, call.issue, "docs/long.md", content);
+        return { status: "done", summary: "touched a guarded path" };
+      });
+      h.putIssue(1);
+      await tick();
+      await tick();
+      const body = factoryComments(1)[0]?.body ?? "";
+      expect(body.length).toBeLessThanOrEqual(GITHUB_COMMENT_LIMIT);
+      expect(body).toContain("差分が長いので、途中で切りました");
+      expect(body).toMatch(/全体は \d{6,} 文字、200\d\d 行です/);
+      expect(body).toContain("+line 0");
+      expect(body).not.toContain("+line 19999");
+      expect(body.trimEnd().endsWith("<!-- factory -->")).toBe(true);
+    });
 
     it("needs_approval で止まると、理由が目印つきでコメントされ、needs-info になり、自動で再試行されない", async () => {
       touch("docs/guide.md");
@@ -903,6 +998,64 @@ describe("実行の管理", () => {
         expect(body).not.toContain(heldMarker(2));
         expect(body.match(/<!--/g)).toHaveLength(1);
         expect(body).toContain("- `b/'@someone' line`(パターン: `b/**`)");
+      });
+
+      describe("保護対象のパスの差分", () => {
+        const approval = (protectedDiff: ProtectedDiff | null | undefined) => ({
+          status: "needs_approval" as const,
+          headCommit: "abc",
+          forbidden: [],
+          protected: [hit("docs/guide.md", "docs/**")],
+          ...(protectedDiff === undefined ? {} : { protectedDiff }),
+        });
+
+        it("差分を、目印の前に、コードブロックで載せる", () => {
+          const body = heldComment(
+            1,
+            approval(summarizeDiff("--- a/docs/guide.md\n+added\n")),
+          );
+          expect(body).toContain("```diff\n--- a/docs/guide.md\n+added\n```");
+          expect(body).toContain("このコメントの下に載せています");
+          expect(body.trimEnd().endsWith(heldMarker(1))).toBe(true);
+        });
+
+        it("差分の記録がない(前の版の記録)なら、作業場所で確かめると書く", () => {
+          const body = heldComment(1, approval(undefined));
+          expect(body).not.toContain("```");
+          expect(body).toContain("内容は、ファクトリーの作業場所で確かめます");
+        });
+
+        it("差分を取得できなかった場合は、そのことを書く", () => {
+          const body = heldComment(1, approval(unavailableDiff()));
+          expect(body).toContain("差分を取得できませんでした");
+        });
+
+        it("forbidden では、差分を載せない", () => {
+          const body = heldComment(1, {
+            status: "forbidden",
+            headCommit: "abc",
+            forbidden: [hit("a", "a")],
+            protected: [],
+            protectedDiff: summarizeDiff("+added\n"),
+          });
+          expect(body).not.toContain("+added");
+        });
+
+        it("上限いっぱいの差分と、長いパスが50件あっても、GitHubの上限に収まる", () => {
+          const diff = summarizeDiff(
+            Array.from({ length: 9000 }, (_, i) => `+line ${i}`).join("\n"),
+          );
+          const body = heldComment(1, {
+            ...approval(diff),
+            protected: Array.from({ length: 60 }, (_, index) =>
+              hit(`docs/${"x".repeat(800)}/${index}.md`, "docs/**"),
+            ),
+          });
+          expect(body.length + 30).toBeLessThanOrEqual(GITHUB_COMMENT_LIMIT);
+          expect(body).toContain("途中で切りました");
+          expect(body).toContain(`全体は ${diff.totalChars} 文字、9000 行です`);
+          expect(body.trimEnd().endsWith(heldMarker(1))).toBe(true);
+        });
       });
 
       it("記録から内容を読めなければ、そのことを書く", () => {
