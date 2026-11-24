@@ -115,6 +115,16 @@ done
    docker compose build worker-image
    ```
 
+   イメージの名前は、設定(`config/factory.config.yml`)の `worker_image` で決めます。既定は `factory-worker` で、そのまま使うなら、ほかに書くものはありません。別の名前にするときは、設定の `worker_image` に書いたうえで、ビルドで同じ名前が付くように、`.env` の `WORKER_IMAGE` にも同じ値を書きます。
+
+   起動係は、起動のときに、設定にあるイメージ(全体と、製品ごと)が手元にあるかを確かめます。なければ、ログに `launcher.image_missing` を出します(`image` がないイメージ、`repos` がそれを使う製品)。起動係は止まらず、イメージのある製品の実行は続きます。
+
+   ```bash
+   docker compose logs launcher | grep launcher.image_missing
+   ```
+
+   確かめるのは起動のときだけです。後からイメージを作った場合、再起動は要りません(次のステップから使われます)。
+
 製品に固有のツール(検査コマンドが使うもの)が要る場合は、基本のイメージを土台にした別のイメージを作り、`config/factory.config.yml` の `worker_image` で指定します。
 
 イメージの定義(Dockerfile)は、製品リポジトリに置きます。どのツールが要るかは、検査コマンドと同じく製品の知識だからです。置き方は次のとおりです。
@@ -164,7 +174,7 @@ docker compose logs -f office
 - 停止は `docker compose stop` です。実行中のポーリングを終えてから終了します。ワーカーが実行中のステップは待たずに止め、次の起動でそのステップからやり直します(試行には数えません)。
 - ログは1行1件のJSONです。
 
-設定を変えたときは、`docker compose restart office` で読み直します。`worker_image` を変えたときは、起動係も読み直します(`docker compose restart office launcher`)。
+設定を変えたときは、`docker compose restart office` で読み直します。`worker_image` を変えたときは、起動係も読み直します(`docker compose restart office launcher`)。起動係は、読み直した設定のイメージが手元にあるかを確かめ、なければログに出します(`launcher.image_missing`)。
 
 ### GitHubへの書き込みを有効にする
 

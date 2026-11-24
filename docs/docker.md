@@ -45,7 +45,28 @@ docker compose config --format json | jq -r .name    # プロジェクト名を�
 - **使われるのは、製品ごとに1つです。** 設定(`config/factory.config.yml`)の製品の項目に `worker_image` があればそれを、なければ全体の `worker_image`(既定は `factory-worker`)を使います。
 - **どのステップも、同じイメージで動きます。** `plan`、`implement`、`review`(Claudeを呼ぶ)と、`verify`(検査コマンドを実行する)です。Claudeが実装の途中でテストを走らせるので、Claudeを呼ぶステップにも製品のツールが要ります。
 - **製品用は、ビルドした時点の基本を取り込みます。** 後から基本を作り直しても、製品用は自動では変わりません。基本を作り直したら、製品用も作り直します。
-- **起動係は、イメージを外から取ってきません**(`--pull=never`)。設定にある名前のイメージが手元になければ、ワーカーを立てられず、ステップが失敗します。
+- **起動係は、イメージを外から取ってきません**(`--pull=never`)。設定にある名前のイメージが手元になければ、ワーカーを立てられず、ステップが失敗します。起動係は、起動のときにこれを確かめて、ないイメージをログに出します(下の「ワーカーの基本の名前」)。
+
+### ワーカーの基本の名前
+
+名前は、設定(`config/factory.config.yml`)の `worker_image` で決めます。起動係がワーカーを立てるときに使うのは、この値です。
+
+- **既定(`factory-worker`)のまま使うなら、何も書きません。** `docker compose build worker-image` が、同じ名前でイメージを作ります。
+- **別の名前にするなら、設定の `worker_image` に書き、`.env` の `WORKER_IMAGE` にも同じ値を書きます。** `WORKER_IMAGE` は、ビルドで付ける名前を設定に合わせるためのものです。Composeは設定ファイルを読めないので、ここだけは手で揃えます。
+
+2つが食い違うと、ビルドしたイメージと、起動係が探すイメージの名前が合いません。起動係は、起動のときに、設定にあるイメージ(全体の `worker_image` のうち実際に使われるものと、製品ごとの `worker_image`)が手元にあるかを確かめ、なければ警告をログに出します。
+
+```bash
+docker compose logs launcher | grep launcher.image_missing
+```
+
+```json
+{"time":"2026-01-01T00:00:00.000Z","level":"warn","event":"launcher.image_missing","image":"factory-worker","repos":["owner/name"]}
+```
+
+- `image` が手元にないイメージ、`repos` がそれを使う製品です。
+- 起動係は止まりません。イメージのある製品の実行は続きます。イメージのない製品は、ワーカーを立てるステップで失敗します。
+- 確かめるのは、起動のときだけです。後からイメージを作れば、次のステップから使われます(再起動は要りません)。
 
 ### 製品用のイメージ
 
@@ -119,11 +140,11 @@ docker ps --filter label=factory.worker    # 実行中のワーカー
 | `.env.launcher` | Claudeのトークン | 起動係だけ |
 | `config/factory.config.yml` | 対象のリポジトリ、`worker_image` など | 事務局と起動係(読み取り専用でマウント) |
 
-設定を変えたら、`docker compose restart office launcher` で読み直します。`worker_image` は起動係が読むので、起動係の再起動も要ります。
+設定を変えたら、`docker compose restart office launcher` で読み直します。`worker_image` は起動係が読むので、起動係の再起動も要ります。`.env` には、ワーカーの基本を既定とは別の名前にするときだけ、`WORKER_IMAGE` も書きます(「ワーカーの基本の名前」)。
 
 ## イメージが古くないかを確かめる
 
-作り直しを忘れても、ファクトリーは古いイメージのまま動き続けます。次の方法で確かめます。目印を付けて確かめられるようにする仕組みは #50 が、設定にあるイメージが手元にないことを起動のときに知らせる仕組みは #51 が扱います。
+作り直しを忘れても、ファクトリーは古いイメージのまま動き続けます。次の方法で確かめます。目印を付けて確かめられるようにする仕組みは #50 が扱います。
 
 **常駐用が、手元のコードより古くないか。** イメージを作った時刻と、最後のコミットの時刻を比べます。イメージのほうが古ければ、作り直します。
 
@@ -149,7 +170,13 @@ docker run --rm --entrypoint claude factory-worker --version
 docker run --rm --entrypoint claude owner-name-worker --version
 ```
 
-**設定にあるイメージが、手元にあるか。**
+**設定にあるイメージが、手元にあるか。** 起動係が、起動のときに確かめています。何も出なければ、起動した時点ではすべてありました。
+
+```bash
+docker compose logs launcher | grep launcher.image_missing
+```
+
+起動の後に消したものは分からないので、いまの状態は次で見ます。
 
 ```bash
 grep -n worker_image config/factory.config.yml

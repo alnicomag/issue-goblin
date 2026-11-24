@@ -7,7 +7,9 @@ db_path: /data/factory.db
 repos_dir: /data/repos # 事務局専用のミラーの置き場所(絶対パス)。ワーカーには見せない
 work_dir: /work # イシューごとの作業場所の置き場所(絶対パス)。repos_dir とは別の場所にする
 logs_dir: /data/logs # ワーカーの呼び出しのログの置き場所(絶対パス)。work_dir と repos_dir の外に置く
-worker_image: factory-worker # ワーカーの既定のイメージ(docker compose build worker-image で作る)
+# ワーカーの既定のイメージ(docker compose build worker-image で作る)。
+# 別の名前にするときは、.env の WORKER_IMAGE にも同じ値を書く(ビルドで付く名前を揃えるため)。
+worker_image: factory-worker
 retry_wait_minutes: [5, 30, 120] # 失敗後の待機時間(分)。回数が足りなければ最後の値を使う
 daily_run_limit: 20 # UTCの1日に着手する実行の数の上限(再試行を含む、全リポジトリの合計)
 commit_author: # 省略可。ワーカーのコミットの作者。作業場所を作るときに、cloneのgit設定に書く
