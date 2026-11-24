@@ -6,6 +6,7 @@
 #   FACTORY_ENV_FILE     事務局の環境変数(既定: .env)
 #   LAUNCHER_ENV_FILE    起動係の環境変数(既定: .env.launcher)
 #   DOCKER_GID           ホストの docker グループの番号(起動係に必要)
+#   WORKER_IMAGE         ワーカーの基本イメージに付ける名前(既定: factory-worker)。設定の worker_image と揃える
 
 services:
   # 事務局。GitHubのトークンとDBを持つ。Dockerソケットは持たない。
@@ -92,6 +93,8 @@ services:
 
   # ワーカーの基本イメージ。常駐はさせず、ビルドだけに使う。
   #   docker compose build worker-image
+  # 名前は、設定の worker_image と同じにする。既定から変えるときだけ、WORKER_IMAGE に同じ値を書く。
+  # 食い違うと、起動係が起動のときにログに出す(launcher.image_missing)。
   worker-image:
     build:
       context: .
