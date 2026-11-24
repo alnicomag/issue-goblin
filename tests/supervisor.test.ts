@@ -15,6 +15,7 @@ import {
   startRun,
 } from "../src/office/runs.ts";
 import {
+  createSupervisor,
   GITHUB_COMMENT_LIMIT,
   heldComment,
   heldMarker,
@@ -2110,5 +2111,304 @@ describe("実行の管理", () => {
         expect(seen[0]).toBe(plainGit(h.source, "rev-parse", "HEAD"));
       },
     );
+  });
+
+  describe("着手前の確認", () => {
+    const OTHER = "owner/other";
+    /** トークンに見える文字列。 */
+    const SECRET = "sk-ant-dummy_value-123";
+    const preflightRequests = () =>
+      h.launcher.requests.filter(
+        (request) => request.workspace === "preflight",
+      );
+    const skippedReasons = () =>
+      logged("intake.skipped").at(-1)?.fields.reasons;
+
+    beforeEach(() => {
+      supervisor = h.newSupervisor({ preflight: true });
+    });
+
+    describe("通る製品", () => {
+      it("最初のポーリングで確かめ、次のポーリングで着手する。その後の動きは変わらない", async () => {
+        h.putIssue(1);
+        await tick();
+        // 確認だけが動き、着手していない。
+        expect(preflightRequests()).toMatchObject([
+          {
+            repo: REPO,
+            argv: ["sh", "-c", "example-setup"],
+            claude_token: false,
+          },
+        ]);
+        expect(preflightRequests()[0]).not.toHaveProperty("issue");
+        expect(runs()).toEqual([]);
+        expect(writes()).toEqual([]);
+        expect(h.worker.calls).toEqual([]);
+        expect(skippedReasons()).toEqual({ preflight_pending: 1 });
+        expect(logged("preflight.passed")).toHaveLength(1);
+
+        await tick();
+        expect(h.labels(1)).toEqual(["state:in-progress"]);
+        expect(h.fake.pullRequests).toHaveLength(1);
+        await tick();
+        expect(h.labels(1)).toEqual(["state:in-review"]);
+        expect(labelWrites()).toEqual([
+          "+state:in-progress",
+          "-state:ready",
+          "PR",
+          "+state:in-review",
+          "-state:in-progress",
+        ]);
+        expect(runs()).toMatchObject([
+          { issue_number: 1, attempt: 1, status: "running" },
+        ]);
+        expect(h.worker.calls.map((call) => call.prompt)).toEqual([
+          "plan",
+          "implement",
+          "review",
+        ]);
+        // 確認は1回だけで、verify の検査コマンドは、いままでどおり実行されている。
+        expect(h.launcher.commands).toEqual([
+          "example-setup",
+          "example-setup",
+          "example-test",
+          "example-lint",
+        ]);
+      });
+
+      it("ポーリングを繰り返しても、次のイシューに着手しても、確かめ直さない", async () => {
+        h.putIssue(1);
+        for (let i = 0; i < 4; i += 1) await tick();
+        h.putIssue(1, { labels: ["state:in-review"], open: false });
+        h.putIssue(2);
+        for (let i = 0; i < 4; i += 1) await tick();
+
+        expect(runs().map((run) => run.issue_number)).toContain(2);
+        expect(preflightRequests()).toHaveLength(1);
+      });
+
+      it("確認の後のイシューの作業場所は、既定ブランチの最新から作られ、確認の残りを含まない", async () => {
+        h.putIssue(1);
+        await tick();
+        const preflightDir = path.join(
+          h.dirs.workDir,
+          "owner",
+          "name",
+          "preflight",
+        );
+        expect(fs.existsSync(preflightDir)).toBe(false);
+
+        let head = "";
+        h.worker.scripts.set("plan", (call) => {
+          const { repoDir } = workspacePaths(h.dirs, call.repo, call.issue);
+          head = unconfiguredGit(repoDir, "rev-parse", "HEAD");
+          return undefined;
+        });
+        await tick();
+        expect(head).toBe(plainGit(h.source, "rev-parse", "HEAD"));
+      });
+
+      it("着手の条件を満たすイシューがなければ、確かめない", async () => {
+        h.putIssue(1, { labels: ["state:ready", "agent:skip"] });
+        h.putIssue(2, { labels: [] });
+        h.putIssue(3, { author: "someone-else" });
+        await tick();
+        await tick();
+        expect(h.launcher.requests).toEqual([]);
+        expect(logged("preflight.started")).toEqual([]);
+      });
+    });
+
+    describe("通らない製品", () => {
+      beforeEach(() => {
+        h.launcher.answer("example-setup", {
+          exit_code: 127,
+          stdout: "installing\n",
+          stderr: `sh: 1: example-tool: not found\ntoken ${SECRET}\n`,
+        });
+      });
+
+      it("着手しない。Claudeを呼ばず、GitHubにも書かず、イシューは ready のまま残る", async () => {
+        h.putIssue(1);
+        for (let i = 0; i < 5; i += 1) await tick();
+
+        expect(runs()).toEqual([]);
+        expect(h.worker.calls).toEqual([]);
+        expect(h.launcher.requests.some((r) => r.claude_token === true)).toBe(
+          false,
+        );
+        expect(writes()).toEqual([]);
+        expect(h.labels(1)).toEqual(["state:ready"]);
+        expect(h.state(1)).toBe("ready");
+        expect(skippedReasons()).toEqual({ preflight_failed: 1 });
+        // イシューの作業場所を作っておらず、確認用の場所も残していない。
+        expect(
+          fs.readdirSync(path.join(h.dirs.workDir, "owner", "name")),
+        ).toEqual([]);
+      });
+
+      it("同じ条件の間は、ポーリングのたびに確かめ直さない", async () => {
+        h.putIssue(1);
+        for (let i = 0; i < 6; i += 1) await tick();
+        expect(preflightRequests()).toHaveLength(1);
+        expect(logged("preflight.failed")).toHaveLength(1);
+      });
+
+      it("理由(コマンド、終了コード、出力の末尾)がログに出る。トークンに見える文字列は伏せられる", async () => {
+        h.putIssue(1);
+        await tick();
+
+        const [line] = logged("preflight.failed");
+        expect(line?.level).toBe("warn");
+        expect(line?.fields).toMatchObject({
+          repo: REPO,
+          command: "example-setup",
+          exit_code: 127,
+          timed_out: false,
+        });
+        expect(line?.fields.output_tail).toContain("example-tool: not found");
+        expect(line?.fields.output_tail).toContain("token sk-ant-***");
+        expect(JSON.stringify(h.logs)).not.toContain(SECRET);
+        expect(
+          JSON.stringify(h.db.prepare("SELECT * FROM preflights").all()),
+        ).not.toContain(SECRET);
+        const logFile = String(line?.fields.log_path);
+        expect(fs.readFileSync(logFile, "utf8")).not.toContain(SECRET);
+      });
+
+      it("決まった時間がたつと確かめ直し、通れば着手する", async () => {
+        h.putIssue(1);
+        await tick();
+        wait(30);
+        await tick();
+        expect(preflightRequests()).toHaveLength(1);
+
+        // イメージが、同じ名前のまま直された(偽の起動係の答えは、1回分だけ)。
+        wait(31);
+        await tick();
+        expect(preflightRequests()).toHaveLength(2);
+        expect(runs()).toEqual([]);
+        await tick();
+        expect(h.labels(1)).toEqual(["state:in-progress"]);
+        expect(runs()).toMatchObject([{ issue_number: 1, attempt: 1 }]);
+      });
+
+      it("factory.yml が変わると、すぐに確かめ直す", async () => {
+        h.putIssue(1);
+        await tick();
+        expect(runs()).toEqual([]);
+
+        setFactoryYml(["example-setup", "fixed-setup"]);
+        await tick();
+        expect(preflightRequests().map((r) => r.argv[2])).toEqual([
+          "example-setup",
+          "fixed-setup",
+        ]);
+        await tick();
+        expect(h.labels(1)).toEqual(["state:in-progress"]);
+      });
+
+      it("1つの製品で通らなくても、ほかの製品の着手を止めず、1日の上限も使わない", async () => {
+        supervisor = h.newSupervisor({ preflight: true, dailyRunLimit: 1 });
+        h.putIssue(1);
+        await h.sync();
+        // もう1つの製品。setup のコマンドが違い、こちらは通る。優先度は、こちらが低い。
+        h.db
+          .prepare(
+            `INSERT INTO repos (repo, factory_yml, factory_yml_sha)
+             SELECT ?, replace(factory_yml, 'example-setup', 'other-setup'), 'sha-other'
+             FROM repos WHERE repo = ?`,
+          )
+          .run(OTHER, REPO);
+        h.db
+          .prepare(
+            `INSERT INTO issues (repo, number, title, state, priority, author, github_updated_at, synced_at)
+             SELECT ?, 5, title, state, NULL, author, github_updated_at, synced_at
+             FROM issues WHERE repo = ? AND number = 1`,
+          )
+          .run(OTHER, REPO);
+        h.db
+          .prepare("UPDATE issues SET priority = 'p0' WHERE repo = ?")
+          .run(REPO);
+
+        const both = async () => {
+          await supervisor.tick([REPO, OTHER]);
+          await supervisor.idle();
+        };
+        await both();
+        expect(preflightRequests().map((r) => [r.repo, r.argv[2]])).toEqual([
+          [REPO, "example-setup"],
+          [OTHER, "other-setup"],
+        ]);
+        await both();
+        await both();
+
+        const started = h.db
+          .prepare("SELECT repo, issue_number FROM runs")
+          .all();
+        expect(started).toEqual([{ repo: OTHER, issue_number: 5 }]);
+        expect(skippedReasons()).toMatchObject({ preflight_failed: 1 });
+        expect(h.labels(1)).toEqual(["state:ready"]);
+      });
+    });
+
+    it("確認を実行できなかった場合は、着手せず、記録もせず、次のポーリングでやり直す", async () => {
+      // 取得元に届かない間は、確認を実行できない。
+      fs.renameSync(h.source, `${h.source}.moved`);
+      h.putIssue(1);
+      await tick();
+      await tick();
+      expect(logged("preflight.not_run")).toHaveLength(2);
+      expect(h.launcher.requests).toEqual([]);
+      expect(runs()).toEqual([]);
+      expect(writes()).toEqual([]);
+      expect(h.db.prepare("SELECT * FROM preflights").all()).toEqual([]);
+
+      fs.renameSync(`${h.source}.moved`, h.source);
+      await tick();
+      await tick();
+      expect(h.labels(1)).toEqual(["state:in-progress"]);
+    });
+
+    it("dry_run が true のとき、確認も着手もせず、GitHubへの書き込みが1回も行われない", async () => {
+      h.dryRun = true;
+      supervisor = h.newSupervisor({ preflight: true });
+      h.putIssue(1);
+      for (let i = 0; i < 3; i += 1) await tick();
+
+      expect(h.fake.writes).toEqual([]);
+      expect(h.launcher.requests).toEqual([]);
+      expect(runs()).toEqual([]);
+      expect(h.db.prepare("SELECT * FROM preflights").all()).toEqual([]);
+      // 見送った着手のログは、確認の結果を見ずに、いままでどおり出る。
+      expect(logged("intake.held")).toHaveLength(1);
+    });
+
+    it("止めると、確かめている途中の確認も止める", async () => {
+      const calls: string[] = [];
+      const stoppable = createSupervisor({
+        runner: h.runner,
+        locks: h.locks,
+        dailyRunLimit: 20,
+        dryRun: false,
+        preflight: {
+          statusOf: () => "pending",
+          ensure: (repo) => void calls.push(`ensure:${repo}`),
+          stop: () => {
+            calls.push("stop");
+            return Promise.resolve();
+          },
+          idle: () => {
+            calls.push("idle");
+            return Promise.resolve();
+          },
+        },
+      });
+      h.putIssue(1);
+      await tick(stoppable);
+      expect(await stoppable.stop(1000)).toBe(true);
+      expect(calls).toEqual([`ensure:${REPO}`, "idle", "stop"]);
+      expect(runs()).toEqual([]);
+    });
   });
 });

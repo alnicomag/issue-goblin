@@ -13,6 +13,7 @@
  * 人間が状態を変えた実行の取り消しと、試行回数のリセットは、DBだけの操作なので行う。
  * 作業場所の後片付けは、実行の cleanup と同じく、`dry_run` の間は行わない。
  * 着手するはずだったイシューは、ログに出す(`intake.held`)。同じイシューを、毎回は出さない。
+ * 着手前の確認(`preflight.ts`)も、`dry_run` の間は行わず、その結果も見ない。
  * 進めなかった実行も、行うはずだったこととあわせてログに出す(`run.held`)。同じ内容を、毎回は出さない。
  */
 import { z } from "zod";
@@ -28,6 +29,7 @@ import {
 import type { RepoLocks } from "./locks.ts";
 import { errorFields } from "./log.ts";
 import { inlineCode, pathHitLines } from "./path-list.ts";
+import type { PreflightGate } from "./preflight.ts";
 import { readStoredFactoryYml } from "./product.ts";
 import { advanceRun, type RunnerDeps } from "./runner.ts";
 import {
@@ -62,6 +64,8 @@ export interface SupervisorDeps {
   readonly dailyRunLimit: number;
   /** 設定の `dry_run`。 */
   readonly dryRun: boolean;
+  /** 着手前の確認(製品の `commands.setup` が、ワーカーのイメージで通るか)。 */
+  readonly preflight: PreflightGate;
 }
 
 export interface Supervisor {
@@ -76,7 +80,7 @@ export interface Supervisor {
    * `graceMs` の間に全部が止まれば true。
    */
   stop(graceMs: number): Promise<boolean>;
-  /** いま進めている実行が、すべて一区切りつくまで待つ。 */
+  /** いま進めている実行と、着手前の確認が、すべて一区切りつくまで待つ。 */
   idle(): Promise<void>;
   /** いま進めている実行の番号。 */
   activeRunIds(): number[];
@@ -670,10 +674,14 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
   /**
    * `ready` のイシューから、着手するものを決める。記録もGitHubも変えない。
    * `unswept` にあるイシュー(作業場所を片付けられなかったもの)は、候補にしない。
+   *
+   * `usePreflight` が true なら、着手前の確認が通っていない製品のイシューを、候補から外す。
+   * false なら、確認の結果を見ない(`dry_run` の間。確認そのものを行わないため)。
    */
   function planStarts(
     repos: readonly string[],
     unswept: ReadonlyMap<string, Set<number> | "all">,
+    usePreflight: boolean,
   ): IntakePlan<IntakeIssue> {
     const running = findResumableRuns(db);
     const intakeRepos: IntakeRepo[] = [];
@@ -688,6 +696,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
           active: running.filter(
             (entry) => entry.run.repo === repo && entry.step !== "cleanup",
           ).length,
+          preflight: usePreflight ? deps.preflight.statusOf(repo) : "passed",
         });
       } catch (error) {
         logger.warn("intake.repo_skipped", { repo, ...errorFields(error) });
@@ -747,12 +756,22 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
   /**
    * `ready` のイシューから、着手するものを決めて、着手する。
    * `unswept` にあるイシュー(作業場所を片付けられなかったもの)には、着手しない。
+   *
+   * 着手前の確認が済んでいないために外した製品は、確認を裏で始める(終わるのを待たない)。
+   * 確認が終われば、後のポーリングで着手する。通らなかった製品のイシューは、`ready` のまま残る。
    */
   async function intake(
     repos: readonly string[],
     unswept: ReadonlyMap<string, Set<number> | "all">,
   ): Promise<void> {
-    const plan = planStarts(repos, unswept);
+    const plan = planStarts(repos, unswept, true);
+    for (const repo of new Set(
+      plan.skipped
+        .filter(({ reason }) => reason === "preflight_pending")
+        .map(({ issue }) => issue.repo),
+    )) {
+      deps.preflight.ensure(repo);
+    }
     if (plan.skipped.length > 0) {
       const reasons: Record<string, number> = {};
       for (const { reason } of plan.skipped) {
@@ -792,7 +811,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
    * 今回渡されなかったリポジトリ(同期できなかったもの)の分は、そのまま覚えておく。
    */
   function announceHeldStarts(repos: readonly string[]): void {
-    const plan = planStarts(repos, new Map());
+    const plan = planStarts(repos, new Map(), false);
     for (const repo of repos) {
       const planned = new Set(
         plan.starts
@@ -843,20 +862,24 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       stopping = true;
       const pending = [...tasks.values()];
       for (const task of pending) task.controller.abort();
-      if (pending.length === 0) return true;
+      // 確かめている途中の、着手前の確認も止める。
+      const preflightStopped = deps.preflight.stop();
       let timer: NodeJS.Timeout | undefined;
       const timeout = new Promise<false>((resolve) => {
         timer = setTimeout(() => resolve(false), graceMs);
       });
-      const finished = Promise.all(pending.map((task) => task.done)).then(
-        () => true as const,
-      );
+      const finished = Promise.all([
+        preflightStopped,
+        ...pending.map((task) => task.done),
+      ]).then(() => true as const);
       const stopped = await Promise.race([finished, timeout]);
       clearTimeout(timer);
       return stopped;
     },
 
     async idle() {
+      // 着手前の確認は、実行を始めない(始めるのは `tick` だけ)ので、先に待てば足りる。
+      await deps.preflight.idle();
       while (tasks.size > 0) {
         await Promise.all([...tasks.values()].map((task) => task.done));
       }
