@@ -2336,7 +2336,12 @@ describe("実行の管理", () => {
           await supervisor.idle();
         };
         await both();
-        expect(preflightRequests().map((r) => [r.repo, r.argv[2]])).toEqual([
+        // 2つの製品の確認は並行に進むので、依頼が届く順は決まらない。
+        expect(
+          preflightRequests()
+            .map((r) => [r.repo, r.argv[2]])
+            .sort(),
+        ).toEqual([
           [REPO, "example-setup"],
           [OTHER, "other-setup"],
         ]);
