@@ -18,6 +18,7 @@ import {
   type FactoryConfig,
   loadConfig,
   resolveToken,
+  stepLimitsFrom,
 } from "./config.ts";
 import { migrate, openDb } from "./db.ts";
 import { createGit } from "./git.ts";
@@ -176,6 +177,7 @@ async function main(): Promise<boolean> {
         logsDir: config.logs_dir,
         commitAuthor: config.commit_author,
         retryWaitMinutes: config.retry_wait_minutes,
+        limits: stepLimitsFrom(config),
         launcher,
         createWorker: (bound) =>
           createClaudeWorker({
