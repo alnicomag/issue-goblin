@@ -2,11 +2,14 @@ import fs from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
 import { ACCEPTED_COMMIT_AUTHORS } from "../scripts/commit-author-examples.ts";
+import { MAX_TIMEOUT_SEC } from "../src/launcher/request.ts";
 import {
   parseConfig,
   resolveToken,
+  stepLimitsFrom,
   workerImageFor,
 } from "../src/office/config.ts";
+import { DEFAULT_STEP_LIMITS } from "../src/office/step-limits.ts";
 
 const VALID = `
 dry_run: false
@@ -35,7 +38,114 @@ describe("ファクトリー側の設定", () => {
         name: "factory-worker",
         email: "factory-worker@example.invalid",
       },
+      step_limits: {
+        plan: { timeout_sec: 1800, max_turns: 50 },
+        implement: { timeout_sec: 7200, max_turns: 200 },
+        review: { timeout_sec: 1800, max_turns: 50 },
+        verify: { timeout_sec: 1800 },
+      },
       repos: [{ repo: "owner/name", token_env: "GITHUB_TOKEN_EXAMPLE" }],
+    });
+  });
+
+  describe("ステップの上限", () => {
+    /** これまでの上限(設定に出す前の定数)。 */
+    const BEFORE = {
+      plan: { timeoutSec: 30 * 60, maxTurns: 50 },
+      implement: { timeoutSec: 2 * 60 * 60, maxTurns: 200 },
+      review: { timeoutSec: 30 * 60, maxTurns: 50 },
+      verifyTimeoutSec: 30 * 60,
+    };
+
+    it("省略すると、これまでと同じ上限になる", () => {
+      expect(DEFAULT_STEP_LIMITS).toEqual(BEFORE);
+      expect(stepLimitsFrom(parseConfig(VALID))).toEqual(BEFORE);
+      expect(stepLimitsFrom(parseConfig(`${VALID}step_limits: {}\n`))).toEqual(
+        BEFORE,
+      );
+    });
+
+    it("書いた項目だけが変わり、省略した項目は既定値になる", () => {
+      const config = parseConfig(`${VALID}step_limits:
+  plan:
+    timeout_sec: 600
+  implement:
+    max_turns: 300
+  verify:
+    timeout_sec: 900
+`);
+      expect(stepLimitsFrom(config)).toEqual({
+        plan: { timeoutSec: 600, maxTurns: 50 },
+        implement: { timeoutSec: 7200, maxTurns: 300 },
+        review: { timeoutSec: 1800, maxTurns: 50 },
+        verifyTimeoutSec: 900,
+      });
+    });
+
+    it("すべての項目を指定できる。時間は、起動係の上限ちょうどまで通る", () => {
+      const config = parseConfig(`${VALID}step_limits:
+  plan: { timeout_sec: 1, max_turns: 1 }
+  implement: { timeout_sec: ${MAX_TIMEOUT_SEC}, max_turns: 1000 }
+  review: { timeout_sec: 120, max_turns: 20 }
+  verify: { timeout_sec: ${MAX_TIMEOUT_SEC} }
+`);
+      expect(stepLimitsFrom(config)).toEqual({
+        plan: { timeoutSec: 1, maxTurns: 1 },
+        implement: { timeoutSec: MAX_TIMEOUT_SEC, maxTurns: 1000 },
+        review: { timeoutSec: 120, maxTurns: 20 },
+        verifyTimeoutSec: MAX_TIMEOUT_SEC,
+      });
+    });
+
+    const ITEMS = [
+      "plan.timeout_sec",
+      "plan.max_turns",
+      "implement.timeout_sec",
+      "implement.max_turns",
+      "review.timeout_sec",
+      "review.max_turns",
+      "verify.timeout_sec",
+    ];
+
+    function withItem(item: string, value: string): string {
+      const [step, key] = item.split(".");
+      return `${VALID}step_limits:\n  ${step}:\n    ${key}: ${value}\n`;
+    }
+
+    function messagePattern(item: string): RegExp {
+      return new RegExp(`step_limits\\.${item.replace(".", "\\.")}: `);
+    }
+
+    it.each(ITEMS)("%s は、0以下や整数でない値を通さない", (item) => {
+      for (const value of ["0", "-1", "1.5", '"60"', "null"]) {
+        expect(() => parseConfig(withItem(item, value)), value).toThrow(
+          messagePattern(item),
+        );
+      }
+    });
+
+    it.each(ITEMS.filter((item) => item.endsWith("timeout_sec")))(
+      "%s は、起動係の時間の上限を超える値を通さない",
+      (item) => {
+        expect(() =>
+          parseConfig(withItem(item, String(MAX_TIMEOUT_SEC + 1))),
+        ).toThrow(messagePattern(item));
+        expect(() =>
+          parseConfig(withItem(item, String(MAX_TIMEOUT_SEC + 1))),
+        ).toThrow(String(MAX_TIMEOUT_SEC));
+      },
+    );
+
+    it("知らないステップや項目は通さない", () => {
+      expect(() =>
+        parseConfig(`${VALID}step_limits:\n  publish:\n    timeout_sec: 60\n`),
+      ).toThrow(/step_limits/);
+      expect(() =>
+        parseConfig(`${VALID}step_limits:\n  plan:\n    max_turn: 60\n`),
+      ).toThrow(/step_limits\.plan/);
+      expect(() =>
+        parseConfig(`${VALID}step_limits:\n  verify:\n    max_turns: 60\n`),
+      ).toThrow(/step_limits\.verify/);
     });
   });
 
@@ -232,6 +342,9 @@ repos:
     expect(config.repos).toEqual([
       { repo: "owner/name", token_env: "GITHUB_TOKEN_EXAMPLE" },
     ]);
+    // 例には、既定値をそのまま書く。
+    expect(example).toMatch(/^step_limits:/m);
+    expect(stepLimitsFrom(config)).toEqual(DEFAULT_STEP_LIMITS);
   });
 
   it("dry_run の既定値は true、poll_interval_sec の既定値は 60", () => {

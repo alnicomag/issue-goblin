@@ -16,6 +16,21 @@ commit_author: # 省略可。ワーカーのコミットの作者。作業場所
   # 名前とメールアドレスの先頭と末尾に、空白や記号(. , : ; " ' \)を置かない。gitがコミットに書くときに落とす
   name: factory-worker
   email: factory-worker@example.invalid # 実在の宛先に届かないものにする
+# 省略可。ステップごとの上限。書かなかった項目は、下の値(既定値)になる。
+# 上限に達したステップは失敗になり、retry_wait_minutes の待機の後に再試行する。
+# timeout_sec は秒で、1から14400(4時間。起動係が受け付ける上限)までの整数。max_turns は1以上の整数。
+step_limits:
+  plan: # 計画
+    timeout_sec: 1800 # 30分
+    max_turns: 50
+  implement: # 実装
+    timeout_sec: 7200 # 2時間
+    max_turns: 200
+  review: # レビュー
+    timeout_sec: 1800 # 30分
+    max_turns: 50
+  verify: # 検査。Claudeを呼ばないので、ターン数はない
+    timeout_sec: 1800 # 検査コマンド1つごとの時間。30分
 repos:
   - repo: owner/name # 対象リポジトリ
     token_env: GITHUB_TOKEN_EXAMPLE # トークンを入れた環境変数の名前(値は .env に書く)

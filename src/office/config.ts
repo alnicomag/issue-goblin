@@ -2,6 +2,8 @@ import fs from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { MAX_TIMEOUT_SEC } from "../launcher/request.ts";
+import { DEFAULT_STEP_LIMITS, type StepLimits } from "./step-limits.ts";
 
 /** 設定ファイルの場所。環境変数 FACTORY_CONFIG で変えられる。 */
 export const DEFAULT_CONFIG_PATH = "config/factory.config.yml";
@@ -83,6 +85,59 @@ const CommitAuthorSchema = z.strictObject({
     .default(DEFAULT_AUTHOR_EMAIL),
 });
 
+/**
+ * ステップの時間の上限(秒)。起動係が受け付ける上限(`MAX_TIMEOUT_SEC`)を超える値は、
+ * 依頼のたびに断られるので、設定の読み込みで止める。
+ *
+ * 上限との比較は、検証のときに行う。`launcher/request.ts` はこのファイルを読むので、
+ * 読み込みの時点では `MAX_TIMEOUT_SEC` がまだ決まっていない場合がある。
+ */
+const TimeoutSec = z
+  .number()
+  .int()
+  .min(1)
+  .superRefine((value, ctx) => {
+    if (value > MAX_TIMEOUT_SEC) {
+      ctx.addIssue({
+        code: "custom",
+        message: `${MAX_TIMEOUT_SEC}以下で書いてください(起動係の時間の上限)`,
+      });
+    }
+  });
+
+/** Claudeを呼ぶステップ1つの上限。省略した項目は、`fallback` の値になる。 */
+function claudeLimitSchema(fallback: StepLimits["plan"]) {
+  return z
+    .strictObject({
+      timeout_sec: TimeoutSec.default(fallback.timeoutSec),
+      max_turns: z.number().int().min(1).default(fallback.maxTurns),
+    })
+    .default({
+      timeout_sec: fallback.timeoutSec,
+      max_turns: fallback.maxTurns,
+    });
+}
+
+const VERIFY_LIMIT_DEFAULT = {
+  timeout_sec: DEFAULT_STEP_LIMITS.verifyTimeoutSec,
+};
+
+/**
+ * ステップごとの上限。どこまで粘らせるかは、使う枠や製品の大きさで変わるので、設定で変えられる。
+ * 省略した項目は、既定値(`DEFAULT_STEP_LIMITS`)になる。
+ */
+const StepLimitsSchema = z.strictObject({
+  plan: claudeLimitSchema(DEFAULT_STEP_LIMITS.plan),
+  implement: claudeLimitSchema(DEFAULT_STEP_LIMITS.implement),
+  review: claudeLimitSchema(DEFAULT_STEP_LIMITS.review),
+  /** 検査コマンド1つごとの時間。 */
+  verify: z
+    .strictObject({
+      timeout_sec: TimeoutSec.default(VERIFY_LIMIT_DEFAULT.timeout_sec),
+    })
+    .default(VERIFY_LIMIT_DEFAULT),
+});
+
 const RepoConfigSchema = z.strictObject({
   repo: z
     .string()
@@ -137,6 +192,8 @@ const FactoryConfigSchema = z
       name: DEFAULT_AUTHOR_NAME,
       email: DEFAULT_AUTHOR_EMAIL,
     }),
+    /** ステップごとの上限(時間とターン数)。 */
+    step_limits: StepLimitsSchema.default(() => StepLimitsSchema.parse({})),
     repos: z.array(RepoConfigSchema).min(1),
   })
   .superRefine((config, ctx) => {
@@ -227,6 +284,20 @@ export function loadConfig(path: string): FactoryConfig {
     );
   }
   return parseConfig(text, path);
+}
+
+/** 設定の `step_limits` を、実行に渡す形(`RunnerDeps.limits`)に直す。 */
+export function stepLimitsFrom(config: FactoryConfig): StepLimits {
+  const { plan, implement, review, verify } = config.step_limits;
+  return {
+    plan: { timeoutSec: plan.timeout_sec, maxTurns: plan.max_turns },
+    implement: {
+      timeoutSec: implement.timeout_sec,
+      maxTurns: implement.max_turns,
+    },
+    review: { timeoutSec: review.timeout_sec, maxTurns: review.max_turns },
+    verifyTimeoutSec: verify.timeout_sec,
+  };
 }
 
 /** リポジトリのワーカーに使うイメージ。設定にないリポジトリなら失敗する。 */
