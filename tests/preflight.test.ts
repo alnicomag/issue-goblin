@@ -17,6 +17,7 @@ import {
   createPreflightGate,
   decidePreflight,
   FAILED_RECHECK_MINUTES,
+  IMAGE_BUILD_COMMAND,
   type PreflightDeps,
   type PreflightRecord,
   readPreflight,
@@ -24,6 +25,7 @@ import {
   savePreflight,
 } from "../src/office/preflight.ts";
 import { parseFactoryYml } from "../src/office/product.ts";
+import { ImageBuildError } from "../src/office/product-image.ts";
 import {
   preflightWorkspacePaths,
   prepareWorkspace,
@@ -56,6 +58,7 @@ function record(overrides: Partial<PreflightRecord> = {}): PreflightRecord {
     status: "passed",
     image: IMAGE,
     factoryYmlSha: SHA,
+    dockerfileSha: null,
     command: "example-setup",
     exitCode: 0,
     timedOut: false,
@@ -71,12 +74,18 @@ describe("確かめるかどうかの決め方", () => {
     new Date(Date.parse("2026-03-01T00:00:00.000Z") + minutes * 60_000);
   const decide = (
     stored: PreflightRecord | null,
-    overrides: { image?: string; sha?: string | null; now?: Date } = {},
+    overrides: {
+      image?: string;
+      sha?: string | null;
+      dockerfileSha?: string | null;
+      now?: Date;
+    } = {},
   ) =>
     decidePreflight({
       record: stored,
       image: overrides.image ?? IMAGE,
       factoryYmlSha: overrides.sha === undefined ? SHA : overrides.sha,
+      dockerfileSha: overrides.dockerfileSha ?? null,
       now: overrides.now ?? at(1),
     });
 
@@ -96,6 +105,25 @@ describe("確かめるかどうかの決め方", () => {
       );
       expect(decide(record({ status }), { sha: "sha-2" })).toBe("check");
     }
+  });
+
+  it("製品の Dockerfile の sha が変わったら、通っていても通らなくても確かめる", () => {
+    for (const status of ["passed", "failed"] as const) {
+      // Dockerfile が足された、変わった、なくなった。
+      expect(decide(record({ status }), { dockerfileSha: "d-1" })).toBe(
+        "check",
+      );
+      expect(
+        decide(record({ status, dockerfileSha: "d-1" }), {
+          dockerfileSha: "d-2",
+        }),
+      ).toBe("check");
+      expect(decide(record({ status, dockerfileSha: "d-1" }))).toBe("check");
+    }
+    // 同じなら、確かめ直さない。
+    expect(
+      decide(record({ dockerfileSha: "d-1" }), { dockerfileSha: "d-1" }),
+    ).toBe("passed");
   });
 
   it("通らなかった記録は、条件が同じなら、決まった時間がたつまで確かめ直さない", () => {
@@ -403,6 +431,128 @@ describe("着手前の確認", () => {
       expect(readPreflight(db, REPO)).toEqual(
         record({ status: "failed", exitCode: 1 }),
       );
+    });
+
+    describe("製品の Dockerfile", () => {
+      const DOCKERFILE_PATH = ".factory/worker.Dockerfile";
+      const setDockerfile = (sha: string | null) => {
+        setFactoryYml(
+          SHA,
+          `${VALID_FACTORY_YML}worker:\n  dockerfile: ${DOCKERFILE_PATH}\n`,
+        );
+        db.prepare(
+          `UPDATE repos SET worker_dockerfile = ?, worker_dockerfile_sha = ?,
+             worker_dockerfile_path = ? WHERE repo = ?`,
+        ).run(
+          sha === null ? null : "FROM example\n",
+          sha,
+          DOCKERFILE_PATH,
+          REPO,
+        );
+      };
+      const buildError = (
+        overrides: Partial<
+          ConstructorParameters<typeof ImageBuildError>[0]
+        > = {},
+      ) =>
+        new ImageBuildError({
+          exitCode: 1,
+          timedOut: false,
+          output:
+            "イメージのビルドに失敗しました\nStep 3/3 : RUN example-install\nexample-install: not found",
+          truncated: false,
+          ...overrides,
+        });
+
+      it("通ったら、Dockerfile の sha も条件として記録する", async () => {
+        setDockerfile("d-1");
+        await run();
+        expect(readPreflight(db, REPO)).toMatchObject({
+          status: "passed",
+          dockerfileSha: "d-1",
+          command: "example-setup",
+        });
+      });
+
+      it("イメージのビルドに失敗したら、通らなかった結果として、ビルドの出力とあわせて記録する", async () => {
+        setDockerfile("d-1");
+        launcher.answers.push(buildError());
+
+        const result = await run();
+
+        expect(result.kind).toBe("recorded");
+        const stored = readPreflight(db, REPO);
+        expect(stored).toMatchObject({
+          status: "failed",
+          dockerfileSha: "d-1",
+          command: IMAGE_BUILD_COMMAND,
+          exitCode: 1,
+          timedOut: false,
+        });
+        expect(stored?.outputTail).toContain("example-install: not found");
+        const log = fs.readFileSync(stored?.logPath ?? "", "utf8");
+        expect(log).toContain('"command": "(ワーカーのイメージのビルド)"');
+        expect(log).toContain('"dockerfile_sha": "d-1"');
+        expect(log).toContain("Step 3/3 : RUN example-install");
+        expect(fs.existsSync(preflightDir())).toBe(false);
+      });
+
+      it("検査に通らない Dockerfile と、ビルドの時間切れも、通らなかった結果になる", async () => {
+        setDockerfile("d-1");
+        launcher.answers.push(
+          buildError({
+            exitCode: null,
+            output: "Dockerfile を使えません(3行目): ADD は使えません",
+          }),
+        );
+        await run();
+        expect(readPreflight(db, REPO)).toMatchObject({
+          status: "failed",
+          command: IMAGE_BUILD_COMMAND,
+          exitCode: null,
+          outputTail: "Dockerfile を使えません(3行目): ADD は使えません",
+        });
+
+        launcher.answers.push(buildError({ exitCode: 143, timedOut: true }));
+        await run();
+        expect(readPreflight(db, REPO)).toMatchObject({
+          status: "failed",
+          timedOut: true,
+        });
+      });
+
+      it("関門は、ビルドに失敗した製品を failed にし、Dockerfile が変わったら確かめ直す", async () => {
+        setDockerfile("d-1");
+        launcher.answers.push(buildError());
+        const gate = createPreflightGate({
+          ...deps,
+          logger,
+          imageFor: () => IMAGE,
+          timeoutSec: 600,
+        });
+        gate.ensure(REPO);
+        await gate.idle();
+        expect(gate.statusOf(REPO)).toBe("failed");
+        expect(
+          logs.filter((line) => line.event === "preflight.failed")[0]?.fields,
+        ).toMatchObject({
+          command: IMAGE_BUILD_COMMAND,
+          dockerfile_sha: "d-1",
+        });
+
+        // 同じ条件の間は、確かめ直さない(ビルドも頼まない)。
+        gate.ensure(REPO);
+        await gate.idle();
+        expect(launcher.requests).toHaveLength(1);
+
+        // 既定ブランチの Dockerfile が変わると、確かめ直して、通る。
+        setDockerfile("d-2");
+        expect(gate.statusOf(REPO)).toBe("pending");
+        gate.ensure(REPO);
+        await gate.idle();
+        expect(gate.statusOf(REPO)).toBe("passed");
+        expect(readPreflight(db, REPO)?.dockerfileSha).toBe("d-2");
+      });
     });
 
     it("途中で止められたら、記録せずに戻り、確認用の場所を消す", async () => {

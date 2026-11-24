@@ -27,6 +27,8 @@ import { createOctokitApi, type GitHubApi } from "./github.ts";
 import { createRepoLocks } from "./locks.ts";
 import { createLogger, errorFields, type Logger } from "./log.ts";
 import { createPreflightGate } from "./preflight.ts";
+import { readStoredWorkerDockerfile } from "./product.ts";
+import { withProductImage } from "./product-image.ts";
 import type { RunnerDeps } from "./runner.ts";
 import { createSupervisor, type Supervisor } from "./supervisor.ts";
 import { type SyncDeps, syncAll } from "./sync.ts";
@@ -167,9 +169,13 @@ async function main(): Promise<boolean> {
     };
 
     const locks = createRepoLocks();
-    const launcher = createLauncherClient({
-      socketPath: process.env.LAUNCHER_SOCKET ?? DEFAULT_LAUNCHER_SOCKET,
-    });
+    // 製品が Dockerfile を持つ場合は、既定ブランチから取得して保存した本文を、依頼に添える。
+    const launcher = withProductImage(
+      createLauncherClient({
+        socketPath: process.env.LAUNCHER_SOCKET ?? DEFAULT_LAUNCHER_SOCKET,
+      }),
+      (repo) => readStoredWorkerDockerfile(db, repo),
+    );
     const limits = stepLimitsFrom(config);
     const runner: RunnerDeps = {
       db,

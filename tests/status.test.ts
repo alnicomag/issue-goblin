@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Clock } from "../src/office/clock.ts";
 import { type Db, migrate, openDb } from "../src/office/db.ts";
 import {
+  IMAGE_BUILD_COMMAND,
   type PreflightRecord,
   savePreflight,
 } from "../src/office/preflight.ts";
@@ -106,6 +107,7 @@ describe("状況表示", () => {
       status: "failed",
       image: "example-image",
       factoryYmlSha: "sha-1",
+      dockerfileSha: null,
       command: "example-setup",
       exitCode: 127,
       timedOut: false,
@@ -150,13 +152,32 @@ describe("状況表示", () => {
         "    イメージ: example-image",
         "    factory.yml: sha-1",
         "    ログ: /data/logs/owner/name/preflight/a.log",
-        "    確かめ直し: イメージの名前か factory.yml が変わったとき、または 2026-03-01T01:30:00.000Z 以降",
+        "    確かめ直し: イメージの名前、factory.yml、製品の Dockerfile のどれかが変わったとき、または 2026-03-01T01:30:00.000Z 以降",
         "    出力の末尾:",
         "      | installing",
         "      | sh: 1: example-tool: not found",
       ]);
       // ほかの製品の表示には混ざらない。
       expect(textOf().match(/着手前の確認: 失敗/g)).toHaveLength(1);
+    });
+
+    it("イメージのビルドに失敗した製品は、ビルドであることと、Dockerfile の sha が出る", () => {
+      savePreflight(db, {
+        ...failed,
+        dockerfileSha: "dockerfile-sha-1",
+        command: IMAGE_BUILD_COMMAND,
+        exitCode: null,
+        outputTail: "Dockerfile を使えません(3行目): ADD は使えません",
+      });
+      const text = textOf();
+      expect(text).toContain("    コマンド: (ワーカーのイメージのビルド)");
+      expect(text).toContain(
+        "    終了コード: なし(ビルドを始めていないか、シグナルで終わりました)",
+      );
+      expect(text).toContain("    Dockerfile: dockerfile-sha-1");
+      expect(text).toContain(
+        "      | Dockerfile を使えません(3行目): ADD は使えません",
+      );
     });
 
     it("時間切れ、シグナルでの終了、出力なしも、読める形で出る", () => {
