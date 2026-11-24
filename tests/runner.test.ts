@@ -6,6 +6,7 @@ import {
   LauncherAbortedError,
   type WorkerLauncher,
 } from "../src/launcher/client.ts";
+import { parseConfig, stepLimitsFrom } from "../src/office/config.ts";
 import { FACTORY_MARKER } from "../src/office/github.ts";
 import {
   advanceRun,
@@ -20,6 +21,16 @@ import { createHarness, type Harness, REPO } from "./factory-harness.ts";
 import { plainGit } from "./git-fixtures.ts";
 
 const ISSUE = 7;
+
+/** ステップの上限を書いていない設定。 */
+const CONFIG_WITHOUT_LIMITS = `
+db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
+repos:
+  - repo: owner/name
+    token_env: GITHUB_TOKEN_EXAMPLE
+`;
 
 describe("ステップの実行", () => {
   let h: Harness;
@@ -46,6 +57,69 @@ describe("ステップの実行", () => {
     h.putIssue(ISSUE, { labels: ["state:in-review"], open: false });
     await h.sync();
   };
+
+  describe("ステップの上限", () => {
+    const claudeLimits = () =>
+      Object.fromEntries(
+        h.worker.calls.map((call) => [
+          call.prompt,
+          { timeoutSec: call.timeoutSec, maxTurns: call.maxTurns },
+        ]),
+      );
+    /** 検査コマンド(`sh -c`)に渡した時間。 */
+    const verifyTimeouts = () =>
+      h.launcher.requests
+        .filter((request) => request.argv[0] === "sh")
+        .map((request) => request.timeout_sec);
+
+    it("設定を省略すると、これまでと同じ上限で、ワーカーと検査コマンドを呼ぶ", async () => {
+      const config = parseConfig(CONFIG_WITHOUT_LIMITS);
+      const runId = start();
+      await advanceRun(
+        { ...h.runner, limits: stepLimitsFrom(config) },
+        runId,
+        new AbortController().signal,
+      );
+      expect(claudeLimits()).toEqual({
+        plan: { timeoutSec: 30 * 60, maxTurns: 50 },
+        implement: { timeoutSec: 2 * 60 * 60, maxTurns: 200 },
+        review: { timeoutSec: 30 * 60, maxTurns: 50 },
+      });
+      expect(verifyTimeouts().length).toBeGreaterThan(0);
+      expect(new Set(verifyTimeouts())).toEqual(new Set([30 * 60]));
+    });
+
+    it("設定した値が、ワーカーの呼び出しと検査コマンドに渡る", async () => {
+      const config = parseConfig(`${CONFIG_WITHOUT_LIMITS}step_limits:
+  plan: { timeout_sec: 601, max_turns: 11 }
+  implement: { timeout_sec: 3602, max_turns: 122 }
+  review: { timeout_sec: 903, max_turns: 33 }
+  verify: { timeout_sec: 244 }
+`);
+      const runId = start();
+      await advanceRun(
+        { ...h.runner, limits: stepLimitsFrom(config) },
+        runId,
+        new AbortController().signal,
+      );
+      expect(stepsOf(runId)).toContain("review:done");
+      expect(claudeLimits()).toEqual({
+        plan: { timeoutSec: 601, maxTurns: 11 },
+        implement: { timeoutSec: 3602, maxTurns: 122 },
+        review: { timeoutSec: 903, maxTurns: 33 },
+      });
+      expect(verifyTimeouts().length).toBeGreaterThan(0);
+      expect(new Set(verifyTimeouts())).toEqual(new Set([244]));
+      // 作業場所の状態の確認は、検査コマンドの上限のほうが短ければ、そちらを使う。
+      const status = h.launcher.requests.filter(
+        (request) => request.argv[0] === "git",
+      );
+      expect(status.length).toBeGreaterThan(0);
+      expect(new Set(status.map((request) => request.timeout_sec))).toEqual(
+        new Set([244]),
+      );
+    });
+  });
 
   it("prepare から publish まで進み、クローズを待つ", async () => {
     const runId = start();

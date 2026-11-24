@@ -185,6 +185,12 @@ describe("起動時のトークンの確認", () => {
     retry_wait_minutes: [5, 30, 120],
     daily_run_limit: 20,
     commit_author: { name: "Example", email: "example@example.invalid" },
+    step_limits: {
+      plan: { timeout_sec: 1800, max_turns: 50 },
+      implement: { timeout_sec: 7200, max_turns: 200 },
+      review: { timeout_sec: 1800, max_turns: 50 },
+      verify: { timeout_sec: 1800 },
+    },
     repos: [
       { repo: "owner/first", token_env: "TOKEN_FIRST" },
       { repo: "owner/second", token_env: "TOKEN_SECOND" },

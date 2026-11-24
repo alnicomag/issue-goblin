@@ -34,6 +34,7 @@ import {
   type Step,
   startStep,
 } from "./runs.ts";
+import { DEFAULT_STEP_LIMITS, type StepLimits } from "./step-limits.ts";
 import { runVerify } from "./verify.ts";
 import {
   cleanupWorkspace,
@@ -44,28 +45,11 @@ import {
   workspacePaths,
 } from "./workspace.ts";
 
-/** Claudeのステップ1回の上限。 */
-export interface ClaudeLimit {
-  readonly timeoutSec: number;
-  readonly maxTurns: number;
-}
-
-/** ステップごとの上限。 */
-export interface StepLimits {
-  readonly plan: ClaudeLimit;
-  readonly implement: ClaudeLimit;
-  readonly review: ClaudeLimit;
-  /** 検査コマンド1つごとの時間の上限(秒)。 */
-  readonly verifyTimeoutSec: number;
-}
-
-/** 上限の既定値。 */
-export const DEFAULT_STEP_LIMITS: StepLimits = {
-  plan: { timeoutSec: 30 * 60, maxTurns: 50 },
-  implement: { timeoutSec: 2 * 60 * 60, maxTurns: 200 },
-  review: { timeoutSec: 30 * 60, maxTurns: 50 },
-  verifyTimeoutSec: 30 * 60,
-};
+export {
+  type ClaudeLimit,
+  DEFAULT_STEP_LIMITS,
+  type StepLimits,
+} from "./step-limits.ts";
 
 /** review に渡す差分の長さの上限(文字数)。超えた分は切り、切ったことを書く。 */
 export const MAX_DIFF_CHARS = 1_000_000;
@@ -92,6 +76,7 @@ export interface RunnerDeps {
   readonly sourceFor: (repo: string) => RepoSource;
   /** リポジトリへの書き込みの口と、`dry_run`。 */
   readonly writeFor: (repo: string) => WriteContext;
+  /** ステップごとの上限(設定の `step_limits`)。省略すると、既定値を使う。 */
   readonly limits?: StepLimits;
 }
 
