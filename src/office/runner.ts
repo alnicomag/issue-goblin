@@ -541,6 +541,8 @@ async function executeStep(
           // 人間の対応待ちで止まったとき、イシューへのコメントに載せる。
           forbidden: result.forbidden,
           protected: result.protected,
+          // 承認待ちで止まったとき、人間が中身を確かめられるように、コメントに載せる。
+          protectedDiff: result.protectedDiff,
           prNumber: result.prNumber,
           prUrl: result.prUrl,
         },

@@ -25,6 +25,11 @@ import {
   updatePullRequest,
   type WriteContext,
 } from "./github.ts";
+import {
+  type ProtectedDiff,
+  summarizeDiff,
+  unavailableDiff,
+} from "./held-diff.ts";
 import { checkPaths, type PathHit } from "./paths.ts";
 import { readStoredFactoryYml } from "./product.ts";
 import { maskSecrets } from "./step-log.ts";
@@ -199,6 +204,50 @@ export async function listCommitIdentities(
     );
   }
   return commits;
+}
+
+/** 差分を取る保護対象のパスの数の上限。人間の対応待ちのコメントに挙げるパスの数と同じにする。 */
+export const PROTECTED_DIFF_PATH_LIMIT = 50;
+
+/**
+ * ミラーで、保護対象のパスの差分を読む。読むだけで、何も変えない。
+ *
+ * 人間が承認の前に中身を確かめられるように、止まった理由のコメントに載せる。ブランチの名前ではなく、
+ * コミットのハッシュで指定するので、コメントに書くコミット(`headCommit`)の差分になる。基準は、
+ * 既定ブランチと分かれた位置である。パスは、記号を含んでいても、文字どおりに扱わせる。
+ *
+ * トークンに見える文字列を伏せ、上限までに切ってから返す。パスが多い場合は、先頭の
+ * `PROTECTED_DIFF_PATH_LIMIT` 件だけを取り、残りは件数を返す。
+ */
+export async function readProtectedDiff(
+  git: Git,
+  input: {
+    mirrorDir: string;
+    mergeBase: string;
+    headCommit: string;
+    hits: readonly PathHit[];
+  },
+): Promise<ProtectedDiff> {
+  const all = [...new Set(input.hits.map((hit) => hit.path))];
+  const shown = new Set(
+    input.hits.slice(0, PROTECTED_DIFF_PATH_LIMIT).map((hit) => hit.path),
+  );
+  const raw = await git.run(
+    [
+      "--literal-pathspecs",
+      "diff",
+      "--no-color",
+      "--no-renames",
+      "--no-ext-diff",
+      "--no-textconv",
+      input.mergeBase,
+      input.headCommit,
+      "--",
+      ...shown,
+    ],
+    { cwd: input.mirrorDir },
+  );
+  return summarizeDiff(raw, { omittedPaths: all.length - shown.size });
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +526,11 @@ export interface PublishResult {
   readonly forbidden: readonly PathHit[];
   readonly protected: readonly PathHit[];
   /**
+   * 保護対象のパスの差分(`needs_approval` のときだけ入る)。止まった理由のコメントに載せる。
+   * 止まったコミット(`headCommit`)と、既定ブランチと分かれた位置との差分である。
+   */
+  readonly protectedDiff: ProtectedDiff | null;
+  /**
    * 作者かコミッターが `commit_author` と一致しなかったコミット(`author_mismatch` のときだけ入る)。
    * コミットのハッシュと、そのコミットに書かれていた作者とコミッターを残す。
    */
@@ -597,6 +651,7 @@ export async function publish(
       changedPaths: [],
       forbidden: [],
       protected: [],
+      protectedDiff: null,
       authorMismatches: [],
       prNumber: null,
       prUrl: null,
@@ -674,10 +729,32 @@ export async function publish(
     input.approvedCommit != null &&
     input.approvedCommit === changes.headCommit;
   if (check.protected.length > 0 && !approved) {
+    // 差分を取れなくても(大きすぎる場合など)、失敗にはしない。失敗にすると、同じ変更のまま
+    // 再試行を繰り返すことになる。取れなかったことは、ログと、止まった理由のコメントに残す。
+    let protectedDiff: ProtectedDiff;
+    try {
+      protectedDiff = await readProtectedDiff(git, {
+        mirrorDir,
+        mergeBase: changes.mergeBase,
+        headCommit: changes.headCommit,
+        hits: check.protected,
+      });
+    } catch (error) {
+      write.logger.warn("publish.diff_unavailable", {
+        repo,
+        issue,
+        branch,
+        head: changes.headCommit,
+        error: maskSecrets(
+          error instanceof Error ? error.message : String(error),
+        ).slice(0, 2000),
+      });
+      protectedDiff = unavailableDiff();
+    }
     return stopped(
       "needs_approval",
       `保護対象のパス(paths.protected)に触れています。人間の承認待ちで、push していません: ${describeHits(check.protected)}`,
-      checked,
+      { ...checked, protectedDiff },
     );
   }
 
@@ -726,6 +803,7 @@ export async function publish(
     baseBranch,
     headCommit: changes.headCommit,
     ...checked,
+    protectedDiff: null,
     authorMismatches: [],
     prNumber: pr?.number ?? null,
     prUrl: pr?.url ?? null,
