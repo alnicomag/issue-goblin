@@ -360,6 +360,149 @@ describe("起動係", () => {
   });
 });
 
+describe("起動時のイメージの確認", () => {
+  /** 手元にあるイメージを決められる偽のDocker。 */
+  function dockerWithImages(present: readonly string[]) {
+    const fake = fakeDocker();
+    const inspected: string[] = [];
+    const docker: Docker = {
+      async exec(args, options) {
+        if (args[0] === "image" && args[1] === "inspect") {
+          const image = args.at(-1) ?? "";
+          inspected.push(image);
+          return present.includes(image)
+            ? {
+                exitCode: 0,
+                stdout: "sha256:0\n",
+                stderr: "",
+                truncated: false,
+              }
+            : {
+                exitCode: 1,
+                stdout: "",
+                stderr: `Error response from daemon: No such image: ${image}`,
+                truncated: false,
+              };
+        }
+        return fake.docker.exec(args, options);
+      },
+    };
+    return { docker, inspected, runs: fake.runs };
+  }
+
+  function recorder() {
+    const records: Array<{ level: string; event: string; fields?: LogFields }> =
+      [];
+    const at = (level: string) => (event: string, fields?: LogFields) => {
+      records.push({ level, event, ...(fields ? { fields } : {}) });
+    };
+    const logger: Logger = {
+      info: at("info"),
+      warn: at("warn"),
+      error: at("error"),
+    };
+    return { logger, records };
+  }
+
+  it("全体のイメージが手元になければ、イメージと、それを使う製品をログに出す", async () => {
+    // ビルドした名前(other-worker)と、設定の名前(factory-worker)が食い違っている。
+    const fake = dockerWithImages(["other-worker", "second-worker"]);
+    const { logger, records } = recorder();
+    const missing = await launcherWith(fake.docker, { logger }).checkImages();
+
+    expect(missing).toEqual(["factory-worker"]);
+    expect(records).toEqual([
+      {
+        level: "warn",
+        event: "launcher.image_missing",
+        fields: { image: "factory-worker", repos: ["owner/first"] },
+      },
+    ]);
+  });
+
+  it("製品ごとのイメージが手元になければ、そのイメージをログに出す", async () => {
+    const fake = dockerWithImages(["factory-worker"]);
+    const { logger, records } = recorder();
+    const missing = await launcherWith(fake.docker, { logger }).checkImages();
+
+    expect(missing).toEqual(["second-worker"]);
+    expect(records.map((record) => record.fields)).toEqual([
+      { image: "second-worker", repos: ["owner/second"] },
+    ]);
+  });
+
+  it("すべて手元にあれば、何も出さない。同じイメージは1回だけ確かめる", async () => {
+    const config = parseConfig(`
+db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
+repos:
+  - repo: owner/first
+    token_env: TOKEN_FIRST
+  - repo: owner/second
+    token_env: TOKEN_SECOND
+`);
+    const fake = dockerWithImages(["factory-worker"]);
+    const { logger, records } = recorder();
+    const missing = await launcherWith(fake.docker, {
+      config,
+      logger,
+    }).checkImages();
+
+    expect(missing).toEqual([]);
+    expect(records).toEqual([]);
+    expect(fake.inspected).toEqual(["factory-worker"]);
+  });
+
+  it("イメージの名前を、オプションとして解釈させない", async () => {
+    const calls: Array<readonly string[]> = [];
+    const docker: Docker = {
+      async exec(args) {
+        calls.push(args);
+        return { exitCode: 0, stdout: "", stderr: "", truncated: false };
+      },
+    };
+    await launcherWith(docker).checkImages();
+    expect(calls).toEqual([
+      ["image", "inspect", "--format={{.Id}}", "--", "factory-worker"],
+      ["image", "inspect", "--format={{.Id}}", "--", "second-worker"],
+    ]);
+  });
+
+  it("イメージがなくても止まらず、イメージのある製品の依頼は通る", async () => {
+    const fake = dockerWithImages(["second-worker"]);
+    const launcher = launcherWith(fake.docker);
+    await expect(launcher.checkImages()).resolves.toEqual(["factory-worker"]);
+
+    const response = await launcher.run({ ...REQUEST, repo: "owner/second" });
+    expect(response.ok).toBe(true);
+    expect(fake.runs()).toHaveLength(1);
+  });
+
+  it("確かめる途中でdockerを呼べなくても止まらず、残りを確かめる", async () => {
+    const { logger, records } = recorder();
+    const docker: Docker = {
+      async exec(args) {
+        if (args.at(-1) === "factory-worker") {
+          throw new Error("docker を起動できません");
+        }
+        return { exitCode: 1, stdout: "", stderr: "", truncated: false };
+      },
+    };
+    const missing = await launcherWith(docker, { logger }).checkImages();
+
+    expect(missing).toEqual(["second-worker"]);
+    expect(records.map((record) => [record.level, record.event])).toEqual([
+      ["error", "launcher.image_check_failed"],
+      ["warn", "launcher.image_missing"],
+    ]);
+    expect(records[0]?.fields).toMatchObject({
+      image: "factory-worker",
+      repos: ["owner/first"],
+    });
+  });
+});
+
 describe("起動係の環境変数", () => {
   const ENV = {
     WORK_VOLUME: "factory-work",

@@ -30,6 +30,12 @@ export interface Launcher {
   run(raw: unknown, signal?: AbortSignal): Promise<LauncherResponse>;
   /** 前回の起動で残ったワーカーのコンテナを消す。消した数を返す。 */
   removeLeftovers(): Promise<number>;
+  /**
+   * 設定にあるワーカーのイメージ(製品ごとに、実際に使うもの)が手元にあるかを確かめる。
+   * なければログに出し、ないイメージの名前を返す。失敗させない
+   * (イメージのある製品の実行を続けられるようにするため)。
+   */
+  checkImages(): Promise<string[]>;
   /** 実行中のコンテナをすべて止める。 */
   stopAll(): Promise<void>;
 }
@@ -239,6 +245,35 @@ export function createLauncher(deps: LauncherDeps): Launcher {
       }
       logger.warn("launcher.leftovers_removed", { count: ids.length });
       return ids.length;
+    },
+
+    async checkImages() {
+      // イメージごとに、それを使う製品をまとめる。同じイメージは1回だけ確かめる。
+      const users = new Map<string, string[]>();
+      for (const entry of config.repos) {
+        const image = workerImageFor(config, entry.repo);
+        users.set(image, [...(users.get(image) ?? []), entry.repo]);
+      }
+      const missing: string[] = [];
+      for (const [image, repos] of users) {
+        try {
+          // 起動係はイメージを外から取ってこないので、手元になければワーカーを立てられない。
+          const result = await docker.exec(
+            ["image", "inspect", "--format={{.Id}}", "--", image],
+            quiet,
+          );
+          if (result.exitCode === 0) continue;
+          missing.push(image);
+          logger.warn("launcher.image_missing", { image, repos });
+        } catch (error) {
+          logger.error("launcher.image_check_failed", {
+            image,
+            repos,
+            ...errorFields(error),
+          });
+        }
+      }
+      return missing;
     },
 
     async stopAll() {
