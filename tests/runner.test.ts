@@ -323,6 +323,15 @@ describe("ステップの実行", () => {
         protected: [],
         ...hits,
       });
+      // 承認待ちのときだけ、保護対象のパスの差分が記録に残る。
+      const recorded = outputOf(runId, "publish").protectedDiff as {
+        text: string;
+      } | null;
+      if (status === "needs_approval") {
+        expect(recorded?.text).toContain(`+++ b/${file}`);
+      } else {
+        expect(recorded).toBeNull();
+      }
       expect(getRun(h.db, runId)).toMatchObject({
         status: "held",
         nextRetryAt: null,

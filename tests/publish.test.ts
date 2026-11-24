@@ -1150,6 +1150,106 @@ describe("publish", () => {
     });
   });
 
+  describe("承認待ちで止まったときの、保護対象のパスの差分", () => {
+    const protectedFile = (name: string, content: string): string => {
+      fs.mkdirSync(path.join(paths.repoDir, "docs"), { recursive: true });
+      return commitFile(paths.repoDir, `docs/${name}`, content);
+    };
+
+    it("止まったコミットの、保護対象のパスの差分だけを、結果に入れる", async () => {
+      commitFile(paths.repoDir, "feature.txt", "unprotected change\n");
+      protectedFile("guide.md", "first version\n");
+      const head = protectedFile("guide.md", "second version\n");
+
+      const result = await run(false);
+      expect(result).toMatchObject({
+        status: "needs_approval",
+        headCommit: head,
+      });
+      const base = plainGit(paths.mirrorDir, "merge-base", "origin/main", head);
+      expect(result.protectedDiff?.text).toBe(
+        plainGit(
+          paths.mirrorDir,
+          "diff",
+          "--no-renames",
+          base,
+          head,
+          "--",
+          "docs/guide.md",
+        ),
+      );
+      expect(result.protectedDiff?.text).toContain("+second version");
+      expect(result.protectedDiff?.text).not.toContain("first version");
+      expect(result.protectedDiff?.text).not.toContain("unprotected change");
+      expect(result.protectedDiff).toMatchObject({
+        truncated: false,
+        omittedPaths: 0,
+      });
+      expectNothingWritten();
+    });
+
+    it("パスは文字どおりに扱い、記号を含む名前でも、そのファイルの差分になる", async () => {
+      protectedFile("*.md", "star\n");
+      protectedFile("plain.md", "plain\n");
+      const result = await run(false);
+      expect(result.protectedDiff?.text).toContain("+star");
+      expect(result.protectedDiff?.text?.match(/^\+plain$/gm)).toHaveLength(1);
+    });
+
+    it("トークンに見える文字列は、結果に入れる前に伏せる", async () => {
+      protectedFile("guide.md", "key: sk-ant-example-value\n");
+      const result = await run(false);
+      expect(result.protectedDiff?.text).toContain("sk-ant-***");
+      expect(JSON.stringify(result)).not.toContain("example-value");
+    });
+
+    it("長い差分は、上限で切り、全体の大きさを残す", async () => {
+      const content = Array.from(
+        { length: 6000 },
+        (_, index) => `line ${index}\n`,
+      ).join("");
+      protectedFile("long.md", content);
+      const result = await run(false);
+      expect(result.protectedDiff?.truncated).toBe(true);
+      expect(result.protectedDiff?.text?.length).toBeLessThanOrEqual(40_000);
+      expect(result.protectedDiff?.totalChars).toBeGreaterThan(content.length);
+      expect(result.protectedDiff?.totalLines).toBeGreaterThan(6000);
+    });
+
+    it("差分を取れなくても、失敗にせず、承認待ちで止める", async () => {
+      protectedFile("guide.md", "guide\n");
+      const inner = git;
+      git = {
+        run(args, options) {
+          if (args.includes("--literal-pathspecs")) {
+            return Promise.reject(
+              new Error("stdout maxBuffer length exceeded"),
+            );
+          }
+          return inner.run(args, options);
+        },
+      };
+      const result = await run(false);
+      expect(result).toMatchObject({
+        status: "needs_approval",
+        outcome: "held",
+        protectedDiff: { text: null },
+      });
+      expect(
+        logs.find((line) => line.event === "publish.diff_unavailable"),
+      ).toMatchObject({ level: "warn" });
+      expectNothingWritten();
+    });
+
+    it("forbidden で止まったときは、差分を取らない", async () => {
+      fs.mkdirSync(path.join(paths.repoDir, "generated"));
+      commitFile(paths.repoDir, "generated/out.txt", "out\n");
+      const result = await run(false);
+      expect(result.status).toBe("forbidden");
+      expect(result.protectedDiff).toBeNull();
+    });
+  });
+
   describe("人間が承認したコミット", () => {
     const touchProtected = (): string => {
       commitFile(paths.repoDir, "feature.txt", "feature\n");

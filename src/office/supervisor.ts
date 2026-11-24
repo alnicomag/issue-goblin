@@ -16,6 +16,7 @@
 import { z } from "zod";
 import { isoNow } from "./clock.ts";
 import { addIssueComment, removeLabel } from "./github.ts";
+import { diffSection, ProtectedDiffSchema } from "./held-diff.ts";
 import { type IntakeIssue, type IntakeRepo, planIntake } from "./intake.ts";
 import type { RepoLocks } from "./locks.ts";
 import { errorFields } from "./log.ts";
@@ -113,29 +114,47 @@ const HeldOutputSchema = z.object({
   headCommit: z.string().nullable(),
   forbidden: z.array(PathHitSchema),
   protected: z.array(PathHitSchema),
+  /**
+   * 保護対象のパスの差分(`needs_approval` のときだけ入る)。
+   * 差分を残すようになる前の記録には、この項目がない。
+   */
+  protectedDiff: ProtectedDiffSchema.nullable().optional(),
 });
 export type HeldOutput = z.infer<typeof HeldOutputSchema>;
 
 const HELD_EXPLANATIONS = {
   needs_approval: {
     what: "人間の承認が要るパス(`paths.protected`)に触れる変更があります。",
-    next: `承認するには、上のコミットの内容を確かめてから、このイシューにラベル \`${AGENT_APPROVED_LABEL}\` を付けてください。承認が効くのは、上のコミットだけです(このコメントより前に付いていたラベルは、外しました)。コミットは push していないので、内容は、ファクトリーの作業場所で確かめます。承認しない場合は、保護対象のパスを避ける方針をコメントするか、人間が作業を引き取ってください。`,
+    next: (hasDiff: boolean) =>
+      `承認するには、上のコミットの内容を確かめてから、このイシューにラベル \`${AGENT_APPROVED_LABEL}\` を付けてください。承認が効くのは、上のコミットだけです(このコメントより前に付いていたラベルは、外しました)。${
+        hasDiff
+          ? "コミットは push していません。保護対象のパスの差分を、このコメントの下に載せています。載せきれなかった分は、ファクトリーの作業場所で確かめます。"
+          : "コミットは push していないので、内容は、ファクトリーの作業場所で確かめます。"
+      }承認しない場合は、保護対象のパスを避ける方針をコメントするか、人間が作業を引き取ってください。`,
   },
   forbidden: {
     what: "ワーカーが変更してはいけないパス(`paths.forbidden`)に触れる変更があります。",
-    next: "禁止のパスを避ける方針をコメントするか、人間が作業を引き取ってください。",
+    next: () =>
+      "禁止のパスを避ける方針をコメントするか、人間が作業を引き取ってください。",
   },
 } as const;
+
+/** GitHubのコメントの本文の、文字数の上限。 */
+export const GITHUB_COMMENT_LIMIT = 65_536;
 
 /**
  * 人間の対応待ちのコメントの本文。純粋関数で、同じ入力からは同じ本文になる。
  * `output` が null なら、記録から内容を読めなかったことを書く。
+ *
+ * `needs_approval` で、差分の記録があれば、保護対象のパスの差分を末尾(目印の前)に載せる。
+ * 差分に使う長さは、ほかの部分の長さを引いて決めるので、本文はGitHubの上限に収まる。
  */
 export function heldComment(
   runId: number,
   output: HeldOutput | null,
   publishCount = 1,
 ): string {
+  const marker = heldMarker(runId, publishCount);
   const lines = [
     "PRを作る前の検査で止まりました。push もPRの作成もしていません。人間の対応を待ちます。自動では再試行しません。",
     "",
@@ -163,13 +182,22 @@ export function heldComment(
     }
     const rest = hits.length - HELD_COMMENT_PATH_LIMIT;
     if (rest > 0) lines.push(`- (ほか ${rest} 件)`);
+    const diff =
+      output.status === "needs_approval"
+        ? (output.protectedDiff ?? null)
+        : null;
     lines.push(
       "",
-      explanation.next,
+      explanation.next(diff !== null),
       "イシューへのコメントは、次の実行のワーカーに渡ります。`state:ready` に戻すと、新しい実行として着手します。変更が同じなら、同じところで止まります。",
     );
+    if (diff !== null) {
+      // 差分の前後の空行、目印、書き込みのときに付く目印(`<!-- factory -->`)の分を残す。
+      const used = lines.join("\n").length + marker.length + 100;
+      lines.push("", ...diffSection(diff, GITHUB_COMMENT_LIMIT - used));
+    }
   }
-  lines.push("", heldMarker(runId, publishCount));
+  lines.push("", marker);
   return lines.join("\n");
 }
 
