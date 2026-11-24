@@ -328,6 +328,25 @@ describe("PRの内容", () => {
     expect(section).not.toContain("<!--");
   });
 
+  it("承認されたパスが長くても、要約が上限いっぱいでも、GitHubの本文の上限に収まる", () => {
+    const body = buildPrBody({
+      issue: 7,
+      verify,
+      unverified: ["deploy"],
+      implementSummary: "y".repeat(SUMMARY_LIMIT + 100),
+      reviewSummary: "z".repeat(SUMMARY_LIMIT + 100),
+      approvedPaths: Array.from({ length: 60 }, (_, index) => ({
+        path: `docs/${"x".repeat(4080)}/${index}.md`,
+        pattern: "docs/**",
+      })),
+    });
+    expect(body.length).toBeLessThanOrEqual(65_536);
+    expect(body).toContain("ほか 10 件");
+    expect(body).toContain("長いので中ほどを省きました");
+    expect(body).toContain("/49.md`");
+    expect(body.trimEnd().endsWith(FACTORY_MARKER)).toBe(true);
+  });
+
   it("承認されたパスがなければ、その節を書かない", () => {
     for (const approvedPaths of [undefined, []]) {
       const body = buildPrBody({

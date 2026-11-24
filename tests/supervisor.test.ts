@@ -1058,6 +1058,42 @@ describe("実行の管理", () => {
         });
       });
 
+      describe("長いパス", () => {
+        const longHits = Array.from({ length: 60 }, (_, index) =>
+          hit(`docs/${"x".repeat(4080)}/${index}.md`, "docs/**"),
+        );
+
+        it("forbidden のコメントは、パスが長くても、GitHubの上限に収まる", () => {
+          const body = heldComment(1, {
+            status: "forbidden",
+            headCommit: "abc",
+            forbidden: longHits,
+            protected: [],
+          });
+          expect(body.length + 30).toBeLessThanOrEqual(GITHUB_COMMENT_LIMIT);
+          expect(body).toContain("ほか 10 件");
+          expect(body).toContain("長いので中ほどを省きました");
+          expect(body.trimEnd().endsWith(heldMarker(1))).toBe(true);
+        });
+
+        it("needs_approval のコメントは、パスが長くても、上限に収まり、差分も載る", () => {
+          const diff = summarizeDiff(
+            Array.from({ length: 9000 }, (_, i) => `+line ${i}`).join("\n"),
+          );
+          const body = heldComment(1, {
+            status: "needs_approval",
+            headCommit: "abc",
+            forbidden: [],
+            protected: longHits,
+            protectedDiff: diff,
+          });
+          expect(body.length + 30).toBeLessThanOrEqual(GITHUB_COMMENT_LIMIT);
+          expect(body).toContain("```diff\n+line 0\n");
+          expect(body).toContain("+line 1000");
+          expect(body).toContain("/49.md`");
+        });
+      });
+
       it("記録から内容を読めなければ、そのことを書く", () => {
         const body = heldComment(4, null);
         expect(body).toContain("記録から読めませんでした");
