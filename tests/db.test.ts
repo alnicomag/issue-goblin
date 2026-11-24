@@ -69,9 +69,9 @@ describe("マイグレーション", () => {
   it("空のDBに適用できる", () => {
     const result = migrate(db, { clock });
 
-    expect(result.applied).toEqual([1, 2, 3, 4, 5, 6]);
+    expect(result.applied).toEqual([1, 2, 3, 4, 5, 6, 7]);
     expect(tableNames(db)).toEqual(EXPECTED_TABLES);
-    expect(currentVersion(db)).toBe(6);
+    expect(currentVersion(db)).toBe(7);
   });
 
   it("実行中の実行とステップの重複を防ぐ索引がある", () => {
@@ -146,6 +146,31 @@ describe("マイグレーション", () => {
     expect(() => insert.run("unknown")).toThrow(/CHECK/);
   });
 
+  it("製品の Dockerfile の列と、確認の条件の列は、既定で NULL になる", () => {
+    migrate(db, { clock });
+    db.prepare("INSERT INTO repos (repo) VALUES ('owner/name')").run();
+    expect(
+      db
+        .prepare(
+          "SELECT worker_dockerfile, worker_dockerfile_sha, worker_dockerfile_path FROM repos",
+        )
+        .all(),
+    ).toEqual([
+      {
+        worker_dockerfile: null,
+        worker_dockerfile_sha: null,
+        worker_dockerfile_path: null,
+      },
+    ]);
+    db.prepare(
+      `INSERT INTO preflights (repo, status, image, factory_yml_sha, command, log_path, checked_at)
+       VALUES ('owner/name', 'passed', 'image', 'sha', 'example-setup', '/logs/a.log', '2026-01-01T00:00:00.000Z')`,
+    ).run();
+    expect(db.prepare("SELECT dockerfile_sha FROM preflights").all()).toEqual([
+      { dockerfile_sha: null },
+    ]);
+  });
+
   it("状態を持つテーブルはリポジトリの列を持つ", () => {
     migrate(db, { clock });
     for (const table of [
@@ -176,7 +201,7 @@ describe("マイグレーション", () => {
 
     expect(second).toEqual({ applied: [], backupPath: null });
     expect(schemaDump(db)).toEqual(before);
-    expect(currentVersion(db)).toBe(6);
+    expect(currentVersion(db)).toBe(7);
     expect(backups()).toEqual(backupsBefore);
   });
 

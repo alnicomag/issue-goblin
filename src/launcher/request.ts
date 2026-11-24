@@ -14,6 +14,9 @@ export const MAX_ARGV_BYTES = 128 * 1024;
 /** 1回の実行の、時間の上限の最大値。 */
 export const MAX_TIMEOUT_SEC = 4 * 60 * 60;
 
+/** 製品の Dockerfile の大きさの上限。 */
+export const MAX_DOCKERFILE_BYTES = 64 * 1024;
+
 /** 依頼で選べる、作業場所の種類。 */
 export const WORKSPACE_KINDS = ["issue", "preflight"] as const;
 export type WorkspaceKind = (typeof WORKSPACE_KINDS)[number];

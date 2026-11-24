@@ -1,12 +1,16 @@
 import { beforeEach, describe, expect, it } from "vitest";
+import { MAX_DOCKERFILE_BYTES } from "../src/launcher/request.ts";
 import { type Db, migrate, openDb } from "../src/office/db.ts";
-import { silentLogger } from "../src/office/log.ts";
+import { type Logger, silentLogger } from "../src/office/log.ts";
 import { checkPaths } from "../src/office/paths.ts";
 import {
   parseFactoryYml,
   pathRulesOf,
   readStoredFactoryYml,
+  readStoredWorkerDockerfile,
+  storedWorkerDockerfileSha,
   syncFactoryYml,
+  syncWorkerDockerfile,
   workerDockerfilePath,
 } from "../src/office/product.ts";
 import { FakeGitHub, VALID_FACTORY_YML } from "./fake-github.ts";
@@ -513,5 +517,175 @@ describe("保存済みの factory.yml の読み出し", () => {
     expect(() => readStoredFactoryYml(db, REPO)).toThrow(
       'paths.protected.1: パスのパターンを読めません: "docs/[a-z]*.md"(使えるのは *、?、** だけです)',
     );
+  });
+});
+
+describe("製品の Dockerfile の取得と保存", () => {
+  const DOCKERFILE_PATH = ".factory/worker.Dockerfile";
+  const WITH_DOCKERFILE = `${VALID_FACTORY_YML}worker:\n  dockerfile: ${DOCKERFILE_PATH}\n`;
+  const CONTENT = "ARG FACTORY_BASE_IMAGE\nFROM $FACTORY_BASE_IMAGE\n";
+
+  let db: Db;
+  let fake: FakeGitHub;
+  let logged: { level: string; event: string }[];
+  let logger: Logger;
+
+  beforeEach(() => {
+    db = openDb(":memory:");
+    migrate(db, { clock });
+    db.prepare("INSERT INTO repos (repo) VALUES (?)").run(REPO);
+    fake = new FakeGitHub();
+    logged = [];
+    const log = (level: string) => (event: string) => {
+      logged.push({ level, event });
+    };
+    logger = { info: log("info"), warn: log("warn"), error: log("error") };
+  });
+
+  const sync = async (factoryYml: string | null = WITH_DOCKERFILE) => {
+    fake.file =
+      factoryYml === null
+        ? null
+        : { sha: `yml-${factoryYml.length}`, content: factoryYml };
+    await syncFactoryYml({ db, api: fake, repo: REPO, clock, logger });
+    logged = [];
+    return syncWorkerDockerfile({ db, api: fake, repo: REPO, logger });
+  };
+  const stored = () =>
+    db
+      .prepare(
+        `SELECT worker_dockerfile AS content, worker_dockerfile_sha AS sha,
+                worker_dockerfile_path AS path FROM repos WHERE repo = ?`,
+      )
+      .get(REPO);
+  const fileCalls = () =>
+    fake.calls.filter(
+      (call) => call.method === "getFile" && call.path !== "factory.yml",
+    );
+
+  it("factory.yml に書かれていなければ、取得せず、Dockerfile なしとして扱う", async () => {
+    fake.files.set(DOCKERFILE_PATH, { sha: "d-1", content: CONTENT });
+    expect(await sync(VALID_FACTORY_YML)).toBe("none");
+    expect(fileCalls()).toEqual([]);
+    expect(stored()).toEqual({ content: null, sha: null, path: null });
+    expect(readStoredWorkerDockerfile(db, REPO)).toBeNull();
+    expect(storedWorkerDockerfileSha(db, REPO)).toBeNull();
+  });
+
+  it("既定ブランチの内容を取得して保存し、変わらなければ保存し直さない", async () => {
+    fake.files.set(DOCKERFILE_PATH, { sha: "d-1", content: CONTENT });
+    expect(await sync()).toBe("updated");
+    expect(stored()).toEqual({
+      content: CONTENT,
+      sha: "d-1",
+      path: DOCKERFILE_PATH,
+    });
+    expect(readStoredWorkerDockerfile(db, REPO)).toEqual({
+      path: DOCKERFILE_PATH,
+      sha: "d-1",
+      content: CONTENT,
+    });
+    expect(storedWorkerDockerfileSha(db, REPO)).toBe("d-1");
+    expect(logged).toEqual([
+      { level: "info", event: "product.dockerfile_updated" },
+    ]);
+
+    // 2回目は、知っている sha を渡し、何も変えない。
+    expect(await sync()).toBe("unchanged");
+    expect(fileCalls().at(-1)).toMatchObject({
+      path: DOCKERFILE_PATH,
+      knownSha: "d-1",
+    });
+    expect(logged).toEqual([]);
+
+    fake.files.set(DOCKERFILE_PATH, { sha: "d-2", content: `${CONTENT}#\n` });
+    expect(await sync()).toBe("updated");
+    expect(storedWorkerDockerfileSha(db, REPO)).toBe("d-2");
+  });
+
+  it("ファイルがなければ、本文を消し、使おうとすると原因の分かるメッセージで失敗する", async () => {
+    fake.files.set(DOCKERFILE_PATH, { sha: "d-1", content: CONTENT });
+    await sync();
+    fake.files.delete(DOCKERFILE_PATH);
+
+    expect(await sync()).toBe("missing");
+    expect(stored()).toEqual({
+      content: null,
+      sha: null,
+      path: DOCKERFILE_PATH,
+    });
+    expect(logged).toEqual([
+      { level: "warn", event: "product.dockerfile_missing" },
+    ]);
+    expect(storedWorkerDockerfileSha(db, REPO)).toBeNull();
+    expect(() => readStoredWorkerDockerfile(db, REPO)).toThrow(
+      `worker.dockerfile: ${DOCKERFILE_PATH})を使えません`,
+    );
+
+    // 同じ状態が続いている間は、ログを重ねない。
+    expect(await sync()).toBe("missing");
+    expect(logged).toEqual([]);
+  });
+
+  it("大きすぎるファイルは保存しない", async () => {
+    fake.files.set(DOCKERFILE_PATH, {
+      sha: "d-big",
+      content: "#".repeat(MAX_DOCKERFILE_BYTES + 1),
+    });
+    expect(await sync()).toBe("too_large");
+    expect(stored()).toEqual({
+      content: null,
+      sha: "d-big",
+      path: DOCKERFILE_PATH,
+    });
+    expect(logged).toEqual([
+      { level: "warn", event: "product.dockerfile_too_large" },
+    ]);
+    expect(storedWorkerDockerfileSha(db, REPO)).toBeNull();
+    expect(() => readStoredWorkerDockerfile(db, REPO)).toThrow("を使えません");
+    // 同じ内容のままなら、取得し直さない。
+    expect(await sync()).toBe("unchanged");
+  });
+
+  it("factory.yml のパスが変わったら、前の本文を使わず、新しい場所から取得し直す", async () => {
+    fake.files.set(DOCKERFILE_PATH, { sha: "d-1", content: CONTENT });
+    await sync();
+    const moved = WITH_DOCKERFILE.replace(DOCKERFILE_PATH, "other/Dockerfile");
+
+    // 新しい場所にファイルがない間は、前の本文を使わない。
+    expect(await sync(moved)).toBe("missing");
+    expect(fileCalls().at(-1)).toMatchObject({
+      path: "other/Dockerfile",
+      knownSha: null,
+    });
+    expect(() => readStoredWorkerDockerfile(db, REPO)).toThrow("を使えません");
+
+    fake.files.set("other/Dockerfile", { sha: "d-1", content: CONTENT });
+    expect(await sync(moved)).toBe("updated");
+    expect(readStoredWorkerDockerfile(db, REPO)?.path).toBe("other/Dockerfile");
+  });
+
+  it("factory.yml から消えたら、保存してあるものも消す", async () => {
+    fake.files.set(DOCKERFILE_PATH, { sha: "d-1", content: CONTENT });
+    await sync();
+    expect(await sync(VALID_FACTORY_YML)).toBe("none");
+    expect(stored()).toEqual({ content: null, sha: null, path: null });
+    expect(logged).toEqual([
+      { level: "info", event: "product.dockerfile_removed" },
+    ]);
+    // factory.yml が不正になった場合も、同じ。
+    await sync();
+    expect(await sync("version: 2\n")).toBe("none");
+    expect(storedWorkerDockerfileSha(db, REPO)).toBeNull();
+  });
+
+  it("取得に失敗したら、保存してあるものを変えずに、失敗を伝える", async () => {
+    fake.files.set(DOCKERFILE_PATH, { sha: "d-1", content: CONTENT });
+    await sync();
+    fake.failWith = new Error("network down");
+    await expect(
+      syncWorkerDockerfile({ db, api: fake, repo: REPO, logger }),
+    ).rejects.toThrow("network down");
+    expect(storedWorkerDockerfileSha(db, REPO)).toBe("d-1");
   });
 });
