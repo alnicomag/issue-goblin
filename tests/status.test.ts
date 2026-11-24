@@ -5,13 +5,19 @@ import Database from "better-sqlite3";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { Clock } from "../src/office/clock.ts";
 import { type Db, migrate, openDb } from "../src/office/db.ts";
+import {
+  type PreflightRecord,
+  savePreflight,
+} from "../src/office/preflight.ts";
 import type { StepName, StepOutcome } from "../src/office/run-steps.ts";
 import { finishStep, startRun, startStep } from "../src/office/runs.ts";
 import {
   collectRunStatus,
   collectStatus,
   formatStatus,
+  preflightLines,
   type RunStatus,
+  STATUS_TAIL_LINES,
 } from "../src/office/status.ts";
 
 const clock = { now: () => new Date("2026-03-01T01:00:00.000Z") };
@@ -69,6 +75,7 @@ describe("状況表示", () => {
       },
       unhandledEvents: 2,
       lastPolledAt: "2026-03-01T00:59:00.000Z",
+      preflight: null,
     });
   });
 
@@ -91,6 +98,107 @@ describe("状況表示", () => {
     expect(text).toContain("未処理のイベント: 2");
     expect(text).toMatch(/triage\s+2/);
     expect(text).toContain("最終同期: 未同期");
+  });
+
+  describe("着手前の確認", () => {
+    const failed: PreflightRecord = {
+      repo: "owner/name",
+      status: "failed",
+      image: "example-image",
+      factoryYmlSha: "sha-1",
+      command: "example-setup",
+      exitCode: 127,
+      timedOut: false,
+      outputTail: "installing\nsh: 1: example-tool: not found",
+      logPath: "/data/logs/owner/name/preflight/a.log",
+      checkedAt: "2026-03-01T00:30:00.000Z",
+    };
+    const textOf = () =>
+      formatStatus(collectStatus(db, ["owner/name", "owner/new"]), NO_RUNS);
+
+    it("まだ確かめていない製品は、未確認と出る", () => {
+      expect(collectStatus(db, ["owner/name"])[0]?.preflight).toBeNull();
+      expect(textOf()).toContain("着手前の確認: 未確認");
+    });
+
+    it("通った製品は、時刻とイメージが出る", () => {
+      savePreflight(db, {
+        ...failed,
+        status: "passed",
+        exitCode: 0,
+        outputTail: "",
+      });
+      expect(textOf()).toContain(
+        "着手前の確認: 通過(2026-03-01T00:30:00.000Z、イメージ example-image)",
+      );
+      expect(textOf()).not.toContain("コマンド:");
+    });
+
+    it("通らなかった製品は、コマンド、終了コード、出力の末尾、ログの場所、確かめ直す条件が出る", () => {
+      savePreflight(db, failed);
+      const status = collectStatus(db, ["owner/name"])[0];
+      expect(status?.preflight).toEqual(failed);
+
+      const lines = textOf().split("\n");
+      const start = lines.indexOf(
+        "  着手前の確認: 失敗(2026-03-01T00:30:00.000Z)。この製品には着手しません",
+      );
+      expect(start).toBeGreaterThan(0);
+      expect(lines.slice(start + 1, start + 10)).toEqual([
+        "    コマンド: example-setup",
+        "    終了コード: 127",
+        "    イメージ: example-image",
+        "    factory.yml: sha-1",
+        "    ログ: /data/logs/owner/name/preflight/a.log",
+        "    確かめ直し: イメージの名前か factory.yml が変わったとき、または 2026-03-01T01:30:00.000Z 以降",
+        "    出力の末尾:",
+        "      | installing",
+        "      | sh: 1: example-tool: not found",
+      ]);
+      // ほかの製品の表示には混ざらない。
+      expect(textOf().match(/着手前の確認: 失敗/g)).toHaveLength(1);
+    });
+
+    it("時間切れ、シグナルでの終了、出力なしも、読める形で出る", () => {
+      expect(
+        preflightLines({ ...failed, exitCode: null, timedOut: true }),
+      ).toContain("    終了コード: 時間切れ(時間の上限で止めました)");
+      expect(
+        preflightLines({ ...failed, exitCode: null, outputTail: "" }),
+      ).toEqual(
+        expect.arrayContaining([
+          "    終了コード: なし(シグナルで終わりました)",
+          "    出力の末尾: (出力なし)",
+        ]),
+      );
+    });
+
+    it("出力の末尾が長いときは、最後の行だけを出し、全体がログにあることを書く", () => {
+      const outputTail = Array.from(
+        { length: STATUS_TAIL_LINES + 5 },
+        (_, index) => `line ${index + 1}`,
+      ).join("\n");
+      const lines = preflightLines({ ...failed, outputTail });
+      expect(lines).toContain(
+        `    出力の末尾(最後の ${STATUS_TAIL_LINES} 行。全体はログにあります):`,
+      );
+      expect(lines).not.toContain("      | line 5");
+      expect(lines).toContain("      | line 6");
+      expect(lines.at(-1)).toBe(`      | line ${STATUS_TAIL_LINES + 5}`);
+    });
+
+    it("トークンに見える文字列は、記録のときに伏せられていて、表示に出ない", () => {
+      const secret = "sk-ant-dummy_value-123";
+      savePreflight(db, { ...failed, outputTail: `token ${secret}` });
+      expect(textOf()).toContain("| token sk-ant-***");
+      expect(textOf()).not.toContain(secret);
+    });
+
+    it("確認の記録の置き場所がまだないDB(マイグレーションの前)でも、表示できる", () => {
+      db.exec("DROP TABLE preflights");
+      expect(collectStatus(db, ["owner/name"])[0]?.preflight).toBeNull();
+      expect(textOf()).toContain("着手前の確認: 未確認");
+    });
   });
 });
 
