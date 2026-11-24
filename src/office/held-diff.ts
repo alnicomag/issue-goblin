@@ -105,10 +105,21 @@ function longestBacktickRun(text: string): number {
   return longest;
 }
 
+/** 囲みのバッククォートの、最短の数。 */
+const MIN_FENCE = 3;
+
 /** コードブロックの囲み。中のどの連続よりも長くして、中から閉じられないようにする。 */
 function fenceFor(text: string): string {
-  return "`".repeat(Math.max(3, longestBacktickRun(text) + 1));
+  return "`".repeat(Math.max(MIN_FENCE, longestBacktickRun(text) + 1));
 }
+
+/** コードブロックのうち、差分のほかの部分の長さ(囲みの行2つ、言語の指定、改行)。 */
+function blockOverhead(fenceLength: number): number {
+  return 2 * fenceLength + "diff".length + 2;
+}
+
+/** 断り書きのために取っておく長さ。断り書きは、最大で3行、合わせて300文字ほどになる。 */
+const NOTES_ROOM = 400;
 
 const WORKSPACE_NOTE = "ファクトリーの作業場所で確かめてください";
 
@@ -141,13 +152,18 @@ export function diffSection(diff: ProtectedDiff, budget: number): string[] {
   } else if (diff.totalChars === 0) {
     lines.push("(差分は空でした)");
   } else {
-    // 断り書きと囲みの行の分を、先に取っておく。
-    const room = Math.min(HELD_DIFF_LIMIT, budget - 400);
+    // コードブロック(囲みの行2つと差分)に使える長さ。断り書きの分を、先に取っておく。
+    const room = budget - NOTES_ROOM;
     const clean = sanitizeDiff(diff.text);
-    let shown = cut(clean, room);
-    if (shown.length + 2 * fenceFor(shown).length > room) {
-      // 囲みが長くなる書き方(バッククォートの長い連続)でも、3分の1まで切れば必ず収まる。
-      shown = cut(clean, Math.floor((room - 2) / 3));
+    // 差分の上限と、コードブロックに使える長さは、別に見る。最短の囲みの分は、先に引いておく。
+    let shown = cut(
+      clean,
+      Math.min(HELD_DIFF_LIMIT, room - blockOverhead(MIN_FENCE)),
+    );
+    if (shown.length + blockOverhead(fenceFor(shown).length) > room) {
+      // 囲みが長くなる書き方(バッククォートの長い連続)のときだけ、ここに来る。囲みは、
+      // 差分より1文字長いのが最長なので、3分の1まで切れば、必ず収まる。
+      shown = cut(clean, Math.floor((room - blockOverhead(1)) / 3));
     }
     const fence = fenceFor(shown);
     lines.push(`${fence}diff`, shown, fence);
