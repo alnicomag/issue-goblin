@@ -143,7 +143,9 @@ export class FakeLauncher implements WorkerLauncher {
       exit_code: 0,
       timed_out: false,
       stdout:
-        request.argv[0] === "git" ? `## ${branchFor(request.issue)}\0` : "",
+        request.argv[0] === "git" && request.issue !== undefined
+          ? `## ${branchFor(request.issue)}\0`
+          : "",
       stderr: "",
       truncated: false,
       ...next,

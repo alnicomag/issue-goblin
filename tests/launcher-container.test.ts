@@ -3,6 +3,7 @@ import {
   buildRunArgs,
   type ContainerSettings,
   issueDirFor,
+  preflightDirFor,
   workerEnv,
 } from "../src/launcher/container.ts";
 import {
@@ -26,6 +27,7 @@ const SETTINGS: ContainerSettings = {
 
 const REQUEST: RunRequest = {
   repo: "owner/name",
+  workspace: "issue",
   issue: 12,
   argv: ["sh", "-c", "echo hello"],
   stdin: "",
@@ -45,6 +47,7 @@ describe("起動係への依頼の検査", () => {
       ok: true,
       value: {
         repo: "owner/name",
+        workspace: "issue",
         issue: 12,
         argv: ["true"],
         stdin: "",
@@ -52,6 +55,35 @@ describe("起動係への依頼の検査", () => {
         timeout_sec: 60,
       },
     });
+  });
+
+  it("着手前の確認の作業場所は、イシュー番号なしで頼む", () => {
+    const { issue: _issue, ...base } = REQUEST;
+    const result = parseRunRequest({ ...base, workspace: "preflight" });
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.workspace).toBe("preflight");
+      expect(result.value.issue).toBeUndefined();
+    }
+  });
+
+  it("作業場所の種類とイシュー番号が合わない依頼、決まっていない種類の依頼は拒否する", () => {
+    const { issue: _issue, ...base } = REQUEST;
+    const cases: unknown[] = [
+      // イシューの作業場所なのに、番号がない。
+      base,
+      { ...base, workspace: "issue" },
+      // 着手前の確認の作業場所なのに、番号がある。
+      { ...REQUEST, workspace: "preflight" },
+      // 決まっていない種類。パスとしても読めない。
+      { ...base, workspace: "other" },
+      { ...base, workspace: "../other" },
+      { ...base, workspace: "/" },
+    ];
+    for (const raw of cases) {
+      const result = parseRunRequest(raw);
+      expect(result.ok, JSON.stringify(raw)).toBe(false);
+    }
   });
 
   it("決まっていない項目のある依頼は拒否する", () => {
@@ -115,6 +147,12 @@ describe("作業場所のパス", () => {
     expect(dirs.size).toBe(3);
   });
 
+  it("着手前の確認の作業場所は、リポジトリごとに1つで、イシューの作業場所と重ならない", () => {
+    expect(preflightDirFor("owner/name")).toBe("owner/name/preflight");
+    expect(preflightDirFor("owner/other")).toBe("owner/other/preflight");
+    expect(preflightDirFor("owner/name")).not.toMatch(/issue-\d+$/);
+  });
+
   it("置き場所の外に出る名前は拒否する", () => {
     for (const repo of [
       "../name",
@@ -131,6 +169,7 @@ describe("作業場所のパス", () => {
       "",
     ]) {
       expect(() => issueDirFor(repo, 1), repo).toThrow();
+      expect(() => preflightDirFor(repo), repo).toThrow();
     }
     for (const issue of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
       expect(() => issueDirFor("owner/name", issue), String(issue)).toThrow();
@@ -157,6 +196,42 @@ describe("ワーカーのコンテナの引数", () => {
     expect(mounts).toEqual([
       "--mount=type=volume,src=factory-work,dst=/workspace,volume-subpath=owner/name/issue-12",
     ]);
+  });
+
+  it("着手前の確認の依頼で変わるのは、マウントする場所だけである", () => {
+    const { issue: _issue, ...base } = REQUEST;
+    const preflight = buildRunArgs({
+      request: { ...base, workspace: "preflight" },
+      repo: "owner/name",
+      image: "factory-worker",
+      containerName: "factory-worker-abc123",
+      settings: SETTINGS,
+    });
+    // ネットワーク、権限、環境変数、作業ディレクトリは、イシューの作業場所のときと同じ。
+    expect(preflight).toEqual(
+      args.map((arg) =>
+        arg.replace(
+          "volume-subpath=owner/name/issue-12",
+          "volume-subpath=owner/name/preflight",
+        ),
+      ),
+    );
+    expect(preflight).toContain(
+      "--mount=type=volume,src=factory-work,dst=/workspace,volume-subpath=owner/name/preflight",
+    );
+  });
+
+  it("イシュー番号のない、イシューの作業場所の依頼からは、引数を作らない", () => {
+    const { issue: _issue, ...base } = REQUEST;
+    expect(() =>
+      buildRunArgs({
+        request: base,
+        repo: "owner/name",
+        image: "factory-worker",
+        containerName: "factory-worker-abc123",
+        settings: SETTINGS,
+      }),
+    ).toThrow(/イシュー番号/);
   });
 
   it("権限を落とし、資源の上限を付け、外への経路がないネットワークにつなぐ", () => {

@@ -6,6 +6,7 @@
  * | `<repos_dir>/<owner>/<name>.git` | 事務局専用のミラー | 事務局だけ |
  * | `<work_dir>/<owner>/<name>/issue-<番号>/repo` | イシューごとのclone | 事務局と、そのイシューのワーカー |
  * | `<work_dir>/<owner>/<name>/issue-<番号>/home` | ワーカーのHOME | 同上 |
+ * | `<work_dir>/<owner>/<name>/preflight/` | 着手前の確認の作業場所(`repo` と `home`) | 事務局と、確認のコンテナ |
  *
  * 作業場所は、ワーカーが中身を書き換えられる。事務局がそこでgitを実行するのは、
  * ワーカーが触る前(作るとき)と、ブランチの有無を読むときだけにする。
@@ -15,7 +16,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { issueDirFor } from "../launcher/container.ts";
+import { issueDirFor, preflightDirFor } from "../launcher/container.ts";
 import { isInsideDir } from "./config.ts";
 import type { Git, GitAuth } from "./git.ts";
 
@@ -95,6 +96,30 @@ export function workspacePaths(
   repo: string,
   issue: number,
 ): WorkspacePaths {
+  return pathsAt(dirs, issueDirFor(repo, issue), branchFor(issue));
+}
+
+/** 着手前の確認の作業場所で取り出しておくブランチの名前。作業用のブランチとは重ならない。 */
+export const PREFLIGHT_BRANCH = "factory/preflight";
+
+/**
+ * 着手前の確認の作業場所のパスを組み立てる純粋関数。製品ごとに1つで、イシューの作業場所とは別。
+ * `issueDir` が、コンテナにマウントされる場所になる。相対パスは、起動係がマウントするときと
+ * 同じ関数(`preflightDirFor`)で決める。
+ */
+export function preflightWorkspacePaths(
+  dirs: WorkspaceDirs,
+  repo: string,
+): WorkspacePaths {
+  return pathsAt(dirs, preflightDirFor(repo), PREFLIGHT_BRANCH);
+}
+
+/** 置き場所の中の相対パス `relative`(`<owner>/<name>/<名前>`)から、パスを組み立てる。 */
+function pathsAt(
+  dirs: WorkspaceDirs,
+  relative: string,
+  branch: string,
+): WorkspacePaths {
   if (!path.isAbsolute(dirs.reposDir) || !path.isAbsolute(dirs.workDir)) {
     throw new Error("置き場所は絶対パスで指定してください");
   }
@@ -106,7 +131,6 @@ export function workspacePaths(
     );
   }
 
-  const relative = issueDirFor(repo, issue);
   const issueDir = path.resolve(workDir, relative);
   const mirrorDir = path.resolve(
     reposDir,
@@ -121,7 +145,7 @@ export function workspacePaths(
     issueDir,
     repoDir: path.join(issueDir, "repo"),
     homeDir: path.join(issueDir, "home"),
-    branch: branchFor(issue),
+    branch,
   };
 }
 
@@ -212,6 +236,63 @@ export async function hasBranch(
 }
 
 /**
+ * 既定ブランチの最新から、ブランチ `paths.branch` を取り出したcloneを、`paths.repoDir` に作る。
+ *
+ * cloneは隣の名前で作り、できあがってから `repo` に改名する。作りかけが残っていれば、消して作り直す。
+ */
+async function createClone(
+  git: Git,
+  paths: WorkspacePaths,
+  source: RepoSource,
+  author: WorkspaceAuthor,
+): Promise<void> {
+  const defaultBranch = await updateMirror(git, paths.mirrorDir, source);
+  const partial = path.join(paths.issueDir, PARTIAL_REPO);
+  fs.mkdirSync(paths.issueDir, { recursive: true });
+  fs.rmSync(partial, { recursive: true, force: true });
+
+  // clone ではなく init と fetch で作る。リモートの設定が残らず、
+  // ミラーのオブジェクトとファイルを共有(ハードリンク)することもない。
+  await git.run([
+    "init",
+    "--quiet",
+    `--initial-branch=${paths.branch}`,
+    "--",
+    partial,
+  ]);
+  await git.run(
+    [
+      // reflogには取得元(ミラーのパス)が書かれるので、この取得では記録しない。
+      "-c",
+      "core.logAllRefUpdates=false",
+      "fetch",
+      "--quiet",
+      "--no-tags",
+      "--",
+      paths.mirrorDir,
+      `+refs/remotes/origin/${defaultBranch}:refs/heads/${defaultBranch}`,
+      "+refs/tags/*:refs/tags/*",
+    ],
+    { cwd: partial },
+  );
+  // 作業用のブランチを、既定ブランチの先頭に作って取り出す。
+  await git.run(["reset", "--quiet", "--hard", `refs/heads/${defaultBranch}`], {
+    cwd: partial,
+  });
+  // 取得元(ミラーのパス)の記録を残さない。
+  fs.rmSync(path.join(partial, ".git", "FETCH_HEAD"), { force: true });
+  // ワーカーが設定を足さずにコミットできるように、作者を入れておく。
+  for (const [key, value] of [
+    ["user.name", author.name],
+    ["user.email", author.email],
+  ] as const) {
+    await git.run(["config", "--local", "--", key, value], { cwd: partial });
+  }
+
+  fs.renameSync(partial, paths.repoDir);
+}
+
+/**
  * イシューの作業場所を用意する。
  *
  * 既定ブランチの最新から、ブランチ `agent/issue-<番号>` を持つcloneを作る。
@@ -256,57 +337,7 @@ export async function prepareWorkspace(
       );
     }
   } else {
-    const defaultBranch = await updateMirror(
-      git,
-      paths.mirrorDir,
-      input.source,
-    );
-    const partial = path.join(paths.issueDir, PARTIAL_REPO);
-    fs.mkdirSync(paths.issueDir, { recursive: true });
-    fs.rmSync(partial, { recursive: true, force: true });
-
-    // clone ではなく init と fetch で作る。リモートの設定が残らず、
-    // ミラーのオブジェクトとファイルを共有(ハードリンク)することもない。
-    await git.run([
-      "init",
-      "--quiet",
-      `--initial-branch=${paths.branch}`,
-      "--",
-      partial,
-    ]);
-    await git.run(
-      [
-        // reflogには取得元(ミラーのパス)が書かれるので、この取得では記録しない。
-        "-c",
-        "core.logAllRefUpdates=false",
-        "fetch",
-        "--quiet",
-        "--no-tags",
-        "--",
-        paths.mirrorDir,
-        `+refs/remotes/origin/${defaultBranch}:refs/heads/${defaultBranch}`,
-        "+refs/tags/*:refs/tags/*",
-      ],
-      { cwd: partial },
-    );
-    // 作業用のブランチを、既定ブランチの先頭に作って取り出す。
-    await git.run(
-      ["reset", "--quiet", "--hard", `refs/heads/${defaultBranch}`],
-      {
-        cwd: partial,
-      },
-    );
-    // 取得元(ミラーのパス)の記録を残さない。
-    fs.rmSync(path.join(partial, ".git", "FETCH_HEAD"), { force: true });
-    // ワーカーが設定を足さずにコミットできるように、作者を入れておく。
-    for (const [key, value] of [
-      ["user.name", input.author.name],
-      ["user.email", input.author.email],
-    ] as const) {
-      await git.run(["config", "--local", "--", key, value], { cwd: partial });
-    }
-
-    fs.renameSync(partial, paths.repoDir);
+    await createClone(git, paths, input.source, input.author);
     created = true;
   }
 
@@ -319,6 +350,38 @@ export async function prepareWorkspace(
   if (home === "missing") fs.mkdirSync(paths.homeDir);
 
   return { ...paths, created };
+}
+
+/**
+ * 着手前の確認の作業場所を、既定ブランチの最新から作り直す。
+ *
+ * 前の確認の残り(`setup` が作ったものを含む)があれば、消してから作る。確認は毎回、
+ * 何も入っていない場所から始まる。消すときは、シンボリックリンクをたどらない。
+ */
+export async function preparePreflightWorkspace(
+  deps: { git: Git },
+  input: {
+    dirs: WorkspaceDirs;
+    repo: string;
+    source: RepoSource;
+    author: WorkspaceAuthor;
+  },
+): Promise<WorkspacePaths> {
+  const paths = preflightWorkspacePaths(input.dirs, input.repo);
+  fs.rmSync(paths.issueDir, { recursive: true, force: true });
+  await createClone(deps.git, paths, input.source, input.author);
+  fs.mkdirSync(paths.homeDir);
+  return paths;
+}
+
+/** 着手前の確認の作業場所を消す。すでになくても失敗しない。gitは実行しない。 */
+export function cleanupPreflightWorkspace(input: {
+  dirs: WorkspaceDirs;
+  repo: string;
+}): { dir: string } {
+  const { issueDir } = preflightWorkspacePaths(input.dirs, input.repo);
+  fs.rmSync(issueDir, { recursive: true, force: true });
+  return { dir: issueDir };
 }
 
 /**

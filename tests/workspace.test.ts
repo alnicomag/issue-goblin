@@ -6,9 +6,12 @@ import { parseConfig } from "../src/office/config.ts";
 import { createGit, type Git, type GitRunOptions } from "../src/office/git.ts";
 import {
   branchFor,
+  cleanupPreflightWorkspace,
   cleanupWorkspace,
   githubSourceUrl,
   listWorkspaceIssues,
+  preflightWorkspacePaths,
+  preparePreflightWorkspace,
   prepareWorkspace,
   type WorkspaceDirs,
   workspacePaths,
@@ -81,6 +84,92 @@ describe("作業場所", () => {
   });
   afterEach(() => {
     fs.rmSync(tmp, { recursive: true, force: true });
+  });
+
+  describe("着手前の確認の作業場所", () => {
+    const preparePreflight = () =>
+      preparePreflightWorkspace(
+        { git },
+        { dirs, repo: REPO, source: { url: source }, author: AUTHOR },
+      );
+
+    it("既定ブランチの最新を取り出した場所を、製品ごとの決まった場所に作る", async () => {
+      const tip = commitFile(source, "latest.txt", "latest\n");
+
+      const workspace = await preparePreflight();
+
+      const dir = path.join(dirs.workDir, "owner", "name", "preflight");
+      expect(workspace).toEqual({
+        mirrorDir: path.join(dirs.reposDir, "owner", "name.git"),
+        issueDir: dir,
+        repoDir: path.join(dir, "repo"),
+        homeDir: path.join(dir, "home"),
+        branch: "factory/preflight",
+      });
+      expect(workspace).toEqual(preflightWorkspacePaths(dirs, REPO));
+      expect(plainGit(workspace.repoDir, "rev-parse", "HEAD")).toBe(tip);
+      expect(fs.statSync(workspace.homeDir).isDirectory()).toBe(true);
+    });
+
+    it("前の確認の残りを消して、最新から作り直す", async () => {
+      const first = await preparePreflight();
+      fs.writeFileSync(path.join(first.repoDir, "leftover.txt"), "x\n");
+      fs.writeFileSync(path.join(first.homeDir, "cache"), "x\n");
+      const tip = commitFile(source, "newer.txt", "newer\n");
+
+      const second = await preparePreflight();
+
+      expect(plainGit(second.repoDir, "rev-parse", "HEAD")).toBe(tip);
+      expect(fs.existsSync(path.join(second.repoDir, "leftover.txt"))).toBe(
+        false,
+      );
+      expect(fs.readdirSync(second.homeDir)).toEqual([]);
+    });
+
+    it("イシューの作業場所には触れず、作業場所のあるイシューにも数えられない", async () => {
+      const issue = await prepare(7);
+      fs.writeFileSync(path.join(issue.repoDir, "work.txt"), "work\n");
+
+      await preparePreflight();
+      expect(listWorkspaceIssues(dirs, REPO)).toEqual([7]);
+      cleanupPreflightWorkspace({ dirs, repo: REPO });
+
+      expect(fs.existsSync(preflightWorkspacePaths(dirs, REPO).issueDir)).toBe(
+        false,
+      );
+      expect(fs.existsSync(path.join(issue.repoDir, "work.txt"))).toBe(true);
+      // すでになくても失敗しない。
+      cleanupPreflightWorkspace({ dirs, repo: REPO });
+    });
+
+    it("残りがリンクでも、たどらずに消す", async () => {
+      const outside = path.join(tmp, "outside");
+      fs.mkdirSync(outside);
+      fs.writeFileSync(path.join(outside, "keep.txt"), "keep\n");
+      const { issueDir } = preflightWorkspacePaths(dirs, REPO);
+      fs.mkdirSync(path.dirname(issueDir), { recursive: true });
+      fs.symlinkSync(outside, issueDir);
+
+      const workspace = await preparePreflight();
+
+      expect(fs.lstatSync(workspace.issueDir).isSymbolicLink()).toBe(false);
+      expect(fs.readFileSync(path.join(outside, "keep.txt"), "utf8")).toBe(
+        "keep\n",
+      );
+    });
+
+    it("置き場所の外に出る名前は、何も作らず、何も消さずに失敗する", async () => {
+      await expect(
+        preparePreflightWorkspace(
+          { git },
+          { dirs, repo: "owner/..", source: { url: source }, author: AUTHOR },
+        ),
+      ).rejects.toThrow("リポジトリ名");
+      expect(() => cleanupPreflightWorkspace({ dirs, repo: "../.." })).toThrow(
+        "リポジトリ名",
+      );
+      expect(fs.existsSync(dirs.workDir)).toBe(false);
+    });
   });
 
   describe("prepare", () => {
