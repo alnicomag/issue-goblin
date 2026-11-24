@@ -1392,6 +1392,106 @@ describe("実行の管理", () => {
       expect(h.launcher.requests).toEqual([]);
     });
 
+    describe("着手の見送りのログ", () => {
+      const held = () =>
+        logged("intake.held").map((line) => ({
+          repo: line.fields.repo,
+          issue: line.fields.issue,
+          reason: line.fields.reason,
+        }));
+
+      beforeEach(() => {
+        h.dryRun = true;
+        supervisor = h.newSupervisor();
+      });
+
+      it("着手の条件を満たすイシューがあると、見送ったことと対象がログに出る。書き込みも、実行の記録もしない", async () => {
+        h.putIssue(1, { labels: ["state:ready", "priority:p1"] });
+        await tick();
+        expect(logged("intake.held")).toMatchObject([
+          {
+            fields: {
+              repo: REPO,
+              issue: 1,
+              priority: "p1",
+              reason: "dry_run",
+            },
+          },
+        ]);
+        expect(h.fake.writes).toEqual([]);
+        expect(runs()).toEqual([]);
+        expect(h.worker.calls).toEqual([]);
+        expect(h.launcher.requests).toEqual([]);
+      });
+
+      it("対象が変わらない間は、同じ行を出し続けない", async () => {
+        h.putIssue(1);
+        for (let i = 0; i < 4; i += 1) await tick();
+        expect(held()).toEqual([{ repo: REPO, issue: 1, reason: "dry_run" }]);
+        expect(runs()).toEqual([]);
+      });
+
+      it("対象が増えたら、増えた分だけを出す", async () => {
+        setFactoryYml(["max_parallel: 1", "max_parallel: 2"]);
+        h.putIssue(1);
+        await tick();
+        h.putIssue(2);
+        await tick();
+        await tick();
+        expect(held().map((line) => line.issue)).toEqual([1, 2]);
+      });
+
+      it("出すのは、その回に着手するはずだった分だけ(枠に収まらない分は出さない)", async () => {
+        h.putIssue(1);
+        h.putIssue(2, { labels: ["state:ready", "priority:p0"] });
+        await tick();
+        await tick();
+        expect(held().map((line) => line.issue)).toEqual([2]);
+      });
+
+      it("対象から外れた後で、もう一度条件を満たしたら、もう一度出す", async () => {
+        h.putIssue(1);
+        await tick();
+        h.putIssue(1, { labels: ["state:ready", "agent:skip"] });
+        await tick();
+        expect(held()).toHaveLength(1);
+        h.putIssue(1, { labels: ["state:ready"] });
+        await tick();
+        await tick();
+        expect(held().map((line) => line.issue)).toEqual([1, 1]);
+      });
+
+      it("同期できなかったリポジトリの分は、次に同期できたときに出し直さない", async () => {
+        h.putIssue(1);
+        await tick();
+        // 同期に失敗した回は、そのリポジトリを渡さずに呼ばれる。
+        await supervisor.tick([]);
+        await tick();
+        expect(held()).toHaveLength(1);
+      });
+
+      it("着手の条件を満たすイシューがないときは、出ない", async () => {
+        await tick();
+        h.putIssue(1, { labels: ["state:triage"] });
+        h.putIssue(2, { labels: ["state:ready", "agent:skip"] });
+        h.putIssue(3, { author: "stranger" });
+        await tick();
+        await tick();
+        expect(held()).toEqual([]);
+        expect(h.fake.writes).toEqual([]);
+        expect(runs()).toEqual([]);
+      });
+
+      it("dry_run でないときは、出ない", async () => {
+        h.dryRun = false;
+        supervisor = h.newSupervisor();
+        h.putIssue(1);
+        await tick();
+        expect(runs()).toHaveLength(1);
+        expect(held()).toEqual([]);
+      });
+    });
+
     it("途中の実行があっても、dry_run の間は進めず、書き込まない", async () => {
       // dry_run でない間に、質問で終わった実行と、途中の実行を作っておく。
       setFactoryYml(["max_parallel: 1", "max_parallel: 2"]);

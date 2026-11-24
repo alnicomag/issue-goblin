@@ -12,12 +12,18 @@
  * ラベルを書けないと、GitHubから見えないところで作業が進むことになるからである。
  * 人間が状態を変えた実行の取り消しと、試行回数のリセットは、DBだけの操作なので行う。
  * 作業場所の後片付けは、実行の cleanup と同じく、`dry_run` の間は行わない。
+ * 着手するはずだったイシューは、ログに出す(`intake.held`)。同じイシューを、毎回は出さない。
  */
 import { z } from "zod";
 import { isoNow } from "./clock.ts";
 import { addIssueComment, removeLabel } from "./github.ts";
 import { diffSection, ProtectedDiffSchema } from "./held-diff.ts";
-import { type IntakeIssue, type IntakeRepo, planIntake } from "./intake.ts";
+import {
+  type IntakeIssue,
+  type IntakePlan,
+  type IntakeRepo,
+  planIntake,
+} from "./intake.ts";
 import type { RepoLocks } from "./locks.ts";
 import { errorFields } from "./log.ts";
 import { inlineCode, pathHitLines } from "./path-list.ts";
@@ -211,6 +217,11 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     { controller: AbortController; done: Promise<void> }
   >();
   let stopping = false;
+  /**
+   * `dry_run` のために着手を見送ったことを、すでにログに出したイシュー(リポジトリごとの番号)。
+   * 同じ行を、ポーリングのたびに出さないために持つ。起動し直すと空になり、1回だけ出し直す。
+   */
+  const heldAnnounced = new Map<string, Set<number>>();
 
   const transitionDeps = (repo: string): TransitionDeps => ({
     db,
@@ -629,13 +640,13 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
   }
 
   /**
-   * `ready` のイシューから、着手するものを決めて、着手する。
-   * `unswept` にあるイシュー(作業場所を片付けられなかったもの)には、着手しない。
+   * `ready` のイシューから、着手するものを決める。記録もGitHubも変えない。
+   * `unswept` にあるイシュー(作業場所を片付けられなかったもの)は、候補にしない。
    */
-  async function intake(
+  function planStarts(
     repos: readonly string[],
     unswept: ReadonlyMap<string, Set<number> | "all">,
-  ): Promise<void> {
+  ): IntakePlan<IntakeIssue> {
     const running = findResumableRuns(db);
     const intakeRepos: IntakeRepo[] = [];
     for (const repo of repos) {
@@ -693,16 +704,27 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         });
       }
     }
-    if (issues.length === 0) return;
+    if (issues.length === 0) return { starts: [], skipped: [] };
 
     const now = clock.now();
-    const plan = planIntake({
+    return planIntake({
       issues,
       repos: intakeRepos,
       dailyLimit: deps.dailyRunLimit,
       startedToday: countRunsStartedToday(db, now),
       now,
     });
+  }
+
+  /**
+   * `ready` のイシューから、着手するものを決めて、着手する。
+   * `unswept` にあるイシュー(作業場所を片付けられなかったもの)には、着手しない。
+   */
+  async function intake(
+    repos: readonly string[],
+    unswept: ReadonlyMap<string, Set<number> | "all">,
+  ): Promise<void> {
+    const plan = planStarts(repos, unswept);
     if (plan.skipped.length > 0) {
       const reasons: Record<string, number> = {};
       for (const { reason } of plan.skipped) {
@@ -734,6 +756,35 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     }
   }
 
+  /**
+   * `dry_run` のために見送った着手を、ログに出す。記録もGitHubも変えない。
+   *
+   * 出すのは、`dry_run` でなければ今回着手したイシューで、まだ出していないものだけである。
+   * 着手の対象から外れたイシューは、出したことを忘れる(もう一度対象になったら、もう一度出す)。
+   * 今回渡されなかったリポジトリ(同期できなかったもの)の分は、そのまま覚えておく。
+   */
+  function announceHeldStarts(repos: readonly string[]): void {
+    const plan = planStarts(repos, new Map());
+    for (const repo of repos) {
+      const planned = new Set(
+        plan.starts
+          .filter((issue) => issue.repo === repo)
+          .map((issue) => issue.number),
+      );
+      const announced = heldAnnounced.get(repo) ?? new Set<number>();
+      for (const issue of plan.starts) {
+        if (issue.repo !== repo || announced.has(issue.number)) continue;
+        logger.info("intake.held", {
+          repo,
+          issue: issue.number,
+          priority: issue.priority,
+          reason: "dry_run",
+        });
+      }
+      heldAnnounced.set(repo, planned);
+    }
+  }
+
   return {
     async tick(repos) {
       if (stopping) return;
@@ -746,7 +797,11 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
           logger.error("run.reconcile_failed", { repo, ...errorFields(error) });
         }
       }
-      if (dryRun || stopping) return;
+      if (stopping) return;
+      if (dryRun) {
+        announceHeldStarts(repos);
+        return;
+      }
       // 着手の前に片付ける。人間が failed から戻したイシューの次の実行が、最新から始まるようにする。
       const unswept = new Map<string, Set<number> | "all">();
       for (const repo of repos) {
