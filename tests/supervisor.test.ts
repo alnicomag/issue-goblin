@@ -1089,7 +1089,7 @@ describe("実行の管理", () => {
           });
           expect(body.length + 30).toBeLessThanOrEqual(GITHUB_COMMENT_LIMIT);
           expect(body).toContain("```diff\n+line 0\n");
-          expect(body).toContain("+line 1000");
+          expect(body).toContain("+line 3000");
           expect(body).toContain("/49.md`");
         });
       });

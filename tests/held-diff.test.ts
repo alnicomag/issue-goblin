@@ -112,6 +112,70 @@ describe("diffSection", () => {
     expect(text).toContain("7 行");
   });
 
+  describe("載せる長さ", () => {
+    /** コードブロックの中身と、断り書きに書かれた文字数。 */
+    const shownOf = (lines: readonly string[]) => {
+      const open = lines.findIndex((line) => /^`{3,}diff$/.test(line));
+      const text = lines[open + 1] ?? "";
+      const noted = /載せたのは、先頭の (\d+) 文字です/.exec(lines.join("\n"));
+      return { text, noted: noted === null ? null : Number(noted[1]) };
+    };
+    /** 1行が `width` 文字の差分。上限を越える長さにする。 */
+    const longDiff = (width: number) =>
+      Array.from(
+        { length: Math.ceil(100_000 / (width + 1)) },
+        (_, index) => `+${String(index).padStart(width - 1, "0")}`,
+      ).join("\n");
+
+    it("上限を越える差分は、3分の1ではなく、上限の近くまで載る", () => {
+      const raw = Array.from({ length: 9000 }, (_, i) => `+line ${i}`).join(
+        "\n",
+      );
+      const { text } = shownOf(diffSection(summarizeDiff(raw), 60_000));
+      expect(text).toContain("+line 3000");
+      expect(text.length).toBeGreaterThan(HELD_DIFF_LIMIT - 12);
+      expect(text.length).toBeLessThanOrEqual(HELD_DIFF_LIMIT);
+    });
+
+    it("切る位置によらず、上限から1行分の差の中まで載り、断り書きの文字数と一致する", () => {
+      for (let width = 6; width <= 60; width += 1) {
+        const lines = diffSection(summarizeDiff(longDiff(width)), 60_000);
+        const { text, noted } = shownOf(lines);
+        expect(text.length, `1行 ${width} 文字`).toBeGreaterThanOrEqual(
+          HELD_DIFF_LIMIT - (width + 1),
+        );
+        expect(text.length).toBeLessThanOrEqual(HELD_DIFF_LIMIT);
+        expect(noted).toBe(text.length);
+      }
+    });
+
+    it("使える長さが上限より短いときも、その近くまで載り、節は使える長さに収まる", () => {
+      for (const budget of [3000, 10_000, 30_000]) {
+        for (const width of [7, 8, 9, 10, 11, 12, 13, 40]) {
+          const lines = diffSection(summarizeDiff(longDiff(width)), budget);
+          const { text, noted } = shownOf(lines);
+          expect(lines.join("\n").length).toBeLessThanOrEqual(budget);
+          expect(
+            text.length,
+            `使える長さ ${budget}、1行 ${width} 文字`,
+          ).toBeGreaterThanOrEqual(budget - 400 - 12 - (width + 1));
+          expect(noted).toBe(text.length);
+        }
+      }
+    });
+
+    it("バッククォートの長い連続があれば、短く切って、使える長さに収める", () => {
+      const raw = ` ${"`".repeat(30_000)}\n${longDiff(10)}`;
+      for (const budget of [20_000, 60_000]) {
+        const lines = diffSection(summarizeDiff(raw), budget);
+        const { text, noted } = shownOf(lines);
+        expect(lines.join("\n").length).toBeLessThanOrEqual(budget);
+        expect(noted).toBe(text.length);
+        expect(outsideFence(lines).join("\n")).not.toContain("+0");
+      }
+    });
+  });
+
   it("差分の中のバッククォートでは、コードブロックを閉じられない", () => {
     const raw = [
       "@@ -1 +1,4 @@",
