@@ -30,6 +30,7 @@ import {
   summarizeDiff,
   unavailableDiff,
 } from "./held-diff.ts";
+import { LISTED_PATH_LIMIT, pathHitLines } from "./path-list.ts";
 import { checkPaths, type PathHit } from "./paths.ts";
 import { readStoredFactoryYml } from "./product.ts";
 import { maskSecrets } from "./step-log.ts";
@@ -207,7 +208,7 @@ export async function listCommitIdentities(
 }
 
 /** 差分を取る保護対象のパスの数の上限。人間の対応待ちのコメントに挙げるパスの数と同じにする。 */
-export const PROTECTED_DIFF_PATH_LIMIT = 50;
+export const PROTECTED_DIFF_PATH_LIMIT = LISTED_PATH_LIMIT;
 
 /**
  * ミラーで、保護対象のパスの差分を読む。読むだけで、何も変えない。
@@ -276,24 +277,6 @@ const VERIFY_STATUS_LABELS: Readonly<Record<string, string>> = {
 function oneLine(text: string): string {
   return text.replace(/\s+/g, " ").trim();
 }
-
-/**
- * パスやパターンを、コメントやPRの本文のコードの中に書ける形にする。
- *
- * パスはワーカーが決められる文字列なので、コードの外に抜け出す書き方(バッククォート、改行)と、
- * 目印に見える書き方(HTMLコメントの始まり)を崩す。コードの中なので、メンションは通知にならない。
- */
-export function inlineCode(text: string): string {
-  const safe = text
-    // biome-ignore lint/suspicious/noControlCharactersInRegex: 制御文字を空白に置き換える
-    .replace(/[\u0000-\u001f\u007f]/g, " ")
-    .replaceAll("`", "'")
-    .replaceAll("<!--", "＜!--");
-  return `\`${safe}\``;
-}
-
-/** PRの本文に挙げる、承認された保護対象のパスの数の上限。残りは件数だけを書く。 */
-export const APPROVED_PATH_LIMIT = 50;
 
 /** PRのタイトル。イシューのタイトルを1行にして使う。空なら、番号から作る。 */
 export function buildPrTitle(issue: number, issueTitle: string): string {
@@ -460,13 +443,7 @@ export function buildPrBody(input: {
       "次のパスは、変更に人間の承認が要ります(`paths.protected`)。このコミットの変更は、イシューの上で承認されています。",
       "",
     );
-    for (const hit of approvedPaths.slice(0, APPROVED_PATH_LIMIT)) {
-      lines.push(
-        `- ${inlineCode(hit.path)}(パターン: ${inlineCode(hit.pattern)})`,
-      );
-    }
-    const rest = approvedPaths.length - APPROVED_PATH_LIMIT;
-    if (rest > 0) lines.push(`- (ほか ${rest} 件)`);
+    lines.push(...pathHitLines(approvedPaths));
   }
   lines.push(
     "",

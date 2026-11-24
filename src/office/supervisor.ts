@@ -20,8 +20,8 @@ import { diffSection, ProtectedDiffSchema } from "./held-diff.ts";
 import { type IntakeIssue, type IntakeRepo, planIntake } from "./intake.ts";
 import type { RepoLocks } from "./locks.ts";
 import { errorFields } from "./log.ts";
+import { inlineCode, pathHitLines } from "./path-list.ts";
 import { readStoredFactoryYml } from "./product.ts";
-import { inlineCode } from "./publish.ts";
 import { advanceRun, type RunnerDeps } from "./runner.ts";
 import {
   cancelRun,
@@ -103,9 +103,6 @@ export function heldMarker(runId: number, publishCount = 1): string {
     : `<!-- factory:held run=${runId} publish=${publishCount} -->`;
 }
 
-/** 人間の対応待ちのコメントに挙げるパスの数の上限。残りは件数だけを書く。 */
-export const HELD_COMMENT_PATH_LIMIT = 50;
-
 const PathHitSchema = z.object({ path: z.string(), pattern: z.string() });
 
 /** publish が人間の対応待ちで止まったときの、チェックポイントの内容。 */
@@ -175,13 +172,7 @@ export function heldComment(
       `当たったパス(${hits.length} 件):`,
       "",
     );
-    for (const hit of hits.slice(0, HELD_COMMENT_PATH_LIMIT)) {
-      lines.push(
-        `- ${inlineCode(hit.path)}(パターン: ${inlineCode(hit.pattern)})`,
-      );
-    }
-    const rest = hits.length - HELD_COMMENT_PATH_LIMIT;
-    if (rest > 0) lines.push(`- (ほか ${rest} 件)`);
+    lines.push(...pathHitLines(hits));
     const diff =
       output.status === "needs_approval"
         ? (output.protectedDiff ?? null)
