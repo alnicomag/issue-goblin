@@ -70,9 +70,9 @@ describe("マイグレーション", () => {
   it("空のDBに適用できる", () => {
     const result = migrate(db, { clock });
 
-    expect(result.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8]);
+    expect(result.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
     expect(tableNames(db)).toEqual(EXPECTED_TABLES);
-    expect(currentVersion(db)).toBe(8);
+    expect(currentVersion(db)).toBe(9);
   });
 
   it("実行中の実行とステップの重複を防ぐ索引がある", () => {
@@ -99,6 +99,24 @@ describe("マイグレーション", () => {
     insert.run("owner/other", 10);
     insert.run("owner/name", 11);
     expect(() => insert.run("owner/name", 10)).toThrow(/UNIQUE/);
+  });
+
+  it("change_requests の合図は、既定が review で、review か label だけ", () => {
+    migrate(db, { clock });
+    const insert = (reviewId: number, signal?: string) =>
+      db
+        .prepare(
+          `INSERT INTO change_requests
+             (repo, issue_number, pr_number, review_id, accepted, body, comments, submitted_at, created_at${signal === undefined ? "" : ", signal"})
+           VALUES ('owner/name', 1, 2, ?, 1, '', '[]', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'${signal === undefined ? "" : ", ?"})`,
+        )
+        .run(...(signal === undefined ? [reviewId] : [reviewId, signal]));
+    insert(10);
+    insert(11, "label");
+    expect(
+      db.prepare("SELECT signal FROM change_requests ORDER BY review_id").all(),
+    ).toEqual([{ signal: "review" }, { signal: "label" }]);
+    expect(() => insert(12, "comment")).toThrow(/CHECK/);
   });
 
   it("steps に、中断した呼び出しのログの場所を残す列がある", () => {
@@ -216,7 +234,7 @@ describe("マイグレーション", () => {
 
     expect(second).toEqual({ applied: [], backupPath: null });
     expect(schemaDump(db)).toEqual(before);
-    expect(currentVersion(db)).toBe(8);
+    expect(currentVersion(db)).toBe(9);
     expect(backups()).toEqual(backupsBefore);
   });
 

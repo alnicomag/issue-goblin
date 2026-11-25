@@ -1,7 +1,10 @@
 /**
- * PRへの修正依頼(レビューの「変更を要求」)の取り込みと、実装のやり直し。
+ * PRへの修正依頼の取り込みと、実装のやり直し。
  *
- * - 合図は、PRのレビューの状態 `CHANGES_REQUESTED` だけである。
+ * - 合図は2つある。どちらも、文章を読まずに見分けられる。
+ *   - PRのレビューの状態 `CHANGES_REQUESTED`(「変更を要求」)。
+ *   - PRのラベル `agent:rework`。GitHubは、PRの作成者に「変更を要求」を出させないので、
+ *     作成者本人はこちらを使う。指摘は、コメントだけのレビュー(`COMMENTED`)から読む。
  * - 受け付けるかは、取り込んだ時点の `issues.allowed_authors` で決めて、記録に残す。
  *   受け付けない人の依頼も記録するが、何も起こさない。
  * - 受け付けた依頼は、クローズ待ちの実行を implement からやり直すときに、使用済みにする。
@@ -23,6 +26,13 @@ import { getRun, listSteps, type Run } from "./runs.ts";
 
 /** 修正依頼として扱う、レビューの状態。 */
 export const CHANGES_REQUESTED = "CHANGES_REQUESTED";
+/** コメントだけのレビューの状態。PRにラベル `agent:rework` が付いているときだけ、依頼として読む。 */
+export const COMMENTED = "COMMENTED";
+/** PRに付ける、やり直しの合図のラベル。使うと、事務局が外す。 */
+export const REWORK_LABEL = "agent:rework";
+
+/** 依頼を取り込んだ合図。`review` は「変更を要求」、`label` はPRのラベル。 */
+export type ChangeRequestSignal = "review" | "label";
 
 /** 指摘に載せる、レビューの本文の文字数の上限。 */
 export const REQUEST_BODY_LIMIT = 20_000;
@@ -53,6 +63,7 @@ const ChangeRequestRowSchema = z
     comments: z.string(),
     commit_id: z.string().nullable(),
     submitted_at: z.string(),
+    signal: z.enum(["review", "label"]),
     run_id: z.number().int().nullable(),
     step_id: z.number().int().nullable(),
     used_at: z.string().nullable(),
@@ -69,6 +80,7 @@ const ChangeRequestRowSchema = z
     comments: ReviewCommentsSchema.parse(JSON.parse(row.comments)),
     commitId: row.commit_id,
     submittedAt: row.submitted_at,
+    signal: row.signal,
     /** やり直した実行。未使用なら null。 */
     runId: row.run_id,
     /** やり直しの最初の implement のステップ。未使用なら null。 */
@@ -78,7 +90,7 @@ const ChangeRequestRowSchema = z
 export type ChangeRequest = z.infer<typeof ChangeRequestRowSchema>;
 
 const COLUMNS =
-  "id, repo, issue_number, pr_number, review_id, author, accepted, body, comments, commit_id, submitted_at, run_id, step_id, used_at";
+  "id, repo, issue_number, pr_number, review_id, author, accepted, body, comments, commit_id, submitted_at, signal, run_id, step_id, used_at";
 
 function parseRow(row: unknown): ChangeRequest {
   const result = ChangeRequestRowSchema.safeParse(row);
@@ -110,7 +122,28 @@ export function isAcceptedRequester(
 }
 
 /**
+ * コメントだけのレビューかどうか。純粋関数。
+ * PRにラベル `agent:rework` が付いているときだけ、修正依頼として取り込む。
+ * 行コメントへの返信も、GitHubの上ではコメントだけのレビューになる。
+ */
+export function isCommentReview(review: GitHubReview): boolean {
+  return review.state === COMMENTED && review.submittedAt !== null;
+}
+
+/**
+ * 指摘のないラベルを知らせたPR(DBごと)。同じ状態が続く間、ログを出し直さないために覚える。
+ * 事務局を起動し直すと、1回だけ出し直す。
+ */
+const labelWithoutComments = new WeakMap<Db, Set<string>>();
+
+/**
  * PRを持つ実行中の実行について、PRのレビューを読み、修正依頼を記録する。記録した数を返す。
+ *
+ * - 「変更を要求」は、いつでも取り込む。
+ * - コメントだけのレビューは、イシューが `in-review` で、実行がクローズ待ち(最後のステップが、
+ *   終わった publish)で、PRにラベル `agent:rework` が付いているときだけ取り込む。
+ *   やり直しの間(`in-review` に戻るまで)に取り込まないのは、ラベルを外した直後にGitHubが
+ *   古い内容を返しても、合図と見誤らないためである。
  *
  * GitHubには書かない。レビューのIDで既出かを確かめるので、何度行っても、同じ依頼は1行だけになる。
  * `factory.yml` を読めないリポジトリでは、受け付けるかを決められないので、取り込まない
@@ -126,11 +159,11 @@ export async function syncChangeRequests(deps: {
   const { db, api, repo, logger } = deps;
   const runs = db
     .prepare(
-      `SELECT issue_number AS issue, pr_number AS pr FROM runs
+      `SELECT id, issue_number AS issue, pr_number AS pr FROM runs
        WHERE repo = ? AND status = 'running' AND pr_number IS NOT NULL
        ORDER BY id`,
     )
-    .all(repo) as { issue: number; pr: number }[];
+    .all(repo) as { id: number; issue: number; pr: number }[];
   if (runs.length === 0) return 0;
 
   let allowedAuthors: readonly string[];
@@ -144,11 +177,32 @@ export async function syncChangeRequests(deps: {
   const known = db.prepare(
     "SELECT 1 FROM change_requests WHERE repo = ? AND review_id = ?",
   );
+  let announced = labelWithoutComments.get(db);
+  if (announced === undefined) {
+    announced = new Set();
+    labelWithoutComments.set(db, announced);
+  }
   let recorded = 0;
   for (const run of runs) {
+    const last = listSteps(db, run.id).at(-1);
+    const issue = db
+      .prepare("SELECT state FROM issues WHERE repo = ? AND number = ?")
+      .get(repo, run.issue) as { state: string } | undefined;
+    const waiting =
+      issue?.state === "in-review" &&
+      last?.name === "publish" &&
+      last.status === "done";
+    const labeled =
+      waiting &&
+      (await api.listLabelsOnIssue(repo, run.pr)).includes(REWORK_LABEL);
     const reviews = await api.listPullRequestReviews(repo, run.pr);
     for (const review of reviews) {
-      if (!isChangeRequest(review)) continue;
+      const signal: ChangeRequestSignal | null = isChangeRequest(review)
+        ? "review"
+        : labeled && isCommentReview(review)
+          ? "label"
+          : null;
+      if (signal === null) continue;
       if (known.get(repo, review.id) !== undefined) continue;
       const comments = await api.listReviewComments(repo, run.pr, review.id);
       const accepted = isAcceptedRequester(review.author, allowedAuthors);
@@ -156,8 +210,8 @@ export async function syncChangeRequests(deps: {
         .prepare(
           `INSERT OR IGNORE INTO change_requests
              (repo, issue_number, pr_number, review_id, author, accepted, body,
-              comments, commit_id, submitted_at, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+              comments, commit_id, submitted_at, signal, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           repo,
@@ -176,6 +230,7 @@ export async function syncChangeRequests(deps: {
           ),
           review.commitId,
           review.submittedAt,
+          signal,
           isoNow(deps.clock),
         );
       if (info.changes === 0) continue;
@@ -187,7 +242,24 @@ export async function syncChangeRequests(deps: {
         review: review.id,
         author: review.author,
         accepted,
+        signal,
       });
+    }
+
+    // ラベルはあるが、渡せる指摘がない。やり直さずに、ラベルを残して待つ。
+    const key = `${repo}#${run.pr}`;
+    if (labeled && pendingChangeRequests(db, repo, run.issue).length === 0) {
+      if (!announced.has(key)) {
+        announced.add(key);
+        logger.info("change_request.label_without_comments", {
+          repo,
+          issue: run.issue,
+          pr: run.pr,
+          label: REWORK_LABEL,
+        });
+      }
+    } else {
+      announced.delete(key);
     }
   }
   return recorded;
