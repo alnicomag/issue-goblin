@@ -127,6 +127,8 @@ export interface GitHubApi {
     prNumber: number,
     reviewId: number,
   ): Promise<GitHubReviewComment[]>;
+  /** イシューかPRの1件に、いま付いているラベルの名前。 */
+  listLabelsOnIssue(repo: string, issueNumber: number): Promise<string[]>;
   /** 書き込み。直接呼ばず、必ず下の `addLabels` を通す。 */
   addLabels(repo: string, issueNumber: number, labels: string[]): Promise<void>;
   /**
@@ -461,6 +463,8 @@ const PullRequestSchema = z.object({
   html_url: z.string(),
 });
 
+const LabelSchema = z.object({ name: z.string() });
+
 const ReviewSchema = z.object({
   id: z.number().int(),
   user: UserSchema,
@@ -740,6 +744,18 @@ export function createOctokitApi(options: {
           body: comment.body ?? "",
         };
       });
+    },
+
+    async listLabelsOnIssue(repo, issueNumber) {
+      const items = await octokit.paginate(
+        octokit.rest.issues.listLabelsOnIssue,
+        { ...splitRepo(repo), issue_number: issueNumber, per_page: 100 },
+      );
+      return items.map(
+        (item) =>
+          parseResponse(LabelSchema, item, `${repo} の ${issueNumber} のラベル`)
+            .name,
+      );
     },
 
     async addLabels(repo, issueNumber, labels) {
