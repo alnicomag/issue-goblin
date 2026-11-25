@@ -17,6 +17,10 @@
  * 進めなかった実行も、行うはずだったこととあわせてログに出す(`run.held`)。同じ内容を、毎回は出さない。
  */
 import { z } from "zod";
+import {
+  pendingChangeRequests,
+  reopenForChangeRequests,
+} from "./change-requests.ts";
 import { isoNow } from "./clock.ts";
 import { addIssueComment, removeLabel } from "./github.ts";
 import { diffSection, ProtectedDiffSchema } from "./held-diff.ts";
@@ -233,6 +237,12 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
    */
   const runHeldAnnounced = new Map<string, Map<number, SettleAction>>();
 
+  /**
+   * 枠がないために、修正依頼でのやり直しを見送ったことを、すでにログに出した実行と、その理由。
+   * 同じ行を、ポーリングのたびに出さないために持つ。
+   */
+  const reworkDeferred = new Map<number, string>();
+
   const transitionDeps = (repo: string): TransitionDeps => ({
     db,
     write: runner.writeFor(repo),
@@ -430,6 +440,72 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
   }
 
   /**
+   * 人間がPRに修正を依頼したので、`in-progress` に進めて、implement からやり直す。
+   *
+   * 状態を進めてから、やり直しを始める。その間で止まっても、`in-progress` でクローズ待ちの実行に
+   * 未使用の依頼が残るので、記録から同じ答えが出て、続きから進む(`settle.ts`)。
+   * 依頼は、やり直しを始めるときに使用済みにするので、同じ依頼で2回はやり直さない。
+   */
+  async function rework(run: Run): Promise<void> {
+    const result = await transition(
+      run,
+      "in-progress",
+      "人間がPRに修正を依頼しました",
+    );
+    if (result.status !== "applied" && result.status !== "unchanged") return;
+    const reopened = reopenForChangeRequests(db, clock, run.id);
+    logger.info("run.reworked_by_request", {
+      ...fieldsOf(run),
+      reviews: reopened.requests.map((request) => request.reviewId),
+    });
+    spawn(reopened.run);
+  }
+
+  /**
+   * 修正依頼でのやり直しを始める枠があるか。なければ、理由を返す。
+   *
+   * やり直しは implement と review でClaudeを呼ぶので、着手と同じ枠(`limits.max_parallel` と、
+   * 1日の実行数の上限)を通す。枠がなければ、イシューは `in-review` のまま待つ。
+   */
+  function reworkBlocker(repo: string): "no_slot" | "daily_limit" | null {
+    const active = findResumableRuns(db).filter(
+      (entry) => entry.run.repo === repo && entry.step !== "cleanup",
+    ).length;
+    if (active >= readStoredFactoryYml(db, repo).limits.max_parallel) {
+      return "no_slot";
+    }
+    if (countRunsStartedToday(db, clock.now()) >= deps.dailyRunLimit) {
+      return "daily_limit";
+    }
+    return null;
+  }
+
+  /**
+   * クローズ待ちの実行について、修正依頼の有無と、やり直しを始める枠を調べる。
+   * 枠がなくて見送るときは、理由が変わったときだけ、ログに出す。
+   */
+  function changeRequestInfo(
+    run: Run,
+    issueState: string,
+  ): { pending: boolean; slot: boolean } {
+    const pending =
+      pendingChangeRequests(db, run.repo, run.issueNumber).length > 0;
+    // 枠を調べるのは、使うときだけにする(factory.yml が不正でも、ほかの処理を止めない)。
+    if (!pending || issueState !== "in-review") {
+      reworkDeferred.delete(run.id);
+      return { pending, slot: false };
+    }
+    const blocker = reworkBlocker(run.repo);
+    if (blocker === null) {
+      reworkDeferred.delete(run.id);
+    } else if (reworkDeferred.get(run.id) !== blocker) {
+      reworkDeferred.set(run.id, blocker);
+      logger.info("run.rework_deferred", { ...fieldsOf(run), reason: blocker });
+    }
+    return { pending, slot: blocker === null };
+  }
+
+  /**
    * 決まったことを行う。
    *
    * `dry_run` のために行わなかった場合は、`heldNow` に、実行と、行うはずだったことを入れる。
@@ -467,6 +543,9 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         return;
       case "to_review":
         await transition(run, "in-review", "PRを作成しました");
+        return;
+      case "rework":
+        await rework(run);
         return;
       case "ask":
         await ask(run);
@@ -561,6 +640,10 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
             started: listSteps(db, run.id).length > 0,
             ...(run.status === "held" ? { held: heldInfo(run) } : {}),
           },
+          // 修正依頼を見るのは、PRを作ってクローズを待っている実行だけである。
+          ...(pending?.step === "cleanup"
+            ? { changeRequest: changeRequestInfo(run, row.state) }
+            : {}),
           approvedLabel: row.approved !== 0,
           active: tasks.has(run.id),
           failedCount: countFailedRuns(db, repo, row.number),

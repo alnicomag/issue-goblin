@@ -8,6 +8,8 @@
  * 差分に現れないもの(ラベルの競合、ラベル付け)は `github_updated_at` が進んだときだけ扱う。
  * コメントは、コメントIDで既出かを確かめる。
  */
+
+import { syncChangeRequests } from "./change-requests.ts";
 import { type Clock, isoNow } from "./clock.ts";
 import type { Db } from "./db.ts";
 import { insertEvent } from "./events.ts";
@@ -261,6 +263,10 @@ export async function syncRepo(
   await syncFactoryYml({ db, api, repo, clock, logger });
   // 製品の Dockerfile(factory.yml の worker.dockerfile が指すファイル)
   await syncWorkerDockerfile({ db, api, repo, logger });
+
+  // PRへの修正依頼(レビューの「変更を要求」)。受け付けるかを allowed_authors で決めるので、
+  // factory.yml の後に取り込む。
+  await syncChangeRequests({ db, api, repo, clock, logger });
 
   // 6. 最後に同期した時刻
   db.prepare("UPDATE repos SET last_polled_at = ? WHERE repo = ?").run(

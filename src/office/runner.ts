@@ -13,6 +13,11 @@ import { stringify as stringifyYaml } from "yaml";
 import { z } from "zod";
 import type { WorkerInvocation, WorkerInvoker } from "../agents/worker.ts";
 import type { WorkerLauncher } from "../launcher/client.ts";
+import {
+  combineFeedback,
+  formatChangeRequests,
+  openChangeRequests,
+} from "./change-requests.ts";
 import type { Clock } from "./clock.ts";
 import type { CommitAuthor } from "./config.ts";
 import type { Db } from "./db.ts";
@@ -400,7 +405,11 @@ async function executeStep(
           issue: issueText(),
           factory_yml: factoryYmlText(),
           plan: summaryOf(plan),
-          feedback: feedbackFor(steps),
+          // 人間がPRで求めた修正(直し終えるまで渡し続ける)と、直前の差し戻しの指摘。
+          feedback: combineFeedback(
+            formatChangeRequests(openChangeRequests(db, repo, issue)),
+            feedbackFor(steps),
+          ),
         },
         ...limits.implement,
       });

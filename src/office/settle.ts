@@ -32,6 +32,16 @@ export interface SettleInput {
   } | null;
   /** イシューに、承認のラベル(`agent:approved`)が付いているか(GitHubの写し)。 */
   readonly approvedLabel?: boolean;
+  /**
+   * PRへの修正依頼(`change-requests.ts`)。省くと、依頼はないものとして扱う。
+   *
+   * - `pending`: 受け付けたが、まだやり直しに使っていない依頼があるか。
+   * - `slot`: やり直しを始める枠(同時実行と、1日の実行数)があるか。
+   */
+  readonly changeRequest?: {
+    readonly pending: boolean;
+    readonly slot: boolean;
+  };
   /** この事務局のプロセスが、その実行をいま進めているか。 */
   readonly active: boolean;
   /** 試行に数える失敗の数。 */
@@ -46,6 +56,7 @@ export interface SettleInput {
  * - `advance`: 実行を進める(再開、または cleanup)。
  * - `cancel`: 実行を取り消す。人間が状態を変えたので、GitHubに合わせる。
  * - `to_review`: PRができたので、`in-review` に進める。
+ * - `rework`: 人間がPRに修正を依頼したので、`in-progress` に進めて、implement からやり直す。
  * - `ask`: 質問をコメントして、`needs-info` に進める。
  * - `hold`: publish が人間の対応待ちで止まったので、理由をコメントして、`needs-info` に進める。
  * - `approve`: 人間が承認したので、承認を記録し、ラベルを外し、`in-progress` に進めて、publish から再開する。
@@ -59,6 +70,7 @@ export type SettleAction =
   | "advance"
   | "cancel"
   | "to_review"
+  | "rework"
   | "ask"
   | "hold"
   | "approve"
@@ -73,8 +85,17 @@ export function decideSettlement(input: SettleInput): SettleAction {
   if (run.status === "running") {
     if (run.nextStep === "cleanup") {
       // publish まで終わっている。残りは、クローズの後の cleanup だけ。
-      if (issueState === "in-progress") return "to_review";
-      if (issueState === "in-review") return "none";
+      const requested = input.changeRequest?.pending === true;
+      // in-progress で依頼が残っているのは、やり直しのために状態を進めた後、やり直しを始める前に
+      // 止まった場合と、やり直しの間に次の依頼が届いた場合である。どちらも、続けてやり直す。
+      if (issueState === "in-progress") {
+        return requested ? "rework" : "to_review";
+      }
+      if (issueState === "in-review") {
+        return requested && input.changeRequest?.slot === true
+          ? "rework"
+          : "none";
+      }
       if (issueState === "closed") return active ? "none" : "advance";
       return "cancel";
     }

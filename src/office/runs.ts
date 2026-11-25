@@ -231,11 +231,20 @@ export function latestRun(
   return row === undefined ? null : parseRun(row);
 }
 
-/** `since`(UTCのISO 8601形式)以降に開始した実行の数。全リポジトリの合計で、再試行を含む。 */
+/**
+ * `since`(UTCのISO 8601形式)以降に開始した実行の数。全リポジトリの合計で、再試行を含む。
+ *
+ * PRへの修正依頼によるやり直しも、1回を1件として数える。実行の行は増えないが、
+ * implement と review でClaudeを呼ぶからである。
+ */
 export function countRunsStartedSince(db: Db, since: string): number {
   const row = db
-    .prepare("SELECT COUNT(*) AS n FROM runs WHERE started_at >= ?")
-    .get(since) as { n: number };
+    .prepare(
+      `SELECT (SELECT COUNT(*) FROM runs WHERE started_at >= ?)
+            + (SELECT COUNT(DISTINCT step_id) FROM change_requests
+               WHERE used_at >= ?) AS n`,
+    )
+    .get(since, since) as { n: number };
   return row.n;
 }
 
@@ -345,7 +354,7 @@ function pendingStep(
   if (last?.status === "running") {
     return { step: last.name, interrupted: true };
   }
-  const action = actionAfter(steps, last);
+  const action = actionAfter(steps, last, reworkRoundStart(db, run.id));
   if (action.kind !== "run_step") {
     throw new Error(
       `実行 ${run.id} は ${action.status} で終わっているはずですが、実行中のままです`,
@@ -354,10 +363,27 @@ function pendingStep(
   return { step: action.step, interrupted: false };
 }
 
-/** `finished` が終わった後に行うこと。`steps` は、その実行のステップを記録した順に並べたもの。 */
+/**
+ * その実行で、PRへの修正依頼によるやり直しを最後に始めたステップ(implement)。なければ 0。
+ * 差し戻しの回数は、やり直しごとに数え直すので、ここより後の差し戻しだけを数える。
+ */
+function reworkRoundStart(db: Db, runId: number): number {
+  const row = db
+    .prepare(
+      "SELECT COALESCE(MAX(step_id), 0) AS id FROM change_requests WHERE run_id = ?",
+    )
+    .get(runId) as { id: number };
+  return row.id;
+}
+
+/**
+ * `finished` が終わった後に行うこと。`steps` は、その実行のステップを記録した順に並べたもの。
+ * `roundStart` は、差し戻しを数え始める位置(`reworkRoundStart`)。
+ */
 function actionAfter(
   steps: readonly Step[],
   finished: Step | undefined,
+  roundStart: number,
 ): NextAction {
   if (finished === undefined) {
     return nextAction({ reworkCount: 0 }, null);
@@ -368,7 +394,8 @@ function actionAfter(
     );
   }
   const reworkCount = steps.filter(
-    (step) => step.status === "rework" && step.id < finished.id,
+    (step) =>
+      step.status === "rework" && step.id < finished.id && step.id > roundStart,
   ).length;
   return nextAction(
     { reworkCount },
@@ -486,7 +513,7 @@ export function finishStep(
       }
       if (last.status !== "running") {
         if (last.status === finish.outcome && last.output === output) {
-          return actionAfter(steps, last);
+          return actionAfter(steps, last, reworkRoundStart(db, run.id));
         }
         throw new Error(
           `実行 ${finish.runId} のステップ ${finish.step} は、別の結果(${last.status})で終わっています`,
@@ -495,7 +522,7 @@ export function finishStep(
 
       // あり得ない組み合わせ(prepare が差し戻しを返すなど)は、書く前にここで失敗する。
       const finished: Step = { ...last, status: finish.outcome, output };
-      const action = actionAfter(steps, finished);
+      const action = actionAfter(steps, finished, reworkRoundStart(db, run.id));
 
       const now = clock.now();
       db.prepare(
