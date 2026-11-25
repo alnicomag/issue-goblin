@@ -48,6 +48,29 @@ export interface GitHubPullRequest {
   readonly url: string;
 }
 
+/** PRのレビュー1件。 */
+export interface GitHubReview {
+  readonly id: number;
+  readonly author: string | null;
+  /** GitHubの状態(`APPROVED`、`CHANGES_REQUESTED`、`COMMENTED`、`DISMISSED`、`PENDING`)。 */
+  readonly state: string;
+  /** 本文。ないときは空文字。 */
+  readonly body: string;
+  /** レビューの対象のコミット。分からなければ null。 */
+  readonly commitId: string | null;
+  /** 出された時刻(UTCのISO 8601形式)。出される前(`PENDING`)は null。 */
+  readonly submittedAt: string | null;
+}
+
+/** レビューに付いた、行ごとのコメント1件。 */
+export interface GitHubReviewComment {
+  readonly id: number;
+  readonly path: string;
+  /** コメントの付いた行。行に結び付かない場合(ファイル全体、古くなった位置)は null。 */
+  readonly line: number | null;
+  readonly body: string;
+}
+
 export interface PullRequestContent {
   readonly title: string;
   readonly body: string;
@@ -93,6 +116,17 @@ export interface GitHubApi {
     repo: string,
     head: string,
   ): Promise<GitHubPullRequest | null>;
+  /** PRのレビューのすべて(古い順)。 */
+  listPullRequestReviews(
+    repo: string,
+    prNumber: number,
+  ): Promise<GitHubReview[]>;
+  /** レビュー1件に付いた、行ごとのコメントのすべて。 */
+  listReviewComments(
+    repo: string,
+    prNumber: number,
+    reviewId: number,
+  ): Promise<GitHubReviewComment[]>;
   /** 書き込み。直接呼ばず、必ず下の `addLabels` を通す。 */
   addLabels(repo: string, issueNumber: number, labels: string[]): Promise<void>;
   /**
@@ -427,6 +461,22 @@ const PullRequestSchema = z.object({
   html_url: z.string(),
 });
 
+const ReviewSchema = z.object({
+  id: z.number().int(),
+  user: UserSchema,
+  state: z.string(),
+  body: z.string().nullish(),
+  commit_id: z.string().nullish(),
+  submitted_at: Timestamp.nullish(),
+});
+
+const ReviewCommentSchema = z.object({
+  id: z.number().int(),
+  path: z.string(),
+  line: z.number().int().nullish(),
+  body: z.string().nullish(),
+});
+
 const FileSchema = z.object({
   type: z.literal("file"),
   sha: z.string(),
@@ -642,6 +692,54 @@ export function createOctokitApi(options: {
       return first === undefined
         ? null
         : { number: first.number, url: first.html_url };
+    },
+
+    async listPullRequestReviews(repo, prNumber) {
+      const items = await octokit.paginate(octokit.rest.pulls.listReviews, {
+        ...splitRepo(repo),
+        pull_number: prNumber,
+        per_page: 100,
+      });
+      return items.map((item) => {
+        const review = parseResponse(
+          ReviewSchema,
+          item,
+          `${repo} のPR ${prNumber} のレビュー`,
+        );
+        return {
+          id: review.id,
+          author: review.user?.login ?? null,
+          state: review.state,
+          body: review.body ?? "",
+          commitId: review.commit_id ?? null,
+          submittedAt: review.submitted_at ?? null,
+        };
+      });
+    },
+
+    async listReviewComments(repo, prNumber, reviewId) {
+      const items = await octokit.paginate(
+        octokit.rest.pulls.listCommentsForReview,
+        {
+          ...splitRepo(repo),
+          pull_number: prNumber,
+          review_id: reviewId,
+          per_page: 100,
+        },
+      );
+      return items.map((item) => {
+        const comment = parseResponse(
+          ReviewCommentSchema,
+          item,
+          `${repo} のPR ${prNumber} のレビュー ${reviewId} のコメント`,
+        );
+        return {
+          id: comment.id,
+          path: comment.path,
+          line: comment.line ?? null,
+          body: comment.body ?? "",
+        };
+      });
     },
 
     async addLabels(repo, issueNumber, labels) {
