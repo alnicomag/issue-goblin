@@ -75,6 +75,7 @@ GITHUB_TOKEN_EXAMPLE=<トークン>
 | `size:s`、`size:m`、`size:l` | 大きさ | 人間 |
 | `agent:skip` | エージェントは触らない | 人間 |
 | `agent:approved` | 保護対象のパスに触れる変更の承認 | 人間(事務局が、受け取ったときに外す) |
+| `agent:rework` | PRに付けて、やり直しを求める(PRの作成者本人の合図) | 人間(事務局が、やり直しを始めるときに外す) |
 
 意味と遷移の詳しい説明は、[docs/design.md](docs/design.md) の「イシューの状態と遷移」にあります。食い違う場合は、`docs/design.md` を正とします。
 
@@ -86,7 +87,7 @@ for label in \
   state:in-progress state:in-review state:failed \
   priority:p0 priority:p1 priority:p2 priority:p3 \
   size:s size:m size:l \
-  agent:skip agent:approved
+  agent:skip agent:approved agent:rework
 do
   gh label create "$label" --repo owner/name --force
 done
@@ -404,9 +405,22 @@ docker run --rm --pull=never --network="${project}_workers" --user=1000:1000 \
 
 - **受け付ける人:** 製品の `factory.yml` の `issues.allowed_authors` にいる人の依頼だけです。ほかの人の依頼は、記録するだけで、何も起きません。
 - **起きること:** 次のポーリングで、イシューが `state:in-review` から `state:in-progress` に戻ります。ワーカーが、同じブランチの続きに修正のコミットを積み、検査とレビューを通ると、同じPRが更新されて、`state:in-review` に戻ります。
-- **合図にならないもの:** 承認、コメントだけのレビュー、PRやイシューへのふつうのコメントです。
+- **合図にならないもの:** 承認、ラベルのないときのコメントだけのレビュー、PRやイシューへのふつうのコメントです。
 - **枠:** やり直し1回を、1日の実行数に1件として数えます。上限か、同時実行の枠に達している間は、`state:in-review` のまま待ちます(ログは `run.rework_deferred`)。
 - **注意:** 作業用のブランチ(`agent/issue-<番号>`)に、人間が直接 push したコミットは、次の更新で消えます。
+
+### PRの作成者本人が依頼する
+
+GitHubは、PRの作成者が、自分のPRに「変更を要求」を出すことを許しません。事務局のトークンが自分のアカウントのものなら、ファクトリーのPRの作成者は自分なので、次の手順で依頼します。
+
+1. PRに、コメントだけのレビュー(Comment)を出します。指摘は、レビューの本文か、行ごとのコメントに書きます。
+2. 書き終えたら、PRにラベル `agent:rework` を付けます。
+
+- **起きること:** 「変更を要求」と同じです。やり直しを始めるときに、事務局がラベルを外します。
+- **順序:** レビューを先に書き、ラベルを最後に付けます。ラベルが外れた後に書いたコメントは、もう一度ラベルを付けるまで読みません。
+- **指摘がない場合:** ラベルだけを付けても、やり直しません(ログは `change_request.label_without_comments`)。ラベルは残るので、後からレビューを書けば、やり直します。
+- **受け付ける人:** レビューを書いた人が、`issues.allowed_authors` にいることです。ラベルを付けた人は、確かめません。
+- **読む範囲:** そのPRの、まだ使っていないコメントだけのレビューを、すべて渡します。ラベルがない間に書いた古いコメントも、含みます。
 
 ログには、`change_request.recorded`(依頼を取り込んだ。`accepted` が受け付けたかどうか)、`run.reworked_by_request`(やり直しを始めた)の順で出ます。決めたことと理由は、`docs/design.md` の「PRへの修正依頼」にあります。
 
