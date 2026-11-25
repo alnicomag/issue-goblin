@@ -5,6 +5,10 @@
  * (判定は、依頼した側の scripts/isolation-check.ts が行う)。
  *
  * 使い方: node --input-type=module - '<調べる対象のJSON>' < isolation-probe.mjs
+ *
+ * イメージのビルドの環境を調べるときは、対象のJSONに `build: true` を入れる
+ * (scripts/build-check.ts が、Dockerfile の `RUN` から実行する)。作業場所はないので、
+ * 作業場所とgitに関する項目は調べない。
  */
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -177,8 +181,33 @@ for (const target of params.proxyTargets ?? []) {
   viaProxy[target] = await connectViaProxy(target);
 }
 
+/** 作業場所とgitに関する項目。ビルドの環境では調べない。 */
+function workspaceChecks() {
+  return {
+    workspaceEntries: fs.readdirSync("/workspace").sort(),
+    marker: fs.readFileSync("/workspace/marker.txt", "utf8").trim(),
+    rootWritable: rootWritable(),
+    commit: commit(),
+    push: run(
+      "git",
+      ["push", params.pushUrl, "HEAD:refs/heads/isolation-check"],
+      {
+        cwd: "/workspace/repo",
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      },
+    ),
+    gh: run("gh", ["auth", "status"]),
+    claudeVersion: run("claude", ["--version"]),
+    lsRemote: run("git", ["ls-remote", params.publicRepoUrl, "HEAD"]),
+  };
+}
+
 const result = {
   env: Object.keys(process.env).sort(),
+  // 値そのものは出さない。トークンが混ざっていないかを、ハッシュで確かめられるようにする。
+  envValueSha256: Object.values(process.env).map((value) =>
+    createHash("sha256").update(value).digest("hex"),
+  ),
   claudeTokenSha256:
     token === undefined
       ? null
@@ -190,24 +219,10 @@ const result = {
     (params.readPaths ?? []).map((path) => [path, exists(path)]),
   ),
   mounts: mounts(),
-  workspaceEntries: fs.readdirSync("/workspace").sort(),
-  marker: fs.readFileSync("/workspace/marker.txt", "utf8").trim(),
-  rootWritable: rootWritable(),
-  commit: commit(),
-  push: run(
-    "git",
-    ["push", params.pushUrl, "HEAD:refs/heads/isolation-check"],
-    {
-      cwd: "/workspace/repo",
-      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
-    },
-  ),
-  gh: run("gh", ["auth", "status"]),
-  claudeVersion: run("claude", ["--version"]),
   defaultRoute: hasDefaultRoute(),
   direct,
   viaProxy,
-  lsRemote: run("git", ["ls-remote", params.publicRepoUrl, "HEAD"]),
+  ...(params.build === true ? {} : workspaceChecks()),
 };
 
 process.stdout.write(`${JSON.stringify(result)}\n`);

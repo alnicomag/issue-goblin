@@ -2,6 +2,7 @@
 # ワーカーの隔離を、実際にコンテナを立てて確かめる。
 # あわせて、事務局のコンテナで作業場所の準備と後片付けが通ること、
 # 検査コマンドの実行(verify)が隔離された環境で動くこと、
+# 製品の Dockerfile からのイメージのビルドが隔離された環境で動くこと、
 # ワーカーのイメージのgitが、設定の作者をそのままコミットに書くことを確かめる。
 #
 # 確認用の環境を、稼働中のものとは別の名前(既定: factory-check)で立て、終わったら消す。
@@ -33,6 +34,11 @@ others() {
   } | grep -v -e " ${PROJECT}[-_]" | sort
 }
 
+# 確認用の環境の起動係がビルドした、製品のイメージの一覧。
+built_images() {
+  docker image ls --quiet --filter "label=factory.built=${PROJECT}_factory-work" | sort -u
+}
+
 cleanup() {
   status=$?
   if [ "${CHECK_KEEP:-}" = "1" ]; then
@@ -40,6 +46,10 @@ cleanup() {
   else
     docker rm --force "$LISTENER" >/dev/null 2>&1 || true
     compose down --volumes --remove-orphans >/dev/null 2>&1 || true
+    # 確認の中でビルドした、製品のイメージ。
+    built_images | while read -r image; do
+      docker image rm --force "$image" >/dev/null 2>&1 || true
+    done
     docker image rm "${PROJECT}-office" "${PROJECT}-launcher" "${PROJECT}-proxy" \
       "${PROJECT}-worker" >/dev/null 2>&1 || true
   fi
@@ -129,6 +139,16 @@ echo
 compose run --rm --no-deps -T office node scripts/verify-check.ts 2>&1 || result=1
 
 echo
+echo "# 製品のイメージのビルドを調べる"
+echo
+compose run --rm --no-deps -T \
+  --env "CHECK_HOST_ADDR=${HOST_IP}:${LISTENER_PORT}" \
+  --env "CHECK_HOST_IP=${HOST_IP}" \
+  --env "CHECK_CONTAINER_ADDR=${LISTENER_IP}:8080" \
+  --env "CHECK_CLAUDE_TOKEN_SHA256=${CLAUDE_DUMMY_SHA256}" \
+  office node scripts/build-check.ts 2>&1 || result=1
+
+echo
 echo "# ワーカーのイメージのgitで、コミットの作者を調べる"
 echo
 compose run --rm --no-deps -T office node scripts/author-check.ts 2>&1 || result=1
@@ -142,7 +162,16 @@ check() {
 leftovers="$(docker ps --all --quiet --filter "label=factory.worker=${PROJECT}_factory-work" | wc -l)"
 check "$([ "$leftovers" = "0" ] && echo 0 || echo 1)" "ワーカーのコンテナが残っていない(時間切れで止めた検査コマンドを含む)"
 
+# 確認の中で、同じ製品のイメージを2回ビルドした。古いほうは、片付けられている。
+built_count="$(built_images | wc -l)"
+check "$([ "$built_count" = "1" ] && echo 0 || echo 1)" "ビルドした製品のイメージは、最後のものだけが残っている(残り: ${built_count})"
+
 logs="$(compose logs --no-color launcher proxy 2>&1)"
+if printf '%s' "$logs" | grep -q -e '"launcher.builder_unavailable"' -e '"launcher.builder_check_failed"'; then
+  check 1 "起動係が、起動のときに、旧ビルダーでワーカーのネットワークを指定できることを確かめた"
+else
+  check 0 "起動係が、起動のときに、旧ビルダーでワーカーのネットワークを指定できることを確かめた"
+fi
 if printf '%s' "$logs" | grep -q -e "$GITHUB_DUMMY" -e "$CLAUDE_DUMMY"; then
   check 1 "起動係とプロキシのログに、トークンが含まれない"
 else

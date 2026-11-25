@@ -11,8 +11,13 @@ import { formatZodError } from "../office/config.ts";
 export const MAX_STDIN_BYTES = 4 * 1024 * 1024;
 /** 引数全体の大きさの上限。 */
 export const MAX_ARGV_BYTES = 128 * 1024;
+/** イメージのビルドの、時間の上限。ステップの時間の上限とは別に数える。 */
+export const BUILD_TIMEOUT_SEC = 30 * 60;
 /** 1回の実行の、時間の上限の最大値。 */
 export const MAX_TIMEOUT_SEC = 4 * 60 * 60;
+
+/** 製品の Dockerfile の大きさの上限。 */
+export const MAX_DOCKERFILE_BYTES = 64 * 1024;
 
 /** 依頼で選べる、作業場所の種類。 */
 export const WORKSPACE_KINDS = ["issue", "preflight"] as const;
@@ -44,6 +49,11 @@ export const RunRequestSchema = z
     argv: z.array(Argument).min(1).max(256),
     /** コマンドの標準入力に渡す文字列。 */
     stdin: z.string().default(""),
+    /**
+     * 製品の Dockerfile の本文(既定ブランチのもの)。省略すると、設定のイメージをそのまま使う。
+     * 指定すると、起動係が検査してビルドし、できたイメージで実行する。イメージの名前は選べない。
+     */
+    dockerfile: z.string().min(1).optional(),
     /** Claudeのトークンを渡すか。Claudeを呼ぶステップだけ true にする。 */
     claude_token: z.boolean().default(false),
     /** この秒数を過ぎたら、コンテナごと止める。 */
@@ -62,6 +72,16 @@ export const RunRequestSchema = z
         code: "custom",
         path: ["issue"],
         message: "着手前の確認の作業場所には、イシュー番号を指定できません",
+      });
+    }
+    if (
+      request.dockerfile !== undefined &&
+      Buffer.byteLength(request.dockerfile) > MAX_DOCKERFILE_BYTES
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["dockerfile"],
+        message: `Dockerfile が大きすぎます(上限 ${MAX_DOCKERFILE_BYTES} バイト)`,
       });
     }
     if (Buffer.byteLength(request.stdin) > MAX_STDIN_BYTES) {
@@ -113,6 +133,15 @@ export const RunResultSchema = z.strictObject({
   stderr: z.string(),
   /** 出力が上限を超えて、途中で切られた場合は true。 */
   truncated: z.boolean(),
+  /**
+   * 製品の Dockerfile を添えた依頼での、イメージのビルドの結果。添えていなければ、項目がない。
+   *
+   * - `cached`: 同じ内容のイメージが手元にあったので、ビルドしなかった。
+   * - `built`: ビルドした。
+   * - `failed`: ビルドできなかった(検査に通らない、基本イメージがない、ビルドの失敗、時間切れ)。
+   *   コマンドは実行していない。`exit_code` と `timed_out` はビルドのもので、理由と出力は `stderr` に入る。
+   */
+  build: z.enum(["cached", "built", "failed"]).optional(),
 });
 
 export type RunResult = z.infer<typeof RunResultSchema>;

@@ -34,4 +34,6 @@ step_limits:
 repos:
   - repo: owner/name # 対象リポジトリ
     token_env: GITHUB_TOKEN_EXAMPLE # トークンを入れた環境変数の名前(値は .env に書く)
-    # worker_image: owner-name-worker # 省略可。製品に固有のツールが要る場合に指定する
+    # 製品に固有のツールが要る場合は、製品の factory.yml の worker.dockerfile に Dockerfile の場所を書く。
+    # 起動係が、worker_image を土台にしてビルドする。手でビルドしたイメージを使うときだけ、ここに書く。
+    # worker_image: owner-name-worker # 省略可

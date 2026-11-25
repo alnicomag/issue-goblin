@@ -23,7 +23,8 @@ import type { Clock } from "./clock.ts";
 import type { Db } from "./db.ts";
 import type { Git } from "./git.ts";
 import { errorFields, type Logger } from "./log.ts";
-import { readStoredFactoryYml } from "./product.ts";
+import { readStoredFactoryYml, storedWorkerDockerfileSha } from "./product.ts";
+import { ImageBuildError } from "./product-image.ts";
 import { maskSecrets, preflightLogDir, writeStepLog } from "./step-log.ts";
 import { buildVerifyArgv, interpretCommand } from "./verify.ts";
 import {
@@ -37,6 +38,9 @@ import {
 /** 通らなかった結果を、同じ条件のまま確かめ直すまでの間隔(分)。 */
 export const FAILED_RECHECK_MINUTES = 60;
 
+/** イメージのビルドに失敗した確認の記録で、`command` に入れる表示。 */
+export const IMAGE_BUILD_COMMAND = "(ワーカーのイメージのビルド)";
+
 /** 最後に終わった確認の記録(`preflights` の1行)。 */
 export interface PreflightRecord {
   readonly repo: string;
@@ -45,7 +49,9 @@ export interface PreflightRecord {
   readonly image: string;
   /** 確かめたときの `factory.yml` の sha。 */
   readonly factoryYmlSha: string;
-  /** 実行した `commands.setup`。 */
+  /** 確かめたときの、製品の Dockerfile の sha。Dockerfile のない製品では null。 */
+  readonly dockerfileSha: string | null;
+  /** 実行した `commands.setup`。イメージのビルドに失敗した場合は、`IMAGE_BUILD_COMMAND`。 */
   readonly command: string;
   /** 終了コード。シグナルで終わった場合は null。 */
   readonly exitCode: number | null;
@@ -69,9 +75,10 @@ export type PreflightDecision = "passed" | "failed" | "check";
 /**
  * 記録から、着手してよいか、確かめるかを決める純粋関数。
  *
- * 条件は、ワーカーのイメージの名前と、`factory.yml` の sha の2つである。
+ * 条件は、ワーカーのイメージの名前、`factory.yml` の sha、製品の Dockerfile の sha の3つである。
+ * Dockerfile のない製品では、Dockerfile の sha は null で、ほかの2つだけで決まる。
  *
- * - 記録がないか、条件のどちらかが記録と違えば、確かめる。
+ * - 記録がないか、条件のどれかが記録と違えば、確かめる。
  * - 条件が同じで、通っていれば、確かめ直さない。
  * - 条件が同じで、通らなかった場合は、前回から `FAILED_RECHECK_MINUTES` 分たったら確かめ直す。
  *   事務局はイメージの中身を見られないので、同じ名前のまま作り直されたことを、時間で拾う。
@@ -81,14 +88,17 @@ export function decidePreflight(input: {
   record: PreflightRecord | null;
   image: string;
   factoryYmlSha: string | null;
+  /** 製品の Dockerfile の sha。Dockerfile がないか、使えなければ null。 */
+  dockerfileSha: string | null;
   now: Date;
 }): PreflightDecision {
-  const { record, image, factoryYmlSha, now } = input;
+  const { record, image, factoryYmlSha, dockerfileSha, now } = input;
   if (
     record === null ||
     factoryYmlSha === null ||
     record.image !== image ||
-    record.factoryYmlSha !== factoryYmlSha
+    record.factoryYmlSha !== factoryYmlSha ||
+    record.dockerfileSha !== dockerfileSha
   ) {
     return "check";
   }
@@ -106,6 +116,7 @@ const RowSchema = z.object({
   status: z.enum(["passed", "failed"]),
   image: z.string(),
   factory_yml_sha: z.string(),
+  dockerfile_sha: z.string().nullable(),
   command: z.string(),
   exit_code: z.number().int().nullable(),
   timed_out: z.number().int(),
@@ -130,6 +141,7 @@ export function readPreflight(db: Db, repo: string): PreflightRecord | null {
     status: data.status,
     image: data.image,
     factoryYmlSha: data.factory_yml_sha,
+    dockerfileSha: data.dockerfile_sha,
     command: data.command,
     exitCode: data.exit_code,
     timedOut: data.timed_out !== 0,
@@ -143,13 +155,14 @@ export function readPreflight(db: Db, repo: string): PreflightRecord | null {
 export function savePreflight(db: Db, record: PreflightRecord): void {
   db.prepare(
     `INSERT INTO preflights
-       (repo, status, image, factory_yml_sha, command, exit_code, timed_out,
-        output_tail, log_path, checked_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       (repo, status, image, factory_yml_sha, dockerfile_sha, command, exit_code,
+        timed_out, output_tail, log_path, checked_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
      ON CONFLICT (repo) DO UPDATE SET
        status = excluded.status,
        image = excluded.image,
        factory_yml_sha = excluded.factory_yml_sha,
+       dockerfile_sha = excluded.dockerfile_sha,
        command = excluded.command,
        exit_code = excluded.exit_code,
        timed_out = excluded.timed_out,
@@ -161,6 +174,7 @@ export function savePreflight(db: Db, record: PreflightRecord): void {
     record.status,
     record.image,
     record.factoryYmlSha,
+    record.dockerfileSha,
     record.command,
     record.exitCode,
     record.timedOut ? 1 : 0,
@@ -251,6 +265,7 @@ export async function runPreflight(
 
   // 条件(sha)とコマンドは、同じ時点のものを使う。
   const factoryYmlSha = storedFactoryYmlSha(db, repo);
+  const dockerfileSha = storedWorkerDockerfileSha(db, repo);
   let command: string;
   try {
     command = readStoredFactoryYml(db, repo).commands.setup;
@@ -279,6 +294,8 @@ export async function runPreflight(
     if (aborted()) return { kind: "interrupted" };
 
     let run: RunResult;
+    // イメージのビルドに失敗した場合は、`setup` を実行していない。通らなかった結果として記録する。
+    let ranCommand = command;
     try {
       run = await deps.launcher.run(
         {
@@ -292,9 +309,16 @@ export async function runPreflight(
         signal === undefined ? {} : { signal },
       );
     } catch (error) {
-      return error instanceof LauncherAbortedError
-        ? { kind: "interrupted" }
-        : notRun(error);
+      if (error instanceof LauncherAbortedError) return { kind: "interrupted" };
+      if (!(error instanceof ImageBuildError)) return notRun(error);
+      ranCommand = IMAGE_BUILD_COMMAND;
+      run = {
+        exit_code: error.exitCode,
+        timed_out: error.timedOut,
+        stdout: "",
+        stderr: error.output,
+        truncated: error.truncated,
+      };
     }
     // 止められた後の結果は、中断によるものかもしれないので、記録しない。
     if (aborted()) return { kind: "interrupted" };
@@ -302,7 +326,7 @@ export async function runPreflight(
     const finishedAt = clock.now();
     const result = interpretCommand(
       "setup",
-      command,
+      ranCommand,
       run,
       finishedAt.getTime() - startedAt.getTime(),
     );
@@ -317,11 +341,12 @@ export async function runPreflight(
           step: "preflight",
           image,
           factory_yml_sha: factoryYmlSha,
+          dockerfile_sha: dockerfileSha,
           started_at: startedAt.toISOString(),
           finished_at: finishedAt.toISOString(),
           timeout_sec: timeoutSec,
           outcome: status,
-          command,
+          command: ranCommand,
           exit_code: result.exitCode,
           timed_out: run.timed_out,
           truncated: run.truncated,
@@ -334,7 +359,8 @@ export async function runPreflight(
       status,
       image,
       factoryYmlSha,
-      command,
+      dockerfileSha,
+      command: ranCommand,
       exitCode: result.exitCode,
       timedOut: run.timed_out,
       outputTail: result.outputTail,
@@ -397,6 +423,7 @@ export function createPreflightGate(deps: PreflightGateDeps): PreflightGate {
       record: readPreflight(db, repo),
       image: deps.imageFor(repo),
       factoryYmlSha: storedFactoryYmlSha(db, repo),
+      dockerfileSha: storedWorkerDockerfileSha(db, repo),
       now: clock.now(),
     });
 
@@ -423,6 +450,7 @@ export function createPreflightGate(deps: PreflightGateDeps): PreflightGate {
         repo,
         image,
         factory_yml_sha: record.factoryYmlSha,
+        dockerfile_sha: record.dockerfileSha,
         log_path: record.logPath,
       });
       return;
@@ -431,6 +459,7 @@ export function createPreflightGate(deps: PreflightGateDeps): PreflightGate {
       repo,
       image,
       factory_yml_sha: record.factoryYmlSha,
+      dockerfile_sha: record.dockerfileSha,
       command: record.command,
       exit_code: record.exitCode,
       timed_out: record.timedOut,

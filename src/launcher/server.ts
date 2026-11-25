@@ -9,11 +9,15 @@
 import http from "node:http";
 import { errorFields, type Logger } from "../office/log.ts";
 import type { Launcher } from "./launcher.ts";
-import { MAX_ARGV_BYTES, MAX_STDIN_BYTES } from "./request.ts";
+import {
+  MAX_ARGV_BYTES,
+  MAX_DOCKERFILE_BYTES,
+  MAX_STDIN_BYTES,
+} from "./request.ts";
 
-/** 依頼の本文の上限。標準入力と引数の上限に、JSONにした分の余裕を足す。 */
+/** 依頼の本文の上限。標準入力、引数、Dockerfile の上限に、JSONにした分の余裕を足す。 */
 export const MAX_BODY_BYTES =
-  (MAX_STDIN_BYTES + MAX_ARGV_BYTES) * 2 + 64 * 1024;
+  (MAX_STDIN_BYTES + MAX_ARGV_BYTES + MAX_DOCKERFILE_BYTES) * 2 + 64 * 1024;
 
 function send(response: http.ServerResponse, status: number, body: unknown) {
   const text = JSON.stringify(body);

@@ -21,7 +21,7 @@ import {
 } from "./github.ts";
 import type { RepoLocks } from "./locks.ts";
 import { errorFields, type Logger } from "./log.ts";
-import { syncFactoryYml } from "./product.ts";
+import { syncFactoryYml, syncWorkerDockerfile } from "./product.ts";
 import { type IssueState, isIssueState } from "./transitions.ts";
 
 export const STATE_LABEL_PREFIX = "state:";
@@ -259,6 +259,8 @@ export async function syncRepo(
 
   // factory.yml
   await syncFactoryYml({ db, api, repo, clock, logger });
+  // 製品の Dockerfile(factory.yml の worker.dockerfile が指すファイル)
+  await syncWorkerDockerfile({ db, api, repo, logger });
 
   // 6. 最後に同期した時刻
   db.prepare("UPDATE repos SET last_polled_at = ? WHERE repo = ?").run(

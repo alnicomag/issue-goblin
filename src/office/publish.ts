@@ -32,7 +32,7 @@ import {
 } from "./held-diff.ts";
 import { LISTED_PATH_LIMIT, pathHitLines } from "./path-list.ts";
 import { checkPaths, type PathHit } from "./paths.ts";
-import { readStoredFactoryYml } from "./product.ts";
+import { pathRulesOf, readStoredFactoryYml } from "./product.ts";
 import { maskSecrets } from "./step-log.ts";
 import {
   hasBranch,
@@ -601,8 +601,10 @@ export async function publish(
   const { git, write } = deps;
   const { repo, issue } = input;
   const factoryYml = readStoredFactoryYml(deps.db, repo);
+  // `worker.dockerfile` のパスは、製品が書いていなくても、保護対象として扱う。
+  const rules = pathRulesOf(factoryYml);
   // パターンを読めない場合は、gitを実行する前に失敗させる。
-  checkPaths([], factoryYml.paths);
+  checkPaths([], rules);
   const paths = workspacePaths(deps.dirs, repo, issue);
   const { branch, mirrorDir } = paths;
 
@@ -688,7 +690,7 @@ export async function publish(
     );
   }
 
-  const check = checkPaths(changes.paths, factoryYml.paths);
+  const check = checkPaths(changes.paths, rules);
   const checked = {
     changedPaths: changes.paths,
     forbidden: check.forbidden,

@@ -4,13 +4,14 @@
  */
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import { MAX_DOCKERFILE_BYTES } from "../launcher/request.ts";
 import { type Clock, isoNow } from "./clock.ts";
 import { formatZodError } from "./config.ts";
 import type { Db } from "./db.ts";
 import { insertEvent } from "./events.ts";
 import type { GitHubApi } from "./github.ts";
 import type { Logger } from "./log.ts";
-import { globPatternError } from "./paths.ts";
+import { globPatternError, type PathRules } from "./paths.ts";
 
 export const FACTORY_YML_PATH = "factory.yml";
 
@@ -24,6 +25,34 @@ const Command = z.string().min(1);
 const PathPattern = z.string().superRefine((pattern, context) => {
   const message = globPatternError(pattern);
   if (message !== null) context.addIssue({ code: "custom", message });
+});
+
+/**
+ * `worker.dockerfile` のパス。リポジトリの直下からの相対パスで書く。
+ *
+ * 使えるのは、英数字と `.`、`_`、`-`、区切りの `/` だけにする。リポジトリの外を指せず、
+ * パスのパターン(`paths.protected`)としても、そのパス1つだけに当たる(`*` や `?` を含まない)。
+ */
+const DockerfilePath = z.string().superRefine((value, context) => {
+  const fail = (reason: string) =>
+    context.addIssue({
+      code: "custom",
+      message: `Dockerfile の場所を読めません: ${JSON.stringify(value)}(${reason})`,
+    });
+  if (value === "") return fail("空です");
+  if (value.length > 255) return fail("長すぎます");
+  if (value.startsWith("/")) {
+    return fail("リポジトリの直下からの相対パスで書いてください");
+  }
+  if (!/^[A-Za-z0-9._/-]+$/.test(value)) {
+    return fail("使えるのは、英数字と . _ - / だけです");
+  }
+  for (const segment of value.split("/")) {
+    if (segment === "") return fail("区切りが続いているか、末尾にあります");
+    if (segment === "." || segment === "..") {
+      return fail(". と .. は使えません");
+    }
+  }
 });
 
 export const FactoryYmlSchema = z.strictObject({
@@ -49,12 +78,37 @@ export const FactoryYmlSchema = z.strictObject({
       max_attempts: z.number().int().min(1).default(3),
     })
     .default({ max_parallel: 1, max_attempts: 3 }),
+  /**
+   * ワーカーの環境。`dockerfile` は、ワーカーのイメージに製品のツールを足す定義の場所。
+   * 省略すると、ファクトリー側の設定のイメージをそのまま使う。
+   */
+  worker: z.strictObject({ dockerfile: DockerfilePath.optional() }).optional(),
   issues: z.strictObject({
     allowed_authors: z.array(z.string().min(1)),
   }),
 });
 
 export type FactoryYml = z.infer<typeof FactoryYmlSchema>;
+
+/** 製品の Dockerfile の場所(`worker.dockerfile`)。書いていなければ null。 */
+export function workerDockerfilePath(factoryYml: FactoryYml): string | null {
+  return factoryYml.worker?.dockerfile ?? null;
+}
+
+/**
+ * 変更されたパスに照らす規則。`paths` に、`worker.dockerfile` のパスを保護対象として足したもの。
+ *
+ * Dockerfile はワーカーの環境を決めるので、製品が `paths.protected` に書いていなくても、
+ * 変更に人間の承認を求める。
+ */
+export function pathRulesOf(factoryYml: FactoryYml): PathRules {
+  const dockerfile = workerDockerfilePath(factoryYml);
+  const { forbidden } = factoryYml.paths;
+  if (dockerfile === null || factoryYml.paths.protected.includes(dockerfile)) {
+    return { forbidden, protected: factoryYml.paths.protected };
+  }
+  return { forbidden, protected: [...factoryYml.paths.protected, dockerfile] };
+}
 
 export type FactoryYmlParseResult =
   | { readonly ok: true; readonly value: FactoryYml }
@@ -212,4 +266,166 @@ export function readStoredFactoryYml(db: Db, repo: string): FactoryYml {
     );
   }
   return result.data;
+}
+
+/** 保存してある、製品の Dockerfile。 */
+export interface StoredWorkerDockerfile {
+  /** `factory.yml` の `worker.dockerfile`。 */
+  readonly path: string;
+  /** 既定ブランチから取得した内容の sha。 */
+  readonly sha: string;
+  /** 本文。 */
+  readonly content: string;
+}
+
+const DockerfileRowSchema = z.object({
+  factory_yml: z.string().nullable(),
+  content: z.string().nullable(),
+  sha: z.string().nullable(),
+  path: z.string().nullable(),
+});
+
+function readDockerfileRow(db: Db, repo: string) {
+  const row = db
+    .prepare(
+      `SELECT factory_yml,
+              worker_dockerfile AS content,
+              worker_dockerfile_sha AS sha,
+              worker_dockerfile_path AS path
+       FROM repos WHERE repo = ?`,
+    )
+    .get(repo);
+  if (row === undefined) return null;
+  return DockerfileRowSchema.parse(row);
+}
+
+/** 保存してある `factory.yml` が指す Dockerfile の場所。読めなければ null。 */
+function wantedDockerfilePath(factoryYml: string | null): string | null {
+  if (factoryYml === null) return null;
+  let raw: unknown;
+  try {
+    raw = JSON.parse(factoryYml);
+  } catch {
+    return null;
+  }
+  const parsed = FactoryYmlSchema.safeParse(raw);
+  return parsed.success ? workerDockerfilePath(parsed.data) : null;
+}
+
+export type WorkerDockerfileSyncOutcome =
+  | "none"
+  | "unchanged"
+  | "updated"
+  | "missing"
+  | "too_large";
+
+/**
+ * `factory.yml` の `worker.dockerfile` が指すファイルを、既定ブランチから取得して保存する。
+ * `syncFactoryYml` の後に呼ぶ。
+ *
+ * - `factory.yml` に書かれていなければ(未取得、不正を含む)、保存してあるものを消す。
+ * - ファイルがないか、大きすぎれば、本文を消す。この製品のイメージはビルドできないので、
+ *   依頼は起動係に送る前に失敗する(`readStoredWorkerDockerfile`)。
+ * - 同じ状態が続いている間は、ログを重ねて出さない。
+ */
+export async function syncWorkerDockerfile(deps: {
+  db: Db;
+  api: GitHubApi;
+  repo: string;
+  logger: Logger;
+}): Promise<WorkerDockerfileSyncOutcome> {
+  const { db, api, repo, logger } = deps;
+  const row = readDockerfileRow(db, repo);
+  if (row === null) {
+    throw new Error(`repos に ${repo} の行がありません`);
+  }
+  const save = db.prepare(
+    `UPDATE repos
+     SET worker_dockerfile = ?, worker_dockerfile_sha = ?, worker_dockerfile_path = ?
+     WHERE repo = ?`,
+  );
+
+  const wanted = wantedDockerfilePath(row.factory_yml);
+  if (wanted === null) {
+    if (row.content !== null || row.sha !== null || row.path !== null) {
+      save.run(null, null, null, repo);
+      logger.info("product.dockerfile_removed", { repo, path: row.path });
+    }
+    return "none";
+  }
+
+  const samePath = row.path === wanted;
+  const file = await api.getFile(repo, wanted, samePath ? row.sha : null);
+  if (file.status === "unchanged") return "unchanged";
+
+  if (file.status === "missing") {
+    if (!samePath || row.content !== null || row.sha !== null) {
+      save.run(null, null, wanted, repo);
+      logger.warn("product.dockerfile_missing", { repo, path: wanted });
+    }
+    return "missing";
+  }
+
+  const bytes = Buffer.byteLength(file.content);
+  if (bytes > MAX_DOCKERFILE_BYTES) {
+    if (!samePath || row.content !== null || row.sha !== file.sha) {
+      save.run(null, file.sha, wanted, repo);
+      logger.warn("product.dockerfile_too_large", {
+        repo,
+        path: wanted,
+        sha: file.sha,
+        bytes,
+        max_bytes: MAX_DOCKERFILE_BYTES,
+      });
+    }
+    return "too_large";
+  }
+
+  if (samePath && row.sha === file.sha && row.content === file.content) {
+    return "unchanged";
+  }
+  save.run(file.content, file.sha, wanted, repo);
+  logger.info("product.dockerfile_updated", {
+    repo,
+    path: wanted,
+    sha: file.sha,
+  });
+  return "updated";
+}
+
+/**
+ * 保存してある製品の Dockerfile(事務局が既定ブランチから取得したもの)を読む。
+ *
+ * `factory.yml` に `worker.dockerfile` がなければ null を返す(設定のイメージをそのまま使う)。
+ * 書かれているのに本文がない場合(未取得、ファイルがない、大きすぎる、パスが変わった直後)は、
+ * 原因の分かるメッセージで失敗する。設定のイメージに黙って切り替えない。
+ */
+export function readStoredWorkerDockerfile(
+  db: Db,
+  repo: string,
+): StoredWorkerDockerfile | null {
+  const wanted = workerDockerfilePath(readStoredFactoryYml(db, repo));
+  if (wanted === null) return null;
+  const row = readDockerfileRow(db, repo);
+  if (
+    row === null ||
+    row.path !== wanted ||
+    row.content === null ||
+    row.sha === null
+  ) {
+    throw new Error(
+      `リポジトリ ${repo} の Dockerfile(${FACTORY_YML_PATH} の worker.dockerfile: ${wanted})を使えません(既定ブランチにファイルがないか、${MAX_DOCKERFILE_BYTES} バイトを超えているか、まだ取得していません)`,
+    );
+  }
+  return { path: wanted, sha: row.sha, content: row.content };
+}
+
+/**
+ * 保存してある製品の Dockerfile の sha。着手前の確認の条件に使う。
+ * `worker.dockerfile` がないか、本文を使えなければ null。失敗しない。
+ */
+export function storedWorkerDockerfileSha(db: Db, repo: string): string | null {
+  const row = readDockerfileRow(db, repo);
+  if (row === null || row.content === null) return null;
+  return row.path === wantedDockerfilePath(row.factory_yml) ? row.sha : null;
 }

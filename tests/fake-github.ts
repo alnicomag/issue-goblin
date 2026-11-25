@@ -58,6 +58,8 @@ export class FakeGitHub implements GitHubApi {
   issues: GitHubIssue[] = [];
   comments: GitHubComment[] = [];
   file: { sha: string; content: string } | null = null;
+  /** `factory.yml` のほかのファイル(パスごと)。 */
+  files = new Map<string, { sha: string; content: string }>();
   /** 設定すると、すべての読み取りがこの例外で失敗する。 */
   failWith: Error | null = null;
   /** 設定すると、書き込みがこの例外で失敗する。 */
@@ -131,9 +133,10 @@ export class FakeGitHub implements GitHubApi {
   ): Promise<GitHubFileResult> {
     this.calls.push({ method: "getFile", repo, path, knownSha });
     if (this.failWith) throw this.failWith;
-    if (this.file === null) return { status: "missing" };
-    if (this.file.sha === knownSha) return { status: "unchanged" };
-    return { status: "found", ...this.file };
+    const file = path === "factory.yml" ? this.file : this.files.get(path);
+    if (file === null || file === undefined) return { status: "missing" };
+    if (file.sha === knownSha) return { status: "unchanged" };
+    return { status: "found", ...file };
   }
 
   async addLabels(repo: string, issueNumber: number, labels: string[]) {

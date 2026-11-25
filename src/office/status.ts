@@ -13,6 +13,7 @@ import { DEFAULT_CONFIG_PATH, loadConfig } from "./config.ts";
 import type { Db } from "./db.ts";
 import {
   FAILED_RECHECK_MINUTES,
+  IMAGE_BUILD_COMMAND,
   type PreflightRecord,
   readPreflight,
 } from "./preflight.ts";
@@ -221,7 +222,9 @@ export function preflightLines(record: PreflightRecord | null): string[] {
   const exit = record.timedOut
     ? "時間切れ(時間の上限で止めました)"
     : record.exitCode === null
-      ? "なし(シグナルで終わりました)"
+      ? record.command === IMAGE_BUILD_COMMAND
+        ? "なし(ビルドを始めていないか、シグナルで終わりました)"
+        : "なし(シグナルで終わりました)"
       : String(record.exitCode);
   const lines = [
     `  着手前の確認: 失敗(${record.checkedAt})。この製品には着手しません`,
@@ -229,8 +232,11 @@ export function preflightLines(record: PreflightRecord | null): string[] {
     `    終了コード: ${exit}`,
     `    イメージ: ${record.image}`,
     `    factory.yml: ${record.factoryYmlSha}`,
+    ...(record.dockerfileSha === null
+      ? []
+      : [`    Dockerfile: ${record.dockerfileSha}`]),
     `    ログ: ${record.logPath}`,
-    `    確かめ直し: イメージの名前か factory.yml が変わったとき、または ${
+    `    確かめ直し: イメージの名前、factory.yml、製品の Dockerfile のどれかが変わったとき、または ${
       Number.isNaN(recheckAt.getTime())
         ? "次のポーリング"
         : recheckAt.toISOString()
