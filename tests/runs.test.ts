@@ -13,10 +13,12 @@ import {
   finishStep,
   getRun,
   heldPublishStep,
+  heldStep,
   latestRun,
   listSteps,
   nextAttempt,
   nextStep,
+  publishedHeads,
   recordApproval,
   recordInterruptedLog,
   recordRunDetails,
@@ -359,6 +361,40 @@ describe("実行とステップの記録", () => {
         ).toEqual(first);
         expect(findApproval(db, first.stepId)).toEqual(first);
         expect(approvedCommit(db, run.id)).toBeNull();
+      });
+
+      it("prepare で止まった実行は、止まったステップとして読める。承認の対象にはならない", () => {
+        const run = startRun(db, clock, target);
+        record(run.id, "prepare", "held", { status: "branch_exists" });
+        expect(getRun(db, run.id).status).toBe("held");
+        expect(heldStep(db, run.id)).toMatchObject({
+          count: 1,
+          step: { name: "prepare" },
+        });
+        expect(heldPublishStep(db, run.id)).toBeNull();
+        // publish で止まった実行は、どちらからも読める。
+        const published = heldRun();
+        expect(heldStep(db, published.id)).toEqual(
+          heldPublishStep(db, published.id),
+        );
+      });
+
+      it("push した記録のあるコミットは、published で終わった publish のものだけ", () => {
+        const run = startRun(db, clock, target);
+        for (const step of UNTIL_REVIEW) record(run.id, step);
+        record(run.id, "publish", "done", {
+          status: "published",
+          headCommit: "aaa",
+        });
+        const other = startRun(db, clock, { ...target, issueNumber: 8 });
+        for (const step of UNTIL_REVIEW) record(other.id, step);
+        record(other.id, "publish", "done", {
+          status: "dry_run",
+          headCommit: "bbb",
+        });
+        expect(publishedHeads(db, target.repo, 7)).toEqual(new Set(["aaa"]));
+        expect(publishedHeads(db, target.repo, 8)).toEqual(new Set());
+        expect(publishedHeads(db, "owner/other", 7)).toEqual(new Set());
       });
 
       it("止まっていない実行には、承認を記録できない", () => {

@@ -24,7 +24,8 @@ export type StepName = (typeof STEP_NAMES)[number];
  * - `rework`: 差し戻し(verify の失敗、review の修正要求)。implement に戻す。
  * - `question`: 質問を返して終了する。
  * - `failed`: ステップそのものが失敗した。実行を失敗で終える。
- * - `held`: 人間の対応待ちで終了する(publish が、禁止や保護対象のパスで止まった)。
+ * - `held`: 人間の対応待ちで終了する(publish が、禁止や保護対象のパスで止まった。または、
+ *   prepare か publish が、リモートに残った別のファクトリーのブランチで止まった)。
  *   失敗ではないので、試行に数えず、再試行もしない。
  */
 export const STEP_OUTCOMES = [
@@ -44,7 +45,7 @@ const REWORK_STEPS: readonly StepName[] = ["verify", "review"];
 /** 質問を返せるステップ(Claudeが担当するもの)。 */
 const QUESTION_STEPS: readonly StepName[] = ["plan", "implement", "review"];
 /** 人間の対応待ちを返せるステップ。 */
-const HELD_STEPS: readonly StepName[] = ["publish"];
+const HELD_STEPS: readonly StepName[] = ["prepare", "publish"];
 
 export interface RunProgress {
   /** 直前のステップの結果より前に、この実行で起きた差し戻しの回数。 */

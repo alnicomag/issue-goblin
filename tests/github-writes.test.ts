@@ -417,6 +417,60 @@ describe("本物のgitでのpush", () => {
     );
   });
 
+  describe("期待するリモートの先頭を渡したとき(lease)", () => {
+    const pushWith = (expected: string | null) =>
+      pushBranch(
+        { dryRun: false, logger },
+        {
+          git,
+          mirrorDir: mirror,
+          repo: REPO,
+          url: remote,
+          branch: BRANCH,
+          lease: { expected },
+        },
+      );
+    /** 別のファクトリーが push した、という想定のコミットを、リモートのブランチに置く。 */
+    const plantForeign = () => {
+      const other = makeRepo(path.join(tmp, "other"));
+      plainGit(other, "checkout", "--quiet", "-b", BRANCH);
+      const foreign = commitFile(other, "foreign.txt", "foreign\n");
+      plainGit(other, "push", "--quiet", "--force", remote, BRANCH);
+      return foreign;
+    };
+
+    it("リモートにブランチがなければ、null を期待して push できる", async () => {
+      expect(await pushWith(null)).toBe(true);
+      expect(remoteHead()).toBe(head);
+    });
+
+    it("リモートの先頭が期待どおりなら、履歴が変わっていても上書きできる", async () => {
+      await pushWith(null);
+      plainGit(mirror, "commit", "--quiet", "--amend", "-m", "rewritten");
+      const rewritten = plainGit(mirror, "rev-parse", "HEAD");
+      expect(await pushWith(head)).toBe(true);
+      expect(remoteHead()).toBe(rewritten);
+    });
+
+    it("ないはずのブランチがリモートにあれば、上書きせずに失敗する", async () => {
+      const foreign = plantForeign();
+      await expect(pushWith(null)).rejects.toThrow();
+      expect(remoteHead()).toBe(foreign);
+    });
+
+    it("リモートの先頭が期待と違えば、上書きせずに失敗する", async () => {
+      await pushWith(null);
+      const foreign = plantForeign();
+      await expect(pushWith(head)).rejects.toThrow();
+      expect(remoteHead()).toBe(foreign);
+    });
+
+    it("期待する先頭がコミットのハッシュでなければ、gitを実行せずに失敗する", async () => {
+      await expect(pushWith("main --force")).rejects.toThrow(/ハッシュ/);
+      expect(plainGit(remote, "for-each-ref")).toBe("");
+    });
+  });
+
   it("リポジトリ内のフック(`hooks/pre-push`)が動かない", async () => {
     plantPrePush(path.join(mirror, ".git", "hooks"));
 

@@ -16,6 +16,7 @@ import {
   type Identity,
   parseCommitIdentities,
 } from "./authors.ts";
+import { checkRemoteBranch, foreignBranchSummary } from "./branch-guard.ts";
 import type { Db } from "./db.ts";
 import type { Git } from "./git.ts";
 import {
@@ -473,6 +474,8 @@ export function buildPrBody(input: {
  * - `empty_diff`: コミットはあるが、既定ブランチとの差分が空。
  * - `forbidden`: `paths.forbidden` に当たる変更がある。push しておらず、人間の対応待ち。
  * - `needs_approval`: `paths.protected` に当たる変更がある。push しておらず、人間の承認待ち。
+ * - `branch_exists`: リモートの作業用のブランチの先頭が、このファクトリーの記録にない。
+ *   上書きしておらず、人間の対応待ち(担当者で着手を分けるリポジトリだけ)。
  */
 export type PublishStatus =
   | "published"
@@ -481,14 +484,15 @@ export type PublishStatus =
   | "author_mismatch"
   | "empty_diff"
   | "forbidden"
-  | "needs_approval";
+  | "needs_approval"
+  | "branch_exists";
 
 /** publish の結果。チェックポイント(`steps.output`)に残せる形にしてある。 */
 export interface PublishResult {
   readonly status: PublishStatus;
   /**
    * ステップの結果。`published` と `dry_run` は `done`。
-   * `forbidden` と `needs_approval` は `held`(人間の対応待ち。再試行しない)。ほかは `failed`。
+   * `forbidden`、`needs_approval`、`branch_exists` は `held`(人間の対応待ち。再試行しない)。ほかは `failed`。
    */
   readonly outcome: "done" | "failed" | "held";
   /** 人間の承認があれば進められる状態か(`needs_approval` のときだけ true)。 */
@@ -512,6 +516,11 @@ export interface PublishResult {
    * コミットのハッシュと、そのコミットに書かれていた作者とコミッターを残す。
    */
   readonly authorMismatches: readonly CommitIdentity[];
+  /**
+   * リモートの作業用のブランチの先頭(`branch_exists` のときだけ入る)。
+   * このファクトリーが push した記録にないコミットである。
+   */
+  readonly remoteHead: string | null;
   /** PRの番号。作っていなければ null(`dry_run` で、既存のPRがあればその番号)。 */
   readonly prNumber: number | null;
   readonly prUrl: string | null;
@@ -554,6 +563,12 @@ export interface PublishInput {
    * `paths.forbidden`、作者、そのほかの検査は、承認があっても変わらない。
    */
   readonly approvedCommit?: string | null;
+  /**
+   * true なら、リモートの作業用のブランチが、このファクトリーのものかを確かめてから push する。
+   * 別のファクトリーか人間のものなら、上書きせずに `branch_exists` で止まる。
+   * 担当者で着手を分けるリポジトリ(設定の `assigned_only`)で渡す。省くと、確かめない。
+   */
+  readonly guardBranch?: boolean;
 }
 
 function describeHits(hits: readonly PathHit[]): string {
@@ -619,7 +634,9 @@ export async function publish(
     const result: PublishResult = {
       status,
       outcome:
-        status === "forbidden" || status === "needs_approval"
+        status === "forbidden" ||
+        status === "needs_approval" ||
+        status === "branch_exists"
           ? "held"
           : "failed",
       awaitingApproval: status === "needs_approval",
@@ -632,6 +649,7 @@ export async function publish(
       protected: [],
       protectedDiff: null,
       authorMismatches: [],
+      remoteHead: null,
       prNumber: null,
       prUrl: null,
       prCreated: false,
@@ -646,9 +664,24 @@ export async function publish(
       forbidden: result.forbidden,
       protected: result.protected,
       author_mismatches: result.authorMismatches,
+      remote_head: result.remoteHead,
     });
     return result;
   };
+
+  // リモートに、このファクトリーのものではない作業用のブランチがあれば、上書きしない。
+  // ほかの検査より先に見る。人間がブランチを片付けるまで、何をしても push できないからである。
+  const remote = input.guardBranch
+    ? await checkRemoteBranch(
+        { db: deps.db, git },
+        { mirrorDir, repo, issue, branch },
+      )
+    : null;
+  if (remote?.kind === "foreign") {
+    return stopped("branch_exists", foreignBranchSummary(branch, remote.tip), {
+      remoteHead: remote.tip,
+    });
+  }
 
   if (imported === null) {
     return stopped(
@@ -744,6 +777,10 @@ export async function publish(
     url: input.source.url,
     ...(input.source.token === undefined ? {} : { token: input.source.token }),
     branch,
+    // 確かめた後にリモートが変わっていたら、上書きせずに失敗させる。
+    ...(remote === null
+      ? {}
+      : { lease: { expected: remote.kind === "own" ? remote.tip : null } }),
   });
   const content = {
     title: buildPrTitle(issue, input.issueTitle),
@@ -784,6 +821,7 @@ export async function publish(
     ...checked,
     protectedDiff: null,
     authorMismatches: [],
+    remoteHead: null,
     prNumber: pr?.number ?? null,
     prUrl: pr?.url ?? null,
     prCreated,

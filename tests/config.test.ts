@@ -44,8 +44,22 @@ describe("ファクトリー側の設定", () => {
         review: { timeout_sec: 1800, max_turns: 50 },
         verify: { timeout_sec: 1800 },
       },
-      repos: [{ repo: "owner/name", token_env: "GITHUB_TOKEN_EXAMPLE" }],
+      repos: [
+        {
+          repo: "owner/name",
+          token_env: "GITHUB_TOKEN_EXAMPLE",
+          assigned_only: false,
+        },
+      ],
     });
+  });
+
+  it("assigned_only は、リポジトリごとに有効にできる。真偽値のほかは通さない", () => {
+    const enabled = parseConfig(`${VALID}    assigned_only: true\n`);
+    expect(enabled.repos[0]?.assigned_only).toBe(true);
+    expect(() =>
+      parseConfig(`${VALID}    assigned_only: example-login\n`),
+    ).toThrow(/repos\.0\.assigned_only/);
   });
 
   describe("ステップの上限", () => {
@@ -340,7 +354,11 @@ repos:
     const config = parseConfig(example);
     expect(config.dry_run).toBe(true);
     expect(config.repos).toEqual([
-      { repo: "owner/name", token_env: "GITHUB_TOKEN_EXAMPLE" },
+      {
+        repo: "owner/name",
+        token_env: "GITHUB_TOKEN_EXAMPLE",
+        assigned_only: false,
+      },
     ]);
     // 例には、既定値をそのまま書く。
     expect(example).toMatch(/^step_limits:/m);

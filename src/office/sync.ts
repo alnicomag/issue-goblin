@@ -9,6 +9,7 @@
  * コメントは、コメントIDで既出かを確かめる。
  */
 
+import { isAssignedToOthers } from "./assignees.ts";
 import { syncChangeRequests } from "./change-requests.ts";
 import { type Clock, isoNow } from "./clock.ts";
 import type { Db } from "./db.ts";
@@ -130,6 +131,12 @@ export interface SyncDeps {
    * 取得した内容を取り込む途中で事務局がラベルを変えると、古い内容を人間の変更と見誤るためである。
    */
   readonly locks?: RepoLocks;
+  /**
+   * 担当者で着手を分けるリポジトリ(設定の `assigned_only`)の、トークンの持ち主のログイン名を返す。
+   * 分けないリポジトリでは null。省くと、どのリポジトリも分けない。
+   * ほかの人だけが担当しているイシューには、ラベルを付けない(そのイシューを扱うファクトリーに任せる)。
+   */
+  readonly ownerFor?: (repo: string) => string | null;
 }
 
 export interface SyncOptions {
@@ -193,6 +200,7 @@ interface IssueRow {
   body: string | null;
   agent_skip: number;
   approved: number;
+  assignees: string | null;
   github_updated_at: string;
 }
 
@@ -298,7 +306,7 @@ async function syncIssue(
   const existing = db
     .prepare(
       `SELECT title, state, priority, size, author, body, agent_skip, approved,
-              github_updated_at
+              assignees, github_updated_at
        FROM issues WHERE repo = ? AND number = ?`,
     )
     .get(repo, issue.number) as IssueRow | undefined;
@@ -306,6 +314,8 @@ async function syncIssue(
   const derived = deriveIssue(issue);
   const agentSkip = issue.labels.includes(AGENT_SKIP_LABEL) ? 1 : 0;
   const approvedLabel = issue.labels.includes(AGENT_APPROVED_LABEL) ? 1 : 0;
+  // 担当者は、並びを揃えて保存する(GitHubが返す順が変わっても、差分とみなさない)。
+  const assignees = JSON.stringify([...issue.assignees].sort());
   // 前回の取り込みより後に更新されたか。取得範囲は前回と重なるので、
   // 同じ内容がもう一度届くことがある(再起動の後も同じ)。
   const fresh =
@@ -318,7 +328,8 @@ async function syncIssue(
       derived.size === existing.size &&
       issue.author === existing.author &&
       issue.body === existing.body &&
-      agentSkip === existing.agent_skip;
+      agentSkip === existing.agent_skip &&
+      assignees === existing.assignees;
     const labelDue = full && derived.needsTriageLabel;
     if (unchanged && !labelDue) return null;
   }
@@ -337,7 +348,12 @@ async function syncIssue(
   // ラベル付けはDBの更新より先に行う。失敗したら行を書かずに例外を投げ、
   // 次回のポーリングで同じイシューをやり直せるようにする。
   // 全件の取り直しでは、以前に付けられなかった分(dry_run だった間など)も対象にする。
-  if (derived.needsTriageLabel && (fresh || full)) {
+  // ほかの人だけが担当しているイシューには、書き込まない。
+  const othersIssue = isAssignedToOthers(
+    issue.assignees,
+    deps.ownerFor?.(repo) ?? null,
+  );
+  if (derived.needsTriageLabel && (fresh || full) && !othersIssue) {
     await addLabels(write, repo, issue.number, [TRIAGE_LABEL]);
   }
 
@@ -362,8 +378,8 @@ async function syncIssue(
       db.prepare(
         `INSERT INTO issues
            (repo, number, title, state, priority, size, author, body, agent_skip,
-            approved, github_updated_at, synced_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            approved, assignees, github_updated_at, synced_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         repo,
         issue.number,
@@ -375,6 +391,7 @@ async function syncIssue(
         issue.body,
         agentSkip,
         approvedLabel,
+        assignees,
         issue.updatedAt,
         now,
       );
@@ -407,7 +424,7 @@ async function syncIssue(
     db.prepare(
       `UPDATE issues
          SET title = ?, state = ?, priority = ?, size = ?,
-             author = ?, body = ?, agent_skip = ?, approved = ?,
+             author = ?, body = ?, agent_skip = ?, approved = ?, assignees = ?,
              github_updated_at = ?, synced_at = ?
        WHERE repo = ? AND number = ?`,
     ).run(
@@ -419,6 +436,7 @@ async function syncIssue(
       issue.body,
       agentSkip,
       approved,
+      assignees,
       fresh ? issue.updatedAt : existing.github_updated_at,
       now,
       repo,

@@ -59,8 +59,14 @@ describe("ステップの進み方", () => {
     });
   });
 
-  it("publish のほかは、人間の対応待ちを返せない", () => {
-    for (const step of STEP_NAMES.filter((name) => name !== "publish")) {
+  it("prepare が人間の対応待ちを返すと(リモートに残ったブランチ)、実行を held で終える", () => {
+    expect(next("prepare", "held")).toEqual({ kind: "finish", status: "held" });
+  });
+
+  it("prepare と publish のほかは、人間の対応待ちを返せない", () => {
+    for (const step of STEP_NAMES.filter(
+      (name) => name !== "prepare" && name !== "publish",
+    )) {
       expect(() => next(step, "held"), step).toThrow(/人間の対応待ち/);
     }
   });

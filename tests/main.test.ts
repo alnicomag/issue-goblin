@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { parseConfig } from "../src/office/config.ts";
 import { type LogFields, silentLogger } from "../src/office/log.ts";
-import { createApis, pollOnce, runLoop } from "../src/office/main.ts";
+import {
+  createApis,
+  pollOnce,
+  resolveOwners,
+  runLoop,
+} from "../src/office/main.ts";
 import { findResumableRuns } from "../src/office/runs.ts";
 import { createHarness, REPO } from "./factory-harness.ts";
 import { FakeGitHub } from "./fake-github.ts";
@@ -192,8 +198,12 @@ describe("起動時のトークンの確認", () => {
       verify: { timeout_sec: 1800 },
     },
     repos: [
-      { repo: "owner/first", token_env: "TOKEN_FIRST" },
-      { repo: "owner/second", token_env: "TOKEN_SECOND" },
+      { repo: "owner/first", token_env: "TOKEN_FIRST", assigned_only: false },
+      {
+        repo: "owner/second",
+        token_env: "TOKEN_SECOND",
+        assigned_only: false,
+      },
     ],
   };
 
@@ -210,5 +220,50 @@ describe("起動時のトークンの確認", () => {
     expect(() =>
       createApis(config, { TOKEN_FIRST: "dummy-1" }, silentLogger),
     ).toThrow(/TOKEN_SECOND/);
+  });
+});
+
+describe("トークンの持ち主の読み取り", () => {
+  const config = (flags: string) =>
+    parseConfig(`
+db_path: /data/factory.db
+repos_dir: /data/repos
+work_dir: /work
+repos:
+  - repo: owner/name
+    token_env: GITHUB_TOKEN_EXAMPLE
+${flags}
+  - repo: owner/other
+    token_env: GITHUB_TOKEN_OTHER
+`);
+
+  it("assigned_only のリポジトリだけ、GitHubから読む", async () => {
+    const asked: string[] = [];
+    const owners = await resolveOwners(
+      config("    assigned_only: true"),
+      (repo) => ({
+        getAuthenticatedLogin: async () => {
+          asked.push(repo);
+          return "example-login";
+        },
+      }),
+    );
+    expect([...owners]).toEqual([["owner/name", "example-login"]]);
+    expect(asked).toEqual(["owner/name"]);
+  });
+
+  it("無効(既定)なら、読まない", async () => {
+    const owners = await resolveOwners(config(""), () => {
+      throw new Error("読まないはず");
+    });
+    expect(owners.size).toBe(0);
+  });
+
+  it("読めなければ、リポジトリと環境変数の名前の分かるメッセージで失敗する", async () => {
+    await expect(
+      resolveOwners(config("    assigned_only: true"), () => ({
+        getAuthenticatedLogin: () => Promise.reject(new Error("401")),
+      })),
+    ).rejects.toThrow(/owner\/name.*GITHUB_TOKEN_EXAMPLE/);
   });
 });

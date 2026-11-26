@@ -156,6 +156,12 @@ const RepoConfigSchema = z.strictObject({
     ),
   /** この製品のワーカーに使うイメージ。省略すると、全体の `worker_image` を使う。 */
   worker_image: ImageName.optional(),
+  /**
+   * true にすると、担当者(assignee)にこのトークンの持ち主がいるイシューだけに着手する。
+   * 同じ製品を複数のファクトリーが見るときに、二重に着手しないために使う。
+   * 既定は false で、担当者を見ない。
+   */
+  assigned_only: z.boolean().default(false),
 });
 
 const FactoryConfigSchema = z
@@ -316,7 +322,7 @@ export function workerImageFor(config: FactoryConfig, repo: string): string {
  * 値はここから呼び出し元に返すだけで、ログにもDBにも書かない。
  */
 export function resolveToken(
-  repo: RepoConfig,
+  repo: Pick<RepoConfig, "repo" | "token_env">,
   env: Record<string, string | undefined>,
 ): string {
   const token = env[repo.token_env];

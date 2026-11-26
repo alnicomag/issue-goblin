@@ -327,3 +327,72 @@ describe("記録から決まる後処理", () => {
     });
   });
 });
+
+describe("担当から外れたイシュー", () => {
+  const unassigned = (overrides: Partial<SettleInput>) =>
+    decide({ assigned: false, ...overrides });
+
+  it("実行中の実行は、進めているかによらず、どの状態でも取り消す", () => {
+    for (const issueState of ["ready", "in-progress", "needs-info"]) {
+      for (const active of [false, true]) {
+        expect(unassigned({ issueState, run: running("plan"), active })).toBe(
+          "cancel",
+        );
+      }
+    }
+    expect(
+      unassigned({ issueState: "ready", run: running("prepare", false) }),
+    ).toBe("cancel");
+  });
+
+  it("クローズ待ちの実行も、取り消す。修正依頼があっても、やり直さない", () => {
+    for (const issueState of ["in-progress", "in-review"]) {
+      expect(
+        unassigned({
+          issueState,
+          run: running("cleanup"),
+          changeRequest: { pending: true, slot: true },
+        }),
+      ).toBe("cancel");
+    }
+  });
+
+  it("クローズ済みのイシューの cleanup は、いままでどおり行う", () => {
+    expect(unassigned({ issueState: "closed", run: running("cleanup") })).toBe(
+      "advance",
+    );
+    expect(
+      unassigned({
+        issueState: "closed",
+        run: running("cleanup"),
+        active: true,
+      }),
+    ).toBe("none");
+    expect(unassigned({ issueState: "closed", run: running("plan") })).toBe(
+      "cancel",
+    );
+  });
+
+  it("終わった実行の後処理(質問、失敗、人間の対応待ち、承認)は、行わない", () => {
+    for (const status of ["question", "failed", "held", "done"] as const) {
+      expect(unassigned({ run: finished(status), failedCount: 3 })).toBe(
+        "none",
+      );
+    }
+    expect(
+      unassigned({
+        issueState: "needs-info",
+        run: {
+          ...finished("held"),
+          held: { reason: "needs_approval", approval: "none" },
+        },
+        approvedLabel: true,
+      }),
+    ).toBe("none");
+  });
+
+  it("担当のまま(assigned が true、または省略)なら、いままでと同じ", () => {
+    expect(decide({ assigned: true, run: running("plan") })).toBe("advance");
+    expect(decide({ run: finished("question") })).toBe("ask");
+  });
+});

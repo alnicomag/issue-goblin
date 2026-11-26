@@ -99,6 +99,32 @@ export function createApis(
 }
 
 /**
+ * 担当者で着手を分けるリポジトリ(`assigned_only`)について、トークンの持ち主をGitHubから読む。
+ *
+ * 持ち主は設定に書かせない。設定とトークンが食い違うと、誰の担当にも着手しない、または
+ * 他人の担当に着手するからである。読めなければ、原因の分かるメッセージで失敗する。
+ * `assigned_only` でないリポジトリは、読まず、結果にも入れない。
+ */
+export async function resolveOwners(
+  config: FactoryConfig,
+  apiFor: (repo: string) => Pick<GitHubApi, "getAuthenticatedLogin">,
+): Promise<Map<string, string>> {
+  const owners = new Map<string, string>();
+  for (const entry of config.repos) {
+    if (!entry.assigned_only) continue;
+    try {
+      owners.set(entry.repo, await apiFor(entry.repo).getAuthenticatedLogin());
+    } catch (error) {
+      throw new Error(
+        `${entry.repo} のトークン(${entry.token_env})の持ち主を、GitHubから読めません。assigned_only を使うには、持ち主のログイン名が要ります`,
+        { cause: error },
+      );
+    }
+  }
+  return owners;
+}
+
+/**
  * 1回のポーリング。同期してから、実行の着手と進行を行う。
  *
  * 実行を扱うのは、今回の同期に成功したリポジトリだけにする。同期できなかったリポジトリは、
@@ -168,6 +194,13 @@ async function main(): Promise<boolean> {
       return resolveToken(entry, process.env);
     };
 
+    // 担当者で着手を分けるリポジトリの、トークンの持ち主。メモリにだけ持ち、起動のたびに読み直す。
+    const owners = await resolveOwners(config, apiFor);
+    for (const [repo, login] of owners) {
+      logger.info("office.assigned_only", { repo, owner: login });
+    }
+    const ownerFor = (repo: string): string | null => owners.get(repo) ?? null;
+
     const locks = createRepoLocks();
     // 製品が Dockerfile を持つ場合は、既定ブランチから取得して保存した本文を、依頼に添える。
     const launcher = withProductImage(
@@ -205,6 +238,7 @@ async function main(): Promise<boolean> {
         dryRun: config.dry_run,
         logger,
       }),
+      ownerFor,
     };
     const supervisor = createSupervisor({
       runner,
@@ -236,7 +270,15 @@ async function main(): Promise<boolean> {
       logger,
       poll: () =>
         pollOnce({
-          sync: { db, apiFor, dryRun: config.dry_run, clock, logger, locks },
+          sync: {
+            db,
+            apiFor,
+            dryRun: config.dry_run,
+            clock,
+            logger,
+            locks,
+            ownerFor,
+          },
           supervisor,
           repos,
           pendingFull,

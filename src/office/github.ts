@@ -27,6 +27,8 @@ export interface GitHubIssue {
   readonly open: boolean;
   readonly labels: readonly string[];
   readonly author: string | null;
+  /** 担当者(assignee)のログイン名。いなければ空。 */
+  readonly assignees: readonly string[];
   /** UTCのISO 8601形式(ミリ秒つき)。 */
   readonly updatedAt: string;
   readonly isPullRequest: boolean;
@@ -90,6 +92,8 @@ export type GitHubFileResult =
 
 /** GitHubとの通信の口。1つのインスタンスが1つのトークンに対応する。 */
 export interface GitHubApi {
+  /** このトークンの持ち主のログイン名。 */
+  getAuthenticatedLogin(): Promise<string>;
   /** `since` 以降に更新されたイシュー(オープンとクローズの両方。プルリクエストも含む)。 */
   listIssues(repo: string, since: string | null): Promise<GitHubIssue[]>;
   /** `since` 以降に更新されたイシューコメント。 */
@@ -287,7 +291,17 @@ export interface PushInput {
   /** push に使うトークン。gitの実行時にだけ渡し、どこにも保存しない。 */
   readonly token?: string;
   readonly branch: string;
+  /**
+   * 渡すと、リモートのブランチの先頭が `expected` のときだけ上書きする(`--force-with-lease`)。
+   * `expected` が null なら、リモートにブランチがないときだけ push する。
+   * 同じ製品を複数のファクトリーが見るときに、別のファクトリーのブランチを上書きしないために使う。
+   * 省くと、いままでどおり、リモートの内容によらず上書きする。
+   */
+  readonly lease?: { readonly expected: string | null };
 }
+
+/** コミットのハッシュ(SHA-1 か SHA-256 の16進表記)。 */
+const COMMIT_HASH_PATTERN = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 
 /**
  * ミラーにあるブランチを、同じ名前で push する。
@@ -295,6 +309,7 @@ export interface PushInput {
  * push できるのは、作業用のブランチ(`agent/issue-<番号>`)だけで、それ以外は失敗させる。
  * 既定ブランチには、ここからは書き込めない。作業用のブランチはファクトリーだけが使うので、
  * 差し戻しで履歴が変わっていても通るように、上書きで push する。やり直して安全である。
+ * `lease` を渡すと、リモートの先頭が期待と違うときは、上書きせずに失敗する。
  *
  * `dry_run` が `true` のときは push せず、予定だったことをログに出して `false` を返す。
  */
@@ -306,6 +321,12 @@ export async function pushBranch(
   if (!AGENT_BRANCH_PATTERN.test(branch)) {
     throw new Error(
       `push できるのは作業用のブランチ(agent/issue-<番号>)だけです: ${branch}`,
+    );
+  }
+  const expected = input.lease?.expected ?? null;
+  if (expected !== null && !COMMIT_HASH_PATTERN.test(expected)) {
+    throw new Error(
+      `期待するリモートの先頭が、コミットのハッシュではありません: ${expected}`,
     );
   }
   if (ctx.dryRun) {
@@ -321,7 +342,9 @@ export async function pushBranch(
     [
       "push",
       "--quiet",
-      "--force",
+      input.lease === undefined
+        ? "--force"
+        : `--force-with-lease=refs/heads/${branch}:${expected ?? ""}`,
       // フックは `git.ts` が毎回無効にしている。ここでも重ねて止める。
       "--no-verify",
       "--",
@@ -444,6 +467,7 @@ const IssueSchema = z.object({
     z.union([z.string(), z.object({ name: z.string().nullish() })]),
   ),
   user: UserSchema,
+  assignees: z.array(UserSchema).nullish(),
   updated_at: Timestamp,
   pull_request: z.unknown().optional(),
 });
@@ -618,6 +642,15 @@ export function createOctokitApi(options: {
   const fileEtags = new Map<string, { etag: string; sha: string }>();
 
   return {
+    async getAuthenticatedLogin() {
+      const response = await octokit.rest.users.getAuthenticated();
+      return parseResponse(
+        z.object({ login: z.string().min(1) }),
+        response.data,
+        "トークンの持ち主",
+      ).login;
+    },
+
     async listIssues(repo, since) {
       const items = await octokit.paginate(octokit.rest.issues.listForRepo, {
         ...splitRepo(repo),
@@ -638,6 +671,9 @@ export function createOctokitApi(options: {
             .map((label) => (typeof label === "string" ? label : label.name))
             .filter((name): name is string => typeof name === "string"),
           author: issue.user?.login ?? null,
+          assignees: (issue.assignees ?? [])
+            .map((user) => user?.login)
+            .filter((login): login is string => typeof login === "string"),
           updatedAt: issue.updated_at,
           isPullRequest: issue.pull_request != null,
         };

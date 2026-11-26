@@ -70,9 +70,9 @@ describe("マイグレーション", () => {
   it("空のDBに適用できる", () => {
     const result = migrate(db, { clock });
 
-    expect(result.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect(result.applied).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
     expect(tableNames(db)).toEqual(EXPECTED_TABLES);
-    expect(currentVersion(db)).toBe(9);
+    expect(currentVersion(db)).toBe(10);
   });
 
   it("実行中の実行とステップの重複を防ぐ索引がある", () => {
@@ -138,6 +138,18 @@ describe("マイグレーション", () => {
       notnull: 1,
       dflt_value: "0",
     });
+  });
+
+  it("issues に担当者を残す列があり、既定は NULL(未取得)", () => {
+    migrate(db, { clock });
+    const columns = db.pragma("table_info(issues)") as {
+      name: string;
+      notnull: number;
+      dflt_value: string | null;
+    }[];
+    expect(columns.find((column) => column.name === "assignees")).toMatchObject(
+      { notnull: 0, dflt_value: null },
+    );
   });
 
   it("承認は、止まったステップ1つにつき1件まで", () => {
@@ -234,7 +246,7 @@ describe("マイグレーション", () => {
 
     expect(second).toEqual({ applied: [], backupPath: null });
     expect(schemaDump(db)).toEqual(before);
-    expect(currentVersion(db)).toBe(9);
+    expect(currentVersion(db)).toBe(10);
     expect(backups()).toEqual(backupsBefore);
   });
 

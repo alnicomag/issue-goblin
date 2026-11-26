@@ -17,6 +17,7 @@
  * 進めなかった実行も、行うはずだったこととあわせてログに出す(`run.held`)。同じ内容を、毎回は出さない。
  */
 import { z } from "zod";
+import { isAssignedTo, parseAssignees } from "./assignees.ts";
 import {
   pendingChangeRequests,
   REWORK_LABEL,
@@ -44,6 +45,7 @@ import {
   findApproval,
   findResumableRuns,
   heldPublishStep,
+  heldStep,
   latestRun,
   listRunsOfIssue,
   listSteps,
@@ -91,19 +93,43 @@ export interface Supervisor {
   activeRunIds(): number[];
 }
 
+/**
+ * 目印に入れる、ファクトリーの名乗り。
+ *
+ * 担当者で着手を分けるリポジトリ(設定の `assigned_only`)では、同じ製品を複数のファクトリーが見る。
+ * 実行の番号はファクトリーごとのDBで振るので、番号だけでは、別のファクトリーの目印と重なりうる。
+ * そのため、トークンの持ち主のログイン名(小文字)を入れる。分けないリポジトリ(`owner` が null)では、
+ * いままでの形のままにする。
+ */
+function ownerPart(owner: string | null): string {
+  if (owner === null) return "";
+  // ログイン名は英数字とハイフンだけのはずだが、目印を崩す文字が入らないことを確かめる。
+  if (!/^[A-Za-z0-9-]+$/.test(owner)) {
+    throw new Error(`トークンの持ち主のログイン名が不正です: ${owner}`);
+  }
+  return ` owner=${owner.toLowerCase()}`;
+}
+
 /** 質問のコメントに付ける目印。同じ実行の質問を、重ねて書かないために使う。 */
-export function questionMarker(runId: number): string {
-  return `<!-- factory:question run=${runId} -->`;
+export function questionMarker(
+  runId: number,
+  owner: string | null = null,
+): string {
+  return `<!-- factory:question${ownerPart(owner)} run=${runId} -->`;
 }
 
 /** 質問のコメントの本文。 */
-export function questionComment(runId: number, question: string): string {
+export function questionComment(
+  runId: number,
+  question: string,
+  owner: string | null = null,
+): string {
   return [
     "作業を進める前に、確認したいことがあります。",
     "",
     question.trim(),
     "",
-    questionMarker(runId),
+    questionMarker(runId, owner),
   ].join("\n");
 }
 
@@ -113,16 +139,21 @@ export function questionComment(runId: number, question: string): string {
  * `publishCount` は、その実行で止まった publish の数(今回を含む)。
  * 承認の後に再開した publish がまた止まった場合(2回目以降)は、回数を入れて、前の知らせと区別する。
  */
-export function heldMarker(runId: number, publishCount = 1): string {
+export function heldMarker(
+  runId: number,
+  publishCount = 1,
+  owner: string | null = null,
+): string {
+  const who = ownerPart(owner);
   return publishCount <= 1
-    ? `<!-- factory:held run=${runId} -->`
-    : `<!-- factory:held run=${runId} publish=${publishCount} -->`;
+    ? `<!-- factory:held${who} run=${runId} -->`
+    : `<!-- factory:held${who} run=${runId} publish=${publishCount} -->`;
 }
 
 const PathHitSchema = z.object({ path: z.string(), pattern: z.string() });
 
-/** publish が人間の対応待ちで止まったときの、チェックポイントの内容。 */
-const HeldOutputSchema = z.object({
+/** publish が、禁止や保護対象のパスで止まったときの、チェックポイントの内容。 */
+const PathHeldOutputSchema = z.object({
   status: z.enum(["needs_approval", "forbidden"]),
   headCommit: z.string().nullable(),
   forbidden: z.array(PathHitSchema),
@@ -133,6 +164,22 @@ const HeldOutputSchema = z.object({
    */
   protectedDiff: ProtectedDiffSchema.nullable().optional(),
 });
+
+/**
+ * prepare か publish が、リモートに残っていた作業用のブランチで止まったときの、チェックポイントの内容。
+ * ブランチの先頭が、このファクトリーが push した記録にない(別のファクトリーか、人間のもの)。
+ */
+const BranchHeldOutputSchema = z.object({
+  status: z.literal("branch_exists"),
+  branch: z.string(),
+  remoteHead: z.string(),
+});
+
+/** 人間の対応待ちで止まったときの、チェックポイントの内容。 */
+const HeldOutputSchema = z.union([
+  PathHeldOutputSchema,
+  BranchHeldOutputSchema,
+]);
 export type HeldOutput = z.infer<typeof HeldOutputSchema>;
 
 const HELD_EXPLANATIONS = {
@@ -166,8 +213,22 @@ export function heldComment(
   runId: number,
   output: HeldOutput | null,
   publishCount = 1,
+  owner: string | null = null,
 ): string {
-  const marker = heldMarker(runId, publishCount);
+  const marker = heldMarker(runId, publishCount, owner);
+  if (output?.status === "branch_exists") {
+    return [
+      "リモートに、このファクトリーが push した記録のない作業用のブランチがあるので、止まりました。ブランチは上書きしていません。人間の対応を待ちます。自動では再試行しません。",
+      "",
+      `- 結果: \`${output.status}\``,
+      `- ブランチ: ${inlineCode(output.branch)}`,
+      `- リモートの先頭: ${inlineCode(output.remoteHead)}`,
+      "",
+      "別のファクトリー(前の担当など)の作業か、人間が push したコミットが残っています。内容を確かめて、要らなければ、リモートのブランチを消してから(開いているPRがあれば、閉じてから)、`state:ready` に戻してください。新しい実行として着手します。残す場合は、人間が作業を引き取ってください。",
+      "",
+      marker,
+    ].join("\n");
+  }
   const lines = [
     "PRを作る前の検査で止まりました。push もPRの作成もしていません。人間の対応を待ちます。自動では再試行しません。",
     "",
@@ -216,6 +277,7 @@ interface ReadyRow {
   state: string;
   priority: string | null;
   author: string | null;
+  assignees: string | null;
   agent_skip: number;
 }
 
@@ -286,12 +348,14 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     tasks.set(run.id, { controller, done });
   }
 
-  function cancel(run: Run, issueState: string): void {
+  function cancel(run: Run, issueState: string, assigned = true): void {
     cancelRun(db, clock, run.id);
     tasks.get(run.id)?.controller.abort();
     logger.info("run.cancelled", {
       ...fieldsOf(run),
-      reason: "人間がイシューの状態を変えました",
+      reason: assigned
+        ? "人間がイシューの状態を変えました"
+        : "担当者から、このファクトリーのトークンの持ち主が外れました",
       state: issueState,
     });
   }
@@ -377,9 +441,9 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     );
   }
 
-  /** 止まった publish の記録を読む。読めなければ null。 */
+  /** 止まったステップ(prepare か publish)の記録を読む。読めなければ null。 */
   function readHeldOutput(run: Run): HeldOutput | null {
-    const held = heldPublishStep(db, run.id);
+    const held = heldStep(db, run.id);
     const parsed = HeldOutputSchema.safeParse(
       held?.step.output == null ? null : JSON.parse(held.step.output),
     );
@@ -399,34 +463,32 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         ? summary
         : "(質問の内容を記録から読めませんでした。実行のログを確認してください)";
 
+    const owner = runner.ownerFor?.(run.repo) ?? null;
     await commentOnce(
       run,
-      questionMarker(run.id),
-      questionComment(run.id, question),
+      questionMarker(run.id, owner),
+      questionComment(run.id, question, owner),
     );
     await transition(run, "needs-info", "ワーカーが質問を返しました");
   }
 
-  /** publish が止まった理由をコメントして、`needs-info` に進める。 */
+  /** 人間の対応待ちで止まった理由をコメントして、`needs-info` に進める。 */
   async function hold(run: Run): Promise<void> {
     const output = readHeldOutput(run);
     if (output === null) {
       logger.warn("run.held_record_unreadable", fieldsOf(run));
     }
-    const count = heldPublishStep(db, run.id)?.count ?? 1;
+    const count = heldStep(db, run.id)?.count ?? 1;
+    const owner = runner.ownerFor?.(run.repo) ?? null;
     await commentOnce(
       run,
-      heldMarker(run.id, count),
-      heldComment(run.id, output, count),
+      heldMarker(run.id, count, owner),
+      heldComment(run.id, output, count, owner),
       // 承認が効くのは、このコメントより後に付いたラベルだけにする。
       // コメントがすでにあれば外さない(コメントを見た人間が付けたラベルかもしれない)。
       () => dropApprovedLabel(run),
     );
-    await transition(
-      run,
-      "needs-info",
-      "publish が人間の対応待ちで止まりました",
-    );
+    await transition(run, "needs-info", "人間の対応待ちで止まりました");
   }
 
   /** 承認された実行を、publish から再開する。 */
@@ -546,10 +608,11 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     run: Run,
     issueState: string,
     heldNow: Map<number, SettleAction>,
+    assigned = true,
   ): Promise<void> {
     if (action === "none") return;
     if (action === "cancel") {
-      cancel(run, issueState);
+      cancel(run, issueState, assigned);
       return;
     }
     // ここから下は、GitHubに書くか、ワーカーを動かす。dry_run の間は行わない。
@@ -627,7 +690,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
   async function reconcile(repo: string): Promise<void> {
     const rows = db
       .prepare(
-        `SELECT number, state, approved FROM issues
+        `SELECT number, state, approved, assignees FROM issues
          WHERE repo = ?
            AND (state = 'in-progress'
                 OR EXISTS (SELECT 1 FROM runs
@@ -643,7 +706,13 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
                                       AND approvals.used_at IS NULL))))
          ORDER BY number`,
       )
-      .all(repo) as { number: number; state: string; approved: number }[];
+      .all(repo) as {
+      number: number;
+      state: string;
+      approved: number;
+      assignees: string | null;
+    }[];
+    const owner = runner.ownerFor?.(repo) ?? null;
     const heldNow = new Map<number, SettleAction>();
     if (rows.length === 0) {
       runHeldAnnounced.set(repo, heldNow);
@@ -660,8 +729,10 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         const pending = resumable.get(row.number);
         const run = pending?.run ?? latestRun(db, repo, row.number);
         if (run === null) continue;
+        // 担当から外れたイシューは、取り消すだけで、ほかのことは行わない。
+        const assigned = isAssignedTo(parseAssignees(row.assignees), owner);
         const needsLimit =
-          run.status === "failed" && row.state === "in-progress";
+          assigned && run.status === "failed" && row.state === "in-progress";
         const action = decideSettlement({
           issueState: row.state,
           run: {
@@ -671,9 +742,10 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
             ...(run.status === "held" ? { held: heldInfo(run) } : {}),
           },
           // 修正依頼を見るのは、PRを作ってクローズを待っている実行だけである。
-          ...(pending?.step === "cleanup"
+          ...(assigned && pending?.step === "cleanup"
             ? { changeRequest: changeRequestInfo(run, row.state) }
             : {}),
+          assigned,
           approvedLabel: row.approved !== 0,
           active: tasks.has(run.id),
           failedCount: countFailedRuns(db, repo, row.number),
@@ -682,7 +754,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
             ? readStoredFactoryYml(db, repo).limits.max_attempts
             : 1,
         });
-        await perform(action, run, row.state, heldNow);
+        await perform(action, run, row.state, heldNow, assigned);
       } catch (error) {
         logger.error("run.settle_failed", {
           repo,
@@ -804,6 +876,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         intakeRepos.push({
           repo,
           allowedAuthors: factoryYml.issues.allowed_authors,
+          owner: runner.ownerFor?.(repo) ?? null,
           maxParallel: factoryYml.limits.max_parallel,
           // クローズを待っているだけの実行は、枠に数えない。
           active: running.filter(
@@ -820,7 +893,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     for (const repo of repos) {
       const rows = db
         .prepare(
-          `SELECT repo, number, state, priority, author, agent_skip
+          `SELECT repo, number, state, priority, author, assignees, agent_skip
            FROM issues WHERE repo = ? AND state = 'ready'`,
         )
         .all(repo) as ReadyRow[];
@@ -849,6 +922,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
           state: row.state,
           priority: PrioritySchema.parse(row.priority) as Priority | null,
           author: row.author,
+          assignees: parseAssignees(row.assignees),
           agentSkip: row.agent_skip !== 0,
           retryAt: retryNotBefore(db, row.repo, row.number),
         });
