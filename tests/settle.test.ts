@@ -98,6 +98,88 @@ describe("記録から決まる後処理", () => {
         ).toBe("cancel");
       }
     });
+
+    describe("PRへの修正依頼", () => {
+      const waiting = running("cleanup");
+      const pending = { pending: true, slot: true };
+
+      it("in-review で、未使用の依頼と枠があれば、やり直す", () => {
+        expect(
+          decide({
+            issueState: "in-review",
+            run: waiting,
+            changeRequest: pending,
+          }),
+        ).toBe("rework");
+      });
+
+      it("in-review で、枠がなければ、待つ", () => {
+        expect(
+          decide({
+            issueState: "in-review",
+            run: waiting,
+            changeRequest: { pending: true, slot: false },
+          }),
+        ).toBe("none");
+      });
+
+      it("依頼がなければ、いままでどおり", () => {
+        const none = { pending: false, slot: true };
+        expect(
+          decide({
+            issueState: "in-review",
+            run: waiting,
+            changeRequest: none,
+          }),
+        ).toBe("none");
+        expect(
+          decide({
+            issueState: "in-progress",
+            run: waiting,
+            changeRequest: none,
+          }),
+        ).toBe("to_review");
+      });
+
+      it("in-progress で依頼が残っていれば、in-review に戻さずに、やり直す(状態を進めた後で止まった場合)", () => {
+        expect(
+          decide({
+            issueState: "in-progress",
+            run: waiting,
+            changeRequest: { pending: true, slot: false },
+          }),
+        ).toBe("rework");
+      });
+
+      it("クローズ済みなら、依頼があっても、cleanup を進める", () => {
+        expect(
+          decide({
+            issueState: "closed",
+            run: waiting,
+            changeRequest: pending,
+          }),
+        ).toBe("advance");
+      });
+
+      it("人間が状態を変えていれば、依頼があっても、取り消す", () => {
+        for (const issueState of ["triage", "ready", "needs-info", "failed"]) {
+          expect(
+            decide({ issueState, run: waiting, changeRequest: pending }),
+            issueState,
+          ).toBe("cancel");
+        }
+      });
+
+      it("クローズ待ちでない実行では、依頼を見ない", () => {
+        expect(
+          decide({
+            issueState: "in-progress",
+            run: running("review"),
+            changeRequest: pending,
+          }),
+        ).toBe("advance");
+      });
+    });
   });
 
   describe("終わった実行", () => {

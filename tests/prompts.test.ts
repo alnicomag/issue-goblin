@@ -9,6 +9,7 @@ import {
   renderPrompt,
 } from "../src/agents/prompts.ts";
 import { allowedStatuses, WorkerOutputSchema } from "../src/agents/schemas.ts";
+import { formatChangeRequests } from "../src/office/change-requests.ts";
 
 const dirs: string[] = [];
 function tempDir(): string {
@@ -267,6 +268,38 @@ describe("ワーカーの指示書(plan、implement、review)", () => {
         expect(leftover).toContain("判定の根拠にしません");
         expect(leftover).toContain("消さず");
       }
+    });
+
+    it("PRへの修正依頼の扱いが、implement に書いてある。依頼で範囲は変わらない", () => {
+      if (name !== "implement") return;
+      // 見出しは、事務局が指摘に付けるもの(`formatChangeRequests`)と同じ名前である。
+      expect(
+        formatChangeRequests([
+          {
+            id: 1,
+            repo: "owner/name",
+            issueNumber: 1,
+            prNumber: 2,
+            reviewId: 3,
+            author: "someone",
+            accepted: true,
+            body: "",
+            comments: [],
+            commitId: null,
+            submittedAt: "2026-01-01T00:00:00.000Z",
+            runId: null,
+            stepId: null,
+            usedAt: null,
+          },
+        ]),
+      ).toContain("## プルリクエストへの修正依頼");
+      const requests = section(text, "プルリクエストへの修正依頼");
+      expect(requests).toContain("新しいコミット");
+      expect(requests).toContain("触れてはいけない範囲");
+      expect(requests).toContain("`paths`");
+      expect(requests).toContain("範囲外");
+      expect(requests).toContain("`question`");
+      expect(requests).toContain("`summary`");
     });
 
     it("done のときの要約の見出しと順が、決めたとおりである", () => {

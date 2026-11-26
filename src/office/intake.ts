@@ -94,6 +94,19 @@ export function orderForIntake<T extends IntakeIssue>(
 }
 
 /**
+ * ログイン名が、許可された一覧(`issues.allowed_authors`)にあるか。分からない(null)なら false。
+ * GitHubのログイン名は、大文字と小文字を区別しない。
+ */
+export function isAllowedLogin(
+  login: string | null,
+  allowed: readonly string[],
+): boolean {
+  if (login === null) return false;
+  const lowered = login.toLowerCase();
+  return allowed.some((candidate) => candidate.toLowerCase() === lowered);
+}
+
+/**
  * イシューそのものと、その製品の条件で、着手できない理由を返す。着手できるなら null。
  * 枠(同時実行、1日の上限)は、ここでは見ない。
  *
@@ -108,12 +121,7 @@ export function intakeBlocker(
   if (issue.state !== "ready") return "not_ready";
   if (repo === undefined) return "unknown_repo";
   if (issue.agentSkip) return "agent_skip";
-  // GitHubのログイン名は、大文字と小文字を区別しない。
-  const author = issue.author?.toLowerCase();
-  if (
-    author === undefined ||
-    !repo.allowedAuthors.some((allowed) => allowed.toLowerCase() === author)
-  ) {
+  if (!isAllowedLogin(issue.author, repo.allowedAuthors)) {
     return "author_not_allowed";
   }
   if (issue.retryAt !== null && Date.parse(issue.retryAt) > now.getTime()) {

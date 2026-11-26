@@ -4,6 +4,8 @@ import type {
   GitHubFileResult,
   GitHubIssue,
   GitHubPullRequest,
+  GitHubReview,
+  GitHubReviewComment,
   NewPullRequest,
   PullRequestContent,
 } from "../src/office/github.ts";
@@ -26,6 +28,13 @@ type Call =
     }
   | { method: "listCommentsOnIssue"; repo: string; issueNumber: number }
   | { method: "findOpenPullRequest"; repo: string; head: string }
+  | { method: "listPullRequestReviews"; repo: string; prNumber: number }
+  | {
+      method: "listReviewComments";
+      repo: string;
+      prNumber: number;
+      reviewId: number;
+    }
   | { method: "createPullRequest"; repo: string; input: NewPullRequest }
   | {
       method: "updatePullRequest";
@@ -57,6 +66,11 @@ export interface FakePullRequest extends NewPullRequest {
 export class FakeGitHub implements GitHubApi {
   issues: GitHubIssue[] = [];
   comments: GitHubComment[] = [];
+  reviews: {
+    prNumber: number;
+    review: GitHubReview;
+    comments: GitHubReviewComment[];
+  }[] = [];
   file: { sha: string; content: string } | null = null;
   /** `factory.yml` のほかのファイル(パスごと)。 */
   files = new Map<string, { sha: string; content: string }>();
@@ -184,6 +198,52 @@ export class FakeGitHub implements GitHubApi {
     if (this.failWith) throw this.failWith;
     const found = this.pullRequests.find((pr) => pr.open && pr.head === head);
     return found === undefined ? null : this.toPullRequest(repo, found);
+  }
+
+  /** PRのレビューを足す。`comments` は、そのレビューの行コメント。 */
+  putReview(
+    prNumber: number,
+    review: Partial<GitHubReview> & { id: number },
+    comments: Omit<GitHubReviewComment, "id">[] = [],
+  ) {
+    const next: GitHubReview = {
+      author: "someone",
+      state: "CHANGES_REQUESTED",
+      body: "",
+      commitId: null,
+      submittedAt: "2026-03-01T03:00:00.000Z",
+      ...review,
+    };
+    this.reviews = [
+      ...this.reviews.filter((entry) => entry.review.id !== review.id),
+      {
+        prNumber,
+        review: next,
+        comments: comments.map((comment, index) => ({
+          id: review.id * 100 + index,
+          ...comment,
+        })),
+      },
+    ];
+  }
+
+  async listPullRequestReviews(repo: string, prNumber: number) {
+    this.calls.push({ method: "listPullRequestReviews", repo, prNumber });
+    if (this.failWith) throw this.failWith;
+    return this.reviews
+      .filter((entry) => entry.prNumber === prNumber)
+      .map((entry) => entry.review)
+      .sort((a, b) => a.id - b.id);
+  }
+
+  async listReviewComments(repo: string, prNumber: number, reviewId: number) {
+    this.calls.push({ method: "listReviewComments", repo, prNumber, reviewId });
+    if (this.failWith) throw this.failWith;
+    return (
+      this.reviews.find(
+        (entry) => entry.prNumber === prNumber && entry.review.id === reviewId,
+      )?.comments ?? []
+    );
   }
 
   async createPullRequest(
