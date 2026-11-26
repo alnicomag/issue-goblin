@@ -17,7 +17,7 @@
  * 進めなかった実行も、行うはずだったこととあわせてログに出す(`run.held`)。同じ内容を、毎回は出さない。
  */
 import { z } from "zod";
-import { parseAssignees } from "./assignees.ts";
+import { isAssignedTo, parseAssignees } from "./assignees.ts";
 import {
   pendingChangeRequests,
   REWORK_LABEL,
@@ -288,12 +288,14 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     tasks.set(run.id, { controller, done });
   }
 
-  function cancel(run: Run, issueState: string): void {
+  function cancel(run: Run, issueState: string, assigned = true): void {
     cancelRun(db, clock, run.id);
     tasks.get(run.id)?.controller.abort();
     logger.info("run.cancelled", {
       ...fieldsOf(run),
-      reason: "人間がイシューの状態を変えました",
+      reason: assigned
+        ? "人間がイシューの状態を変えました"
+        : "担当者から、このファクトリーのトークンの持ち主が外れました",
       state: issueState,
     });
   }
@@ -548,10 +550,11 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     run: Run,
     issueState: string,
     heldNow: Map<number, SettleAction>,
+    assigned = true,
   ): Promise<void> {
     if (action === "none") return;
     if (action === "cancel") {
-      cancel(run, issueState);
+      cancel(run, issueState, assigned);
       return;
     }
     // ここから下は、GitHubに書くか、ワーカーを動かす。dry_run の間は行わない。
@@ -629,7 +632,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
   async function reconcile(repo: string): Promise<void> {
     const rows = db
       .prepare(
-        `SELECT number, state, approved FROM issues
+        `SELECT number, state, approved, assignees FROM issues
          WHERE repo = ?
            AND (state = 'in-progress'
                 OR EXISTS (SELECT 1 FROM runs
@@ -645,7 +648,13 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
                                       AND approvals.used_at IS NULL))))
          ORDER BY number`,
       )
-      .all(repo) as { number: number; state: string; approved: number }[];
+      .all(repo) as {
+      number: number;
+      state: string;
+      approved: number;
+      assignees: string | null;
+    }[];
+    const owner = runner.ownerFor?.(repo) ?? null;
     const heldNow = new Map<number, SettleAction>();
     if (rows.length === 0) {
       runHeldAnnounced.set(repo, heldNow);
@@ -662,8 +671,10 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         const pending = resumable.get(row.number);
         const run = pending?.run ?? latestRun(db, repo, row.number);
         if (run === null) continue;
+        // 担当から外れたイシューは、取り消すだけで、ほかのことは行わない。
+        const assigned = isAssignedTo(parseAssignees(row.assignees), owner);
         const needsLimit =
-          run.status === "failed" && row.state === "in-progress";
+          assigned && run.status === "failed" && row.state === "in-progress";
         const action = decideSettlement({
           issueState: row.state,
           run: {
@@ -673,9 +684,10 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
             ...(run.status === "held" ? { held: heldInfo(run) } : {}),
           },
           // 修正依頼を見るのは、PRを作ってクローズを待っている実行だけである。
-          ...(pending?.step === "cleanup"
+          ...(assigned && pending?.step === "cleanup"
             ? { changeRequest: changeRequestInfo(run, row.state) }
             : {}),
+          assigned,
           approvedLabel: row.approved !== 0,
           active: tasks.has(run.id),
           failedCount: countFailedRuns(db, repo, row.number),
@@ -684,7 +696,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
             ? readStoredFactoryYml(db, repo).limits.max_attempts
             : 1,
         });
-        await perform(action, run, row.state, heldNow);
+        await perform(action, run, row.state, heldNow, assigned);
       } catch (error) {
         logger.error("run.settle_failed", {
           repo,

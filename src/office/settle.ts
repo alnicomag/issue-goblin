@@ -42,6 +42,12 @@ export interface SettleInput {
     readonly pending: boolean;
     readonly slot: boolean;
   };
+  /**
+   * このファクトリーが扱ってよいイシューか(`assignees.ts` の `isAssignedTo`)。省くと true。
+   * 担当者で着手を分けるリポジトリ(設定の `assigned_only`)で、担当者にトークンの持ち主が
+   * いなければ false。
+   */
+  readonly assigned?: boolean;
   /** この事務局のプロセスが、その実行をいま進めているか。 */
   readonly active: boolean;
   /** 試行に数える失敗の数。 */
@@ -54,7 +60,7 @@ export interface SettleInput {
  * - `none`: 何もしない。
  * - `begin`: `in-progress` に進めてから、実行を進める(着手の続き)。
  * - `advance`: 実行を進める(再開、または cleanup)。
- * - `cancel`: 実行を取り消す。人間が状態を変えたので、GitHubに合わせる。
+ * - `cancel`: 実行を取り消す。人間が状態を変えたか、担当から外したので、GitHubに合わせる。
  * - `to_review`: PRができたので、`in-review` に進める。
  * - `rework`: 人間がPRに修正を依頼したので、`in-progress` に進めて、implement からやり直す。
  * - `ask`: 質問をコメントして、`needs-info` に進める。
@@ -81,6 +87,17 @@ export type SettleAction =
 export function decideSettlement(input: SettleInput): SettleAction {
   const { issueState, run, active } = input;
   if (run === null) return "none";
+
+  // 担当から外れたイシューには、GitHubに何も書かず、ワーカーも動かさない。
+  // 実行中の実行は取り消す。終わった実行の後処理(質問のコメント、状態の変更、承認の受け取り)も行わない。
+  // クローズ済みのイシューの cleanup(作業場所を消すだけ)は、いままでどおり行う。
+  if (input.assigned === false) {
+    if (run.status !== "running") return "none";
+    if (run.nextStep === "cleanup" && issueState === "closed") {
+      return active ? "none" : "advance";
+    }
+    return "cancel";
+  }
 
   if (run.status === "running") {
     if (run.nextStep === "cleanup") {
