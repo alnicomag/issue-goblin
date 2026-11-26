@@ -28,6 +28,7 @@ type Call =
     }
   | { method: "listCommentsOnIssue"; repo: string; issueNumber: number }
   | { method: "findOpenPullRequest"; repo: string; head: string }
+  | { method: "listLabelsOnIssue"; repo: string; issueNumber: number }
   | { method: "listPullRequestReviews"; repo: string; prNumber: number }
   | {
       method: "listReviewComments";
@@ -71,6 +72,8 @@ export class FakeGitHub implements GitHubApi {
     review: GitHubReview;
     comments: GitHubReviewComment[];
   }[] = [];
+  /** PRに付いているラベル(PRの番号ごと)。イシューのラベルは `issues` に持つ。 */
+  pullRequestLabels = new Map<number, string[]>();
   file: { sha: string; content: string } | null = null;
   /** `factory.yml` のほかのファイル(パスごと)。 */
   files = new Map<string, { sha: string; content: string }>();
@@ -171,6 +174,13 @@ export class FakeGitHub implements GitHubApi {
   async removeLabel(repo: string, issueNumber: number, label: string) {
     this.calls.push({ method: "removeLabel", repo, issueNumber, label });
     if (this.failWritesWith) throw this.failWritesWith;
+    const onPullRequest = this.pullRequestLabels.get(issueNumber);
+    if (onPullRequest !== undefined) {
+      this.pullRequestLabels.set(
+        issueNumber,
+        onPullRequest.filter((l) => l !== label),
+      );
+    }
     const issue = this.issues.find((i) => i.number === issueNumber);
     if (issue?.labels.includes(label)) {
       const bumped = new Date(Date.parse(issue.updatedAt) + 1000).toISOString();
@@ -180,6 +190,16 @@ export class FakeGitHub implements GitHubApi {
         updatedAt: bumped,
       });
     }
+  }
+
+  async listLabelsOnIssue(repo: string, issueNumber: number) {
+    this.calls.push({ method: "listLabelsOnIssue", repo, issueNumber });
+    if (this.failWith) throw this.failWith;
+    return [
+      ...(this.pullRequestLabels.get(issueNumber) ??
+        this.issues.find((i) => i.number === issueNumber)?.labels ??
+        []),
+    ];
   }
 
   async listCommentsOnIssue(repo: string, issueNumber: number) {

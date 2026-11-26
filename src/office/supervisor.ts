@@ -19,6 +19,7 @@
 import { z } from "zod";
 import {
   pendingChangeRequests,
+  REWORK_LABEL,
   reopenForChangeRequests,
 } from "./change-requests.ts";
 import { isoNow } from "./clock.ts";
@@ -348,6 +349,34 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     });
   }
 
+  /**
+   * やり直しの合図のラベル(PRの `agent:rework`)を外す。付いていなくても行う(やり直して安全)。
+   *
+   * 外すのは、未使用の依頼に、ラベルで取り込んだものがあるときだけである。使った合図を残すと、
+   * 次にクローズ待ちになったときに、人間が合図していないコメントまで、依頼として読むからである。
+   * 実行を開き直す前に外すので、外した後で止まっても、未使用の依頼が残り、もう一度ここを通る。
+   */
+  async function removeReworkLabel(run: Run): Promise<void> {
+    const labeled = pendingChangeRequests(db, run.repo, run.issueNumber).some(
+      (request) => request.signal === "label",
+    );
+    if (!labeled) return;
+    const row = db
+      .prepare("SELECT pr_number AS pr FROM runs WHERE id = ?")
+      .get(run.id) as { pr: number | null } | undefined;
+    if (row === undefined || row.pr === null) {
+      throw new Error(
+        `実行 ${run.id} のPRの番号が記録にありません。やり直しの合図のラベルを外せません`,
+      );
+    }
+    await removeLabel(
+      runner.writeFor(run.repo),
+      run.repo,
+      row.pr,
+      REWORK_LABEL,
+    );
+  }
+
   /** 止まった publish の記録を読む。読めなければ null。 */
   function readHeldOutput(run: Run): HeldOutput | null {
     const held = heldPublishStep(db, run.id);
@@ -453,6 +482,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       "人間がPRに修正を依頼しました",
     );
     if (result.status !== "applied" && result.status !== "unchanged") return;
+    await removeReworkLabel(run);
     const reopened = reopenForChangeRequests(db, clock, run.id);
     logger.info("run.reworked_by_request", {
       ...fieldsOf(run),
