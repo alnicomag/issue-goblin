@@ -99,6 +99,7 @@ export class FakeGitHub implements GitHubApi {
       open: true,
       labels: [],
       author: "someone",
+      assignees: [],
       isPullRequest: false,
       ...previous,
       ...issue,

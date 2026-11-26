@@ -27,6 +27,8 @@ export interface GitHubIssue {
   readonly open: boolean;
   readonly labels: readonly string[];
   readonly author: string | null;
+  /** 担当者(assignee)のログイン名。いなければ空。 */
+  readonly assignees: readonly string[];
   /** UTCのISO 8601形式(ミリ秒つき)。 */
   readonly updatedAt: string;
   readonly isPullRequest: boolean;
@@ -444,6 +446,7 @@ const IssueSchema = z.object({
     z.union([z.string(), z.object({ name: z.string().nullish() })]),
   ),
   user: UserSchema,
+  assignees: z.array(UserSchema).nullish(),
   updated_at: Timestamp,
   pull_request: z.unknown().optional(),
 });
@@ -638,6 +641,9 @@ export function createOctokitApi(options: {
             .map((label) => (typeof label === "string" ? label : label.name))
             .filter((name): name is string => typeof name === "string"),
           author: issue.user?.login ?? null,
+          assignees: (issue.assignees ?? [])
+            .map((user) => user?.login)
+            .filter((login): login is string => typeof login === "string"),
           updatedAt: issue.updated_at,
           isPullRequest: issue.pull_request != null,
         };
