@@ -472,10 +472,35 @@ const ReviewSchema = z.object({
 
 const ReviewCommentSchema = z.object({
   id: z.number().int(),
+  pull_request_review_id: z.number().int().nullish(),
   path: z.string(),
   line: z.number().int().nullish(),
+  original_line: z.number().int().nullish(),
   body: z.string().nullish(),
 });
+
+/**
+ * PRのレビューコメントの一覧(GitHubの応答)から、レビュー1件の行ごとのコメントを取り出す。純粋関数。
+ *
+ * 行は、いまの差分での行(`line`)を使い、なければ、コメントを書いた時点の行(`original_line`)を使う。
+ * コメントの後でコミットが積まれると、`line` は null になるからである。
+ * ファイル全体へのコメントは、どちらもないので、null になる。
+ */
+export function reviewCommentsFrom(
+  items: readonly unknown[],
+  reviewId: number,
+  context: string,
+): GitHubReviewComment[] {
+  return items
+    .map((item) => parseResponse(ReviewCommentSchema, item, context))
+    .filter((comment) => comment.pull_request_review_id === reviewId)
+    .map((comment) => ({
+      id: comment.id,
+      path: comment.path,
+      line: comment.line ?? comment.original_line ?? null,
+      body: comment.body ?? "",
+    }));
+}
 
 const FileSchema = z.object({
   type: z.literal("file"),
@@ -718,28 +743,21 @@ export function createOctokitApi(options: {
     },
 
     async listReviewComments(repo, prNumber, reviewId) {
+      // レビューごとの一覧(`listCommentsForReview`)は、行番号を返さない。
+      // PRのコメントの一覧から、そのレビューの分を取り出す。
       const items = await octokit.paginate(
-        octokit.rest.pulls.listCommentsForReview,
+        octokit.rest.pulls.listReviewComments,
         {
           ...splitRepo(repo),
           pull_number: prNumber,
-          review_id: reviewId,
           per_page: 100,
         },
       );
-      return items.map((item) => {
-        const comment = parseResponse(
-          ReviewCommentSchema,
-          item,
-          `${repo} のPR ${prNumber} のレビュー ${reviewId} のコメント`,
-        );
-        return {
-          id: comment.id,
-          path: comment.path,
-          line: comment.line ?? null,
-          body: comment.body ?? "",
-        };
-      });
+      return reviewCommentsFrom(
+        items,
+        reviewId,
+        `${repo} のPR ${prNumber} のレビューコメント`,
+      );
     },
 
     async addLabels(repo, issueNumber, labels) {
