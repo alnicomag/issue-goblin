@@ -19,6 +19,7 @@ function issue(number: number, overrides: Partial<IntakeIssue> = {}) {
     state: "ready",
     priority: null,
     author: "example-login",
+    assignees: [] as readonly string[] | null,
     agentSkip: false,
     retryAt: null,
     ...overrides,
@@ -29,6 +30,7 @@ function repo(overrides: Partial<IntakeRepo> = {}): IntakeRepo {
   return {
     repo: REPO,
     allowedAuthors: ["example-login"],
+    owner: null,
     maxParallel: 1,
     active: 0,
     preflight: "passed",
@@ -290,5 +292,60 @@ describe("UTCの1日の始まり", () => {
     expect(utcDayStart(new Date("2026-03-02T00:00:00.000Z"))).toBe(
       "2026-03-02T00:00:00.000Z",
     );
+  });
+});
+
+describe("担当者による着手の分け方", () => {
+  const mine = repo({ owner: "Example-Bot" });
+
+  it("無効(持ち主が null)なら、担当者を見ない", () => {
+    for (const assignees of [[], ["someone-else"], null]) {
+      expect(intakeBlocker(issue(1, { assignees }), repo(), NOW)).toBeNull();
+    }
+  });
+
+  it("有効なら、担当者に持ち主がいるイシューだけを通す。大文字と小文字は区別しない", () => {
+    expect(
+      intakeBlocker(issue(1, { assignees: ["example-bot"] }), mine, NOW),
+    ).toBeNull();
+    expect(
+      intakeBlocker(
+        issue(1, { assignees: ["someone-else", "EXAMPLE-BOT"] }),
+        mine,
+        NOW,
+      ),
+    ).toBeNull();
+  });
+
+  it.each([
+    ["担当者がいない", []],
+    ["ほかの人だけが担当", ["someone-else"]],
+    ["担当者が分からない", null],
+  ])("有効で、%s なら、not_assigned で見送る", (_name, assignees) => {
+    expect(intakeBlocker(issue(1, { assignees }), mine, NOW)).toBe(
+      "not_assigned",
+    );
+  });
+
+  it("担当外のイシューは、枠を取らず、着手前の確認のきっかけにもならない", () => {
+    const plan = planIntake({
+      issues: [
+        issue(1, { assignees: ["someone-else"], priority: "p0" }),
+        issue(2, { assignees: ["example-bot"] }),
+      ],
+      repos: [mine],
+      dailyLimit: 1,
+      startedToday: 0,
+      now: NOW,
+    });
+    expect(numbers(plan.starts)).toEqual([`${REPO}#2`]);
+    expect(plan.skipped.map((entry) => entry.reason)).toEqual(["not_assigned"]);
+    expect(
+      intakeBlocker(
+        issue(1, { assignees: ["someone-else"] }),
+        repo({ owner: "example-bot", preflight: "pending" }),
+        NOW,
+      ),
+    ).toBe("not_assigned");
   });
 });

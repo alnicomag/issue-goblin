@@ -83,6 +83,11 @@ export interface RunnerDeps {
   readonly writeFor: (repo: string) => WriteContext;
   /** ステップごとの上限(設定の `step_limits`)。省略すると、既定値を使う。 */
   readonly limits?: StepLimits;
+  /**
+   * 担当者で着手を分けるリポジトリ(設定の `assigned_only`)の、トークンの持ち主のログイン名を返す。
+   * 分けないリポジトリでは null。省くと、どのリポジトリも分けない。
+   */
+  readonly ownerFor?: (repo: string) => string | null;
 }
 
 /**

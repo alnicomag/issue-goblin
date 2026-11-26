@@ -694,18 +694,64 @@ describe("担当者の同期", () => {
     const logger: Logger = { info: () => {}, warn: () => {}, error: () => {} };
     const fake = new FakeGitHub();
     fake.file = { sha: "sha-1", content: VALID_FACTORY_YML };
+    const state = { owner: null as string | null, dryRun: true };
     const sync = (full = false) =>
-      syncAll({ db, apiFor: () => fake, dryRun: true, clock, logger }, [REPO], {
-        fullRepos: new Set(full ? [REPO] : []),
-      });
+      syncAll(
+        {
+          db,
+          apiFor: () => fake,
+          dryRun: state.dryRun,
+          clock,
+          logger,
+          ownerFor: () => state.owner,
+        },
+        [REPO],
+        { fullRepos: new Set(full ? [REPO] : []) },
+      );
     const assignees = (number: number) =>
       (
         db
           .prepare("SELECT assignees FROM issues WHERE repo = ? AND number = ?")
           .get(REPO, number) as { assignees: string | null }
       ).assignees;
-    return { db, fake, sync, assignees };
+    return { db, fake, sync, assignees, state };
   };
+
+  it("担当者で分けるとき、ほかの人だけが担当のイシューには、triage のラベルを付けない", async () => {
+    const { db, fake, sync, state } = setup();
+    state.owner = "example-bot";
+    state.dryRun = false;
+    fake.putIssue({ number: 1, assignees: ["someone-else"], updatedAt: T1 });
+    fake.putIssue({ number: 2, assignees: ["Example-Bot"], updatedAt: T1 });
+    fake.putIssue({ number: 3, updatedAt: T1 });
+
+    await sync();
+
+    expect(fake.writes).toEqual([
+      expect.objectContaining({ method: "addLabels", issueNumber: 2 }),
+      expect.objectContaining({ method: "addLabels", issueNumber: 3 }),
+    ]);
+    // 写しは、ラベルのないイシューとして取り込む。
+    expect(
+      db.prepare("SELECT number, state FROM issues ORDER BY number").all(),
+    ).toEqual([
+      { number: 1, state: "triage" },
+      { number: 2, state: "triage" },
+      { number: 3, state: "triage" },
+    ]);
+  });
+
+  it("担当者で分けないなら、担当者によらず、triage のラベルを付ける", async () => {
+    const { fake, sync, state } = setup();
+    state.dryRun = false;
+    fake.putIssue({ number: 1, assignees: ["someone-else"], updatedAt: T1 });
+
+    await sync();
+
+    expect(fake.writes).toEqual([
+      expect.objectContaining({ method: "addLabels", issueNumber: 1 }),
+    ]);
+  });
 
   it("担当者を、並びを揃えたJSON配列で保存する", async () => {
     const { fake, sync, assignees } = setup();

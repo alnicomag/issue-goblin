@@ -199,6 +199,7 @@ async function main(): Promise<boolean> {
     for (const [repo, login] of owners) {
       logger.info("office.assigned_only", { repo, owner: login });
     }
+    const ownerFor = (repo: string): string | null => owners.get(repo) ?? null;
 
     const locks = createRepoLocks();
     // 製品が Dockerfile を持つ場合は、既定ブランチから取得して保存した本文を、依頼に添える。
@@ -237,6 +238,7 @@ async function main(): Promise<boolean> {
         dryRun: config.dry_run,
         logger,
       }),
+      ownerFor,
     };
     const supervisor = createSupervisor({
       runner,
@@ -268,7 +270,15 @@ async function main(): Promise<boolean> {
       logger,
       poll: () =>
         pollOnce({
-          sync: { db, apiFor, dryRun: config.dry_run, clock, logger, locks },
+          sync: {
+            db,
+            apiFor,
+            dryRun: config.dry_run,
+            clock,
+            logger,
+            locks,
+            ownerFor,
+          },
           supervisor,
           repos,
           pendingFull,

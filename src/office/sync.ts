@@ -9,6 +9,7 @@
  * コメントは、コメントIDで既出かを確かめる。
  */
 
+import { isAssignedToOthers } from "./assignees.ts";
 import { syncChangeRequests } from "./change-requests.ts";
 import { type Clock, isoNow } from "./clock.ts";
 import type { Db } from "./db.ts";
@@ -130,6 +131,12 @@ export interface SyncDeps {
    * 取得した内容を取り込む途中で事務局がラベルを変えると、古い内容を人間の変更と見誤るためである。
    */
   readonly locks?: RepoLocks;
+  /**
+   * 担当者で着手を分けるリポジトリ(設定の `assigned_only`)の、トークンの持ち主のログイン名を返す。
+   * 分けないリポジトリでは null。省くと、どのリポジトリも分けない。
+   * ほかの人だけが担当しているイシューには、ラベルを付けない(そのイシューを扱うファクトリーに任せる)。
+   */
+  readonly ownerFor?: (repo: string) => string | null;
 }
 
 export interface SyncOptions {
@@ -341,7 +348,12 @@ async function syncIssue(
   // ラベル付けはDBの更新より先に行う。失敗したら行を書かずに例外を投げ、
   // 次回のポーリングで同じイシューをやり直せるようにする。
   // 全件の取り直しでは、以前に付けられなかった分(dry_run だった間など)も対象にする。
-  if (derived.needsTriageLabel && (fresh || full)) {
+  // ほかの人だけが担当しているイシューには、書き込まない。
+  const othersIssue = isAssignedToOthers(
+    issue.assignees,
+    deps.ownerFor?.(repo) ?? null,
+  );
+  if (derived.needsTriageLabel && (fresh || full) && !othersIssue) {
     await addLabels(write, repo, issue.number, [TRIAGE_LABEL]);
   }
 

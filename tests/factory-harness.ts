@@ -195,6 +195,11 @@ export interface Harness {
   readonly source: string;
   readonly locks: RepoLocks;
   dryRun: boolean;
+  /**
+   * 担当者で着手を分けるとき(`assigned_only`)の、トークンの持ち主。null なら、分けない。
+   * 書き換えると、その後の同期と実行に効く。
+   */
+  owner: string | null;
   readonly runner: RunnerDeps;
   /** GitHubの内容をDBに取り込む。 */
   sync(): Promise<void>;
@@ -204,6 +209,7 @@ export interface Harness {
     overrides?: {
       labels?: string[];
       author?: string;
+      assignees?: string[];
       open?: boolean;
       body?: string;
     },
@@ -228,7 +234,17 @@ export interface Harness {
 }
 
 export function createHarness(
-  options: { dryRun?: boolean; start?: string } = {},
+  options: {
+    dryRun?: boolean;
+    start?: string;
+    /** 担当者で着手を分けるときの、トークンの持ち主。省くと、分けない。 */
+    owner?: string;
+    /**
+     * 別のファクトリーと共有する、偽のGitHubと取得元。同じ製品を見る2つのファクトリーを並べるときに渡す。
+     * DB、作業場所、ミラーは、ファクトリーごとに別になる。
+     */
+    shared?: { fake: FakeGitHub; source: string };
+  } = {},
 ): Harness {
   const tmp = makeTempDir();
   const db = openDb(":memory:");
@@ -258,9 +274,11 @@ export function createHarness(
     error: push("error"),
   };
 
-  const fake = new FakeGitHub();
-  fake.file = { sha: "sha-1", content: VALID_FACTORY_YML };
-  const source = makeRepo(path.join(tmp, "source"));
+  const fake = options.shared?.fake ?? new FakeGitHub();
+  if (options.shared === undefined) {
+    fake.file = { sha: "sha-1", content: VALID_FACTORY_YML };
+  }
+  const source = options.shared?.source ?? makeRepo(path.join(tmp, "source"));
   const dirs: WorkspaceDirs = {
     reposDir: path.join(tmp, "data", "repos"),
     workDir: path.join(tmp, "work"),
@@ -299,6 +317,7 @@ export function createHarness(
     source,
     locks,
     dryRun: options.dryRun ?? false,
+    owner: options.owner ?? null,
     runner: {
       db,
       clock,
@@ -312,10 +331,19 @@ export function createHarness(
       createWorker: () => worker,
       sourceFor: () => ({ url: source }),
       writeFor: () => ({ api: fake, dryRun: self.dryRun, logger }),
+      ownerFor: () => self.owner,
     },
     async sync() {
       const [result] = await syncAll(
-        { db, apiFor: () => fake, dryRun: self.dryRun, clock, logger, locks },
+        {
+          db,
+          apiFor: () => fake,
+          dryRun: self.dryRun,
+          clock,
+          logger,
+          locks,
+          ownerFor: () => self.owner,
+        },
         [REPO],
       );
       if (!result?.ok) throw new Error("同期に失敗しました");

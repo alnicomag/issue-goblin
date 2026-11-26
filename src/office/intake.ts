@@ -5,6 +5,7 @@
  * ここにある関数は純粋関数で、DBにもネットワークにも触れない。
  * 事務局は判断を持たず、人間がラベルで決めた優先度の順に並べて、枠に収まる分だけを拾う。
  */
+import { isAssignedTo } from "./assignees.ts";
 import type { Priority } from "./sync.ts";
 
 /** 着手の候補になるイシュー。DBにある、GitHubの写しから作る。 */
@@ -15,6 +16,8 @@ export interface IntakeIssue {
   readonly priority: Priority | null;
   /** 起票者のログイン名。分からなければ null。 */
   readonly author: string | null;
+  /** 担当者(assignee)のログイン名。分からなければ null。 */
+  readonly assignees: readonly string[] | null;
   /** `agent:skip` が付いているか。 */
   readonly agentSkip: boolean;
   /** 失敗の後、次に再試行してよい時刻(UTCのISO 8601形式)。待機がなければ null。 */
@@ -26,6 +29,11 @@ export interface IntakeRepo {
   readonly repo: string;
   /** 自動で着手してよい起票者(`issues.allowed_authors`)。 */
   readonly allowedAuthors: readonly string[];
+  /**
+   * 担当者で着手を分けるとき(設定の `assigned_only`)の、トークンの持ち主のログイン名。
+   * 分けないなら null。
+   */
+  readonly owner: string | null;
   /** 同時に進めてよい実行の数(`limits.max_parallel`)。 */
   readonly maxParallel: number;
   /** いま進んでいる実行の数。 */
@@ -44,6 +52,8 @@ export interface IntakeRepo {
  * - `unknown_repo`: 着手の条件を読めないリポジトリ(`factory.yml` が未取得または不正)。
  * - `agent_skip`: `agent:skip` が付いている。
  * - `author_not_allowed`: 起票者が `allowed_authors` にいない(分からない場合を含む)。
+ * - `not_assigned`: 担当者に、このファクトリーのトークンの持ち主がいない(分からない場合を含む)。
+ *   担当者で着手を分けるリポジトリ(`assigned_only`)だけで起きる。
  * - `waiting_retry`: 失敗の後の待機時間が過ぎていない。
  * - `preflight_pending`: 着手前の確認が済んでいない(確かめている途中を含む)。
  * - `preflight_failed`: 着手前の確認で、`commands.setup` がワーカーのイメージで通らなかった。
@@ -55,6 +65,7 @@ export type SkipReason =
   | "unknown_repo"
   | "agent_skip"
   | "author_not_allowed"
+  | "not_assigned"
   | "waiting_retry"
   | "preflight_pending"
   | "preflight_failed"
@@ -124,6 +135,7 @@ export function intakeBlocker(
   if (!isAllowedLogin(issue.author, repo.allowedAuthors)) {
     return "author_not_allowed";
   }
+  if (!isAssignedTo(issue.assignees, repo.owner)) return "not_assigned";
   if (issue.retryAt !== null && Date.parse(issue.retryAt) > now.getTime()) {
     return "waiting_retry";
   }

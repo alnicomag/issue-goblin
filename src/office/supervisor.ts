@@ -17,6 +17,7 @@
  * 進めなかった実行も、行うはずだったこととあわせてログに出す(`run.held`)。同じ内容を、毎回は出さない。
  */
 import { z } from "zod";
+import { parseAssignees } from "./assignees.ts";
 import {
   pendingChangeRequests,
   REWORK_LABEL,
@@ -216,6 +217,7 @@ interface ReadyRow {
   state: string;
   priority: string | null;
   author: string | null;
+  assignees: string | null;
   agent_skip: number;
 }
 
@@ -804,6 +806,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         intakeRepos.push({
           repo,
           allowedAuthors: factoryYml.issues.allowed_authors,
+          owner: runner.ownerFor?.(repo) ?? null,
           maxParallel: factoryYml.limits.max_parallel,
           // クローズを待っているだけの実行は、枠に数えない。
           active: running.filter(
@@ -820,7 +823,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     for (const repo of repos) {
       const rows = db
         .prepare(
-          `SELECT repo, number, state, priority, author, agent_skip
+          `SELECT repo, number, state, priority, author, assignees, agent_skip
            FROM issues WHERE repo = ? AND state = 'ready'`,
         )
         .all(repo) as ReadyRow[];
@@ -849,6 +852,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
           state: row.state,
           priority: PrioritySchema.parse(row.priority) as Priority | null,
           author: row.author,
+          assignees: parseAssignees(row.assignees),
           agentSkip: row.agent_skip !== 0,
           retryAt: retryNotBefore(db, row.repo, row.number),
         });
