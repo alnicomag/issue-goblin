@@ -348,3 +348,31 @@ describe("ワーカーの指示書(plan、implement、review)", () => {
     });
   });
 });
+
+describe("prompts/ の指示書すべて", () => {
+  const files = fs
+    .readdirSync(DEFAULT_PROMPTS_DIR)
+    .filter((file) => file.endsWith(".md"))
+    .sort();
+
+  it("指示書が1つ以上ある", () => {
+    expect(files.length).toBeGreaterThan(0);
+  });
+
+  it.each(files)(
+    "%s に、文字どおりの \\n(バックスラッシュと n)がない",
+    (file) => {
+      // 改行のつもりで書いた `\n` が残ると、箇条書きの項目が1行につながる。
+      const text = fs.readFileSync(
+        path.join(DEFAULT_PROMPTS_DIR, file),
+        "utf8",
+      );
+      const found = text
+        .split("\n")
+        .flatMap((line, index) =>
+          line.includes("\\n") ? [`${file}:${index + 1}`] : [],
+        );
+      expect(found).toEqual([]);
+    },
+  );
+});
