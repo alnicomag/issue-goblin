@@ -92,6 +92,8 @@ export type GitHubFileResult =
 
 /** GitHubとの通信の口。1つのインスタンスが1つのトークンに対応する。 */
 export interface GitHubApi {
+  /** このトークンの持ち主のログイン名。 */
+  getAuthenticatedLogin(): Promise<string>;
   /** `since` 以降に更新されたイシュー(オープンとクローズの両方。プルリクエストも含む)。 */
   listIssues(repo: string, since: string | null): Promise<GitHubIssue[]>;
   /** `since` 以降に更新されたイシューコメント。 */
@@ -621,6 +623,15 @@ export function createOctokitApi(options: {
   const fileEtags = new Map<string, { etag: string; sha: string }>();
 
   return {
+    async getAuthenticatedLogin() {
+      const response = await octokit.rest.users.getAuthenticated();
+      return parseResponse(
+        z.object({ login: z.string().min(1) }),
+        response.data,
+        "トークンの持ち主",
+      ).login;
+    },
+
     async listIssues(repo, since) {
       const items = await octokit.paginate(octokit.rest.issues.listForRepo, {
         ...splitRepo(repo),

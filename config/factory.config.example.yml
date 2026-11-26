@@ -37,3 +37,6 @@ repos:
     # 製品に固有のツールが要る場合は、製品の factory.yml の worker.dockerfile に Dockerfile の場所を書く。
     # 起動係が、worker_image を土台にしてビルドする。手でビルドしたイメージを使うときだけ、ここに書く。
     # worker_image: owner-name-worker # 省略可
+    # 同じ製品を複数のファクトリーが見るときは true にする。担当者(assignee)に、このトークンの持ち主が
+    # いるイシューだけに着手する。持ち主は、起動時にGitHubから読む。既定は false(担当者を見ない)。
+    # assigned_only: true # 省略可

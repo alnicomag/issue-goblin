@@ -83,6 +83,13 @@ export class FakeGitHub implements GitHubApi {
   failWritesWith: Error | null = null;
   pullRequests: FakePullRequest[] = [];
   readonly calls: Call[] = [];
+  /** このトークンの持ち主のログイン名。 */
+  login = "example-bot";
+
+  async getAuthenticatedLogin() {
+    if (this.failWith) throw this.failWith;
+    return this.login;
+  }
 
   get writes(): Call[] {
     return this.calls.filter((call) => WRITE_METHODS.includes(call.method));
