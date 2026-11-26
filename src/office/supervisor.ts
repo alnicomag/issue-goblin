@@ -45,6 +45,7 @@ import {
   findApproval,
   findResumableRuns,
   heldPublishStep,
+  heldStep,
   latestRun,
   listRunsOfIssue,
   listSteps,
@@ -151,8 +152,8 @@ export function heldMarker(
 
 const PathHitSchema = z.object({ path: z.string(), pattern: z.string() });
 
-/** publish が人間の対応待ちで止まったときの、チェックポイントの内容。 */
-const HeldOutputSchema = z.object({
+/** publish が、禁止や保護対象のパスで止まったときの、チェックポイントの内容。 */
+const PathHeldOutputSchema = z.object({
   status: z.enum(["needs_approval", "forbidden"]),
   headCommit: z.string().nullable(),
   forbidden: z.array(PathHitSchema),
@@ -163,6 +164,22 @@ const HeldOutputSchema = z.object({
    */
   protectedDiff: ProtectedDiffSchema.nullable().optional(),
 });
+
+/**
+ * prepare か publish が、リモートに残っていた作業用のブランチで止まったときの、チェックポイントの内容。
+ * ブランチの先頭が、このファクトリーが push した記録にない(別のファクトリーか、人間のもの)。
+ */
+const BranchHeldOutputSchema = z.object({
+  status: z.literal("branch_exists"),
+  branch: z.string(),
+  remoteHead: z.string(),
+});
+
+/** 人間の対応待ちで止まったときの、チェックポイントの内容。 */
+const HeldOutputSchema = z.union([
+  PathHeldOutputSchema,
+  BranchHeldOutputSchema,
+]);
 export type HeldOutput = z.infer<typeof HeldOutputSchema>;
 
 const HELD_EXPLANATIONS = {
@@ -199,6 +216,19 @@ export function heldComment(
   owner: string | null = null,
 ): string {
   const marker = heldMarker(runId, publishCount, owner);
+  if (output?.status === "branch_exists") {
+    return [
+      "リモートに、このファクトリーが push した記録のない作業用のブランチがあるので、止まりました。ブランチは上書きしていません。人間の対応を待ちます。自動では再試行しません。",
+      "",
+      `- 結果: \`${output.status}\``,
+      `- ブランチ: ${inlineCode(output.branch)}`,
+      `- リモートの先頭: ${inlineCode(output.remoteHead)}`,
+      "",
+      "別のファクトリー(前の担当など)の作業か、人間が push したコミットが残っています。内容を確かめて、要らなければ、リモートのブランチを消してから(開いているPRがあれば、閉じてから)、`state:ready` に戻してください。新しい実行として着手します。残す場合は、人間が作業を引き取ってください。",
+      "",
+      marker,
+    ].join("\n");
+  }
   const lines = [
     "PRを作る前の検査で止まりました。push もPRの作成もしていません。人間の対応を待ちます。自動では再試行しません。",
     "",
@@ -411,9 +441,9 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     );
   }
 
-  /** 止まった publish の記録を読む。読めなければ null。 */
+  /** 止まったステップ(prepare か publish)の記録を読む。読めなければ null。 */
   function readHeldOutput(run: Run): HeldOutput | null {
-    const held = heldPublishStep(db, run.id);
+    const held = heldStep(db, run.id);
     const parsed = HeldOutputSchema.safeParse(
       held?.step.output == null ? null : JSON.parse(held.step.output),
     );
@@ -442,13 +472,13 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
     await transition(run, "needs-info", "ワーカーが質問を返しました");
   }
 
-  /** publish が止まった理由をコメントして、`needs-info` に進める。 */
+  /** 人間の対応待ちで止まった理由をコメントして、`needs-info` に進める。 */
   async function hold(run: Run): Promise<void> {
     const output = readHeldOutput(run);
     if (output === null) {
       logger.warn("run.held_record_unreadable", fieldsOf(run));
     }
-    const count = heldPublishStep(db, run.id)?.count ?? 1;
+    const count = heldStep(db, run.id)?.count ?? 1;
     const owner = runner.ownerFor?.(run.repo) ?? null;
     await commentOnce(
       run,
@@ -458,11 +488,7 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       // コメントがすでにあれば外さない(コメントを見た人間が付けたラベルかもしれない)。
       () => dropApprovedLabel(run),
     );
-    await transition(
-      run,
-      "needs-info",
-      "publish が人間の対応待ちで止まりました",
-    );
+    await transition(run, "needs-info", "人間の対応待ちで止まりました");
   }
 
   /** 承認された実行を、publish から再開する。 */

@@ -20,13 +20,13 @@ export interface SettleInput {
     /** ステップを1つでも始めたか。 */
     readonly started: boolean;
     /**
-     * publish が人間の対応待ちで止まって終わった実行(`held`)の、止まり方。それ以外は省く。
+     * 人間の対応待ちで止まって終わった実行(`held`)の、止まり方。それ以外は省く。
      *
      * - `reason`: 止まった理由。記録から読めなければ null。
      * - `approval`: 止まったステップに対する承認の記録。`pending` は、記録したが、まだ再開していない。
      */
     readonly held?: {
-      readonly reason: "needs_approval" | "forbidden" | null;
+      readonly reason: "needs_approval" | "forbidden" | "branch_exists" | null;
       readonly approval: "none" | "pending" | "used";
     };
   } | null;

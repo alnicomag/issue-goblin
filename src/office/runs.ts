@@ -625,6 +625,63 @@ function parseApproval(row: unknown): Approval {
 }
 
 /**
+ * 実行が人間の対応待ち(`held`)で終わっていれば、その止まったステップと、
+ * その実行で、同じステップが止まった数(今回を含む)を返す。そうでなければ null。
+ * 止まるのは、prepare(リモートに残ったブランチ)と publish である。
+ */
+export function heldStep(
+  db: Db,
+  runId: number,
+): { step: Step; count: number } | null {
+  const steps = listSteps(db, runId);
+  const last = steps.at(-1);
+  if (last === undefined || last.status !== "held") return null;
+  const count = steps.filter(
+    (step) => step.name === last.name && step.status === "held",
+  ).length;
+  return { step: last, count };
+}
+
+/**
+ * このファクトリーが、そのイシューの作業用のブランチとして push した記録のあるコミット
+ * (`published` で終わった publish の `headCommit`)。読めない記録は、数えない。
+ */
+export function publishedHeads(
+  db: Db,
+  repo: string,
+  issueNumber: number,
+): Set<string> {
+  const rows = db
+    .prepare(
+      `SELECT steps.output AS output FROM steps
+       JOIN runs ON runs.id = steps.run_id
+       WHERE runs.repo = ? AND runs.issue_number = ?
+         AND steps.name = 'publish' AND steps.status = 'done'
+         AND steps.output IS NOT NULL`,
+    )
+    .all(repo, issueNumber) as { output: string }[];
+  const heads = new Set<string>();
+  for (const row of rows) {
+    const parsed = PublishedOutputSchema.safeParse(safeJson(row.output));
+    if (parsed.success) heads.add(parsed.data.headCommit);
+  }
+  return heads;
+}
+
+const PublishedOutputSchema = z.object({
+  status: z.literal("published"),
+  headCommit: z.string().min(1),
+});
+
+function safeJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 実行が publish の人間の対応待ち(`held`)で終わっていれば、その止まったステップと、
  * その実行で止まった publish の数(今回を含む)を返す。そうでなければ null。
  */

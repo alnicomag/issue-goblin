@@ -13,6 +13,7 @@ import { stringify as stringifyYaml } from "yaml";
 import { z } from "zod";
 import type { WorkerInvocation, WorkerInvoker } from "../agents/worker.ts";
 import type { WorkerLauncher } from "../launcher/client.ts";
+import { checkRemoteBranch, foreignBranchSummary } from "./branch-guard.ts";
 import {
   combineFeedback,
   formatChangeRequests,
@@ -361,6 +362,35 @@ async function executeStep(
 
   switch (step) {
     case "prepare": {
+      // 担当者で着手を分けるリポジトリでは、リモートに、別のファクトリーの作業用のブランチが
+      // 残っていないかを、作業場所を作る前に確かめる。残っていれば、Claudeを呼ぶ前に止める。
+      if ((deps.ownerFor?.(repo) ?? null) !== null) {
+        const { mirrorDir, branch } = workspacePaths(dirs, repo, issue);
+        await updateMirror(git, mirrorDir, deps.sourceFor(repo));
+        const remote = await checkRemoteBranch(
+          { db, git },
+          { mirrorDir, repo, issue, branch },
+        );
+        if (remote.kind === "foreign") {
+          const summary = foreignBranchSummary(branch, remote.tip);
+          deps.logger.warn("prepare.stopped", {
+            repo,
+            issue,
+            status: "branch_exists",
+            branch,
+            remote_head: remote.tip,
+          });
+          return {
+            outcome: "held",
+            output: {
+              summary,
+              status: "branch_exists",
+              branch,
+              remoteHead: remote.tip,
+            },
+          };
+        }
+      }
       const prepared = await prepareWorkspace(
         { git },
         {
@@ -525,6 +555,8 @@ async function executeStep(
           reviewSummary: lastDoneSummary(steps, "review"),
           // 人間が承認したコミット。承認から再開した実行だけが持つ。
           approvedCommit: approvedCommit(db, run.id),
+          // 担当者で着手を分けるリポジトリでは、別のファクトリーのブランチを上書きしない。
+          guardBranch: (deps.ownerFor?.(repo) ?? null) !== null,
         },
       );
       if (result.prNumber !== null) {
@@ -537,6 +569,9 @@ async function executeStep(
           status: result.status,
           awaitingApproval: result.awaitingApproval,
           headCommit: result.headCommit,
+          branch: result.branch,
+          // リモートに残っていたブランチで止まったとき、イシューへのコメントに載せる。
+          remoteHead: result.remoteHead,
           // 人間の対応待ちで止まったとき、イシューへのコメントに載せる。
           forbidden: result.forbidden,
           protected: result.protected,
