@@ -4,7 +4,13 @@
  */
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { findResumableRuns } from "../src/office/runs.ts";
-import type { Supervisor } from "../src/office/supervisor.ts";
+import {
+  heldComment,
+  heldMarker,
+  questionComment,
+  questionMarker,
+  type Supervisor,
+} from "../src/office/supervisor.ts";
 import { createHarness, type Harness, REPO } from "./factory-harness.ts";
 
 const OWNER = "example-bot";
@@ -269,5 +275,125 @@ describe("実行の途中で担当から外れたとき", () => {
     await tick();
     expect(h.labels(1)).toEqual(["state:in-review"]);
     expect(runStatuses()).toEqual(["running"]);
+  });
+});
+
+describe("イシューに残す目印", () => {
+  it("担当者で分けないなら、いままでの形のまま", () => {
+    expect(questionMarker(3)).toBe("<!-- factory:question run=3 -->");
+    expect(heldMarker(3)).toBe("<!-- factory:held run=3 -->");
+    expect(heldMarker(3, 2)).toBe("<!-- factory:held run=3 publish=2 -->");
+  });
+
+  it("担当者で分けるなら、持ち主のログイン名(小文字)を入れる", () => {
+    expect(questionMarker(3, "Example-Bot")).toBe(
+      "<!-- factory:question owner=example-bot run=3 -->",
+    );
+    expect(heldMarker(3, 1, "Example-Bot")).toBe(
+      "<!-- factory:held owner=example-bot run=3 -->",
+    );
+    expect(heldMarker(3, 2, "Example-Bot")).toBe(
+      "<!-- factory:held owner=example-bot run=3 publish=2 -->",
+    );
+    expect(questionComment(3, "質問", "example-bot")).toContain(
+      "<!-- factory:question owner=example-bot run=3 -->",
+    );
+    expect(heldComment(3, null, 1, "example-bot")).toContain(
+      "<!-- factory:held owner=example-bot run=3 -->",
+    );
+  });
+
+  it("別の持ち主の目印とも、持ち主のない目印とも、一致しない", () => {
+    const mine = questionMarker(1, "example-bot");
+    for (const other of [
+      questionMarker(1, "someone-else"),
+      questionMarker(1),
+      questionMarker(1, "example-bot-2"),
+      questionMarker(11, "example-bot"),
+    ]) {
+      expect(other.includes(mine)).toBe(false);
+      expect(mine.includes(other)).toBe(false);
+    }
+  });
+
+  it("目印を崩すログイン名は、通さない", () => {
+    expect(() => questionMarker(1, "a --> b")).toThrow(/ログイン名/);
+  });
+
+  describe("別のファクトリーの目印がイシューにあるとき", () => {
+    let h: Harness;
+    let supervisor: Supervisor;
+
+    beforeEach(() => {
+      h = createHarness({ owner: OWNER });
+      supervisor = h.newSupervisor();
+    });
+
+    afterEach(async () => {
+      await supervisor.stop(1000);
+      h.cleanup();
+    });
+
+    const tick = async () => {
+      await h.sync();
+      await supervisor.tick([REPO]);
+      await supervisor.idle();
+    };
+    const comments = () =>
+      h.fake.comments
+        .filter((comment) => comment.issueNumber === 1)
+        .map((comment) => comment.body);
+
+    it("同じ実行番号の、別の持ち主の質問があっても、自分の質問を書く。自分の質問は重ねない", async () => {
+      // 前の担当のファクトリー(DBは別)が、同じ番号の実行で残した質問。
+      h.fake.putComment({
+        id: 1,
+        issueNumber: 1,
+        body: questionComment(1, "前の担当の質問", OTHER),
+        updatedAt: "2026-03-01T00:10:00.000Z",
+      });
+      // 担当者で分ける前の形の目印。
+      h.fake.putComment({
+        id: 2,
+        issueNumber: 1,
+        body: questionComment(1, "古い形の質問"),
+        updatedAt: "2026-03-01T00:11:00.000Z",
+      });
+      h.worker.answer("plan", { status: "question", summary: "自分の質問" });
+      h.putIssue(1, { assignees: [OWNER] });
+
+      await tick();
+      await tick();
+      await tick();
+
+      expect(h.labels(1)).toEqual(["state:needs-info"]);
+      const mine = comments().filter((body) =>
+        body.includes(questionMarker(1, OWNER)),
+      );
+      expect(mine).toHaveLength(1);
+      expect(mine[0]).toContain("自分の質問");
+    });
+
+    it("同じ実行番号の、別の持ち主の対応待ちの知らせがあっても、自分の知らせを書く", async () => {
+      h.fake.putComment({
+        id: 1,
+        issueNumber: 1,
+        body: heldComment(1, null, 1, OTHER),
+        updatedAt: "2026-03-01T00:10:00.000Z",
+      });
+      h.worker.scripts.set("implement", (call) => {
+        h.worker.commitPath(call.repo, call.issue, "generated/out.txt");
+        return { status: "done", summary: "実装" };
+      });
+      h.putIssue(1, { assignees: [OWNER] });
+
+      await tick();
+      await tick();
+
+      expect(h.labels(1)).toEqual(["state:needs-info"]);
+      expect(
+        comments().filter((body) => body.includes(heldMarker(1, 1, OWNER))),
+      ).toHaveLength(1);
+    });
   });
 });

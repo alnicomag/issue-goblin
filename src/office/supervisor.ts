@@ -92,19 +92,43 @@ export interface Supervisor {
   activeRunIds(): number[];
 }
 
+/**
+ * 目印に入れる、ファクトリーの名乗り。
+ *
+ * 担当者で着手を分けるリポジトリ(設定の `assigned_only`)では、同じ製品を複数のファクトリーが見る。
+ * 実行の番号はファクトリーごとのDBで振るので、番号だけでは、別のファクトリーの目印と重なりうる。
+ * そのため、トークンの持ち主のログイン名(小文字)を入れる。分けないリポジトリ(`owner` が null)では、
+ * いままでの形のままにする。
+ */
+function ownerPart(owner: string | null): string {
+  if (owner === null) return "";
+  // ログイン名は英数字とハイフンだけのはずだが、目印を崩す文字が入らないことを確かめる。
+  if (!/^[A-Za-z0-9-]+$/.test(owner)) {
+    throw new Error(`トークンの持ち主のログイン名が不正です: ${owner}`);
+  }
+  return ` owner=${owner.toLowerCase()}`;
+}
+
 /** 質問のコメントに付ける目印。同じ実行の質問を、重ねて書かないために使う。 */
-export function questionMarker(runId: number): string {
-  return `<!-- factory:question run=${runId} -->`;
+export function questionMarker(
+  runId: number,
+  owner: string | null = null,
+): string {
+  return `<!-- factory:question${ownerPart(owner)} run=${runId} -->`;
 }
 
 /** 質問のコメントの本文。 */
-export function questionComment(runId: number, question: string): string {
+export function questionComment(
+  runId: number,
+  question: string,
+  owner: string | null = null,
+): string {
   return [
     "作業を進める前に、確認したいことがあります。",
     "",
     question.trim(),
     "",
-    questionMarker(runId),
+    questionMarker(runId, owner),
   ].join("\n");
 }
 
@@ -114,10 +138,15 @@ export function questionComment(runId: number, question: string): string {
  * `publishCount` は、その実行で止まった publish の数(今回を含む)。
  * 承認の後に再開した publish がまた止まった場合(2回目以降)は、回数を入れて、前の知らせと区別する。
  */
-export function heldMarker(runId: number, publishCount = 1): string {
+export function heldMarker(
+  runId: number,
+  publishCount = 1,
+  owner: string | null = null,
+): string {
+  const who = ownerPart(owner);
   return publishCount <= 1
-    ? `<!-- factory:held run=${runId} -->`
-    : `<!-- factory:held run=${runId} publish=${publishCount} -->`;
+    ? `<!-- factory:held${who} run=${runId} -->`
+    : `<!-- factory:held${who} run=${runId} publish=${publishCount} -->`;
 }
 
 const PathHitSchema = z.object({ path: z.string(), pattern: z.string() });
@@ -167,8 +196,9 @@ export function heldComment(
   runId: number,
   output: HeldOutput | null,
   publishCount = 1,
+  owner: string | null = null,
 ): string {
-  const marker = heldMarker(runId, publishCount);
+  const marker = heldMarker(runId, publishCount, owner);
   const lines = [
     "PRを作る前の検査で止まりました。push もPRの作成もしていません。人間の対応を待ちます。自動では再試行しません。",
     "",
@@ -403,10 +433,11 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
         ? summary
         : "(質問の内容を記録から読めませんでした。実行のログを確認してください)";
 
+    const owner = runner.ownerFor?.(run.repo) ?? null;
     await commentOnce(
       run,
-      questionMarker(run.id),
-      questionComment(run.id, question),
+      questionMarker(run.id, owner),
+      questionComment(run.id, question, owner),
     );
     await transition(run, "needs-info", "ワーカーが質問を返しました");
   }
@@ -418,10 +449,11 @@ export function createSupervisor(deps: SupervisorDeps): Supervisor {
       logger.warn("run.held_record_unreadable", fieldsOf(run));
     }
     const count = heldPublishStep(db, run.id)?.count ?? 1;
+    const owner = runner.ownerFor?.(run.repo) ?? null;
     await commentOnce(
       run,
-      heldMarker(run.id, count),
-      heldComment(run.id, output, count),
+      heldMarker(run.id, count, owner),
+      heldComment(run.id, output, count, owner),
       // 承認が効くのは、このコメントより後に付いたラベルだけにする。
       // コメントがすでにあれば外さない(コメントを見た人間が付けたラベルかもしれない)。
       () => dropApprovedLabel(run),
