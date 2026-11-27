@@ -4,10 +4,14 @@
  * 着手前の確認の結果(通らなかった場合は、コマンド、終了コード、出力の末尾)を表示する。
  * 続けて、全体について、当日に開始した実行の数と上限、進行中の実行、クローズ待ちの実行、
  * 再試行を待っているイシューを表示する。
- * DBは読み取り専用で開き、何も書き換えない。
+ * 最後に、稼働中のイメージの目印(作った元のコミット)を表示する。事務局は自分の環境変数から読み、
+ * 起動係とワーカーのイメージは、起動係に尋ねる(事務局はDockerソケットを持たない)。
+ * DBは読み取り専用で開き、何も書き換えない。起動係にも、読み取りの依頼しか送らない。
  */
 import fs from "node:fs";
 import Database from "better-sqlite3";
+import { createImageReporter, type ImageReporter } from "../launcher/client.ts";
+import type { ImageInfo, ImagesReport } from "../launcher/request.ts";
 import { systemClock } from "./clock.ts";
 import { DEFAULT_CONFIG_PATH, loadConfig } from "./config.ts";
 import type { Db } from "./db.ts";
@@ -17,6 +21,7 @@ import {
   type PreflightRecord,
   readPreflight,
 } from "./preflight.ts";
+import { formatRevision, revisionFromEnv } from "./revision.ts";
 import type { StepName } from "./run-steps.ts";
 import {
   countRunsStartedToday,
@@ -257,9 +262,117 @@ export function preflightLines(record: PreflightRecord | null): string[] {
   return lines;
 }
 
+/** 稼働中のイメージの状況。 */
+export interface ImageStatus {
+  /** 事務局のイメージの目印。目印のないイメージでは null。 */
+  readonly officeRevision: string | null;
+  /** 起動係から得た情報。得られなければ null で、理由が `error` に入る。 */
+  readonly report: ImagesReport | null;
+  readonly error: string | null;
+}
+
+/**
+ * イメージの状況を集める。起動係に届かなくても失敗させず、理由を残す
+ * (ホストから実行した場合や、起動係が止まっている場合にも、ほかの欄を表示できるようにするため)。
+ */
+export async function collectImageStatus(input: {
+  env: Record<string, string | undefined>;
+  reporter: ImageReporter;
+}): Promise<ImageStatus> {
+  const officeRevision = revisionFromEnv(input.env);
+  try {
+    return {
+      officeRevision,
+      report: await input.reporter.images(),
+      error: null,
+    };
+  } catch (error) {
+    return {
+      officeRevision,
+      report: null,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/** ワーカーのイメージ1つを、表示の1行分の列にする。 */
+function imageRow(image: ImageInfo): string[] {
+  const kind =
+    image.base === "self"
+      ? "基本"
+      : image.kind === "built"
+        ? "製品用(起動係がビルド)"
+        : "製品用(設定で指定)";
+  const repos = image.repos.join(", ");
+  if (!image.present) {
+    return [image.image, kind, "手元にありません", "", "", repos];
+  }
+  const base =
+    image.base === "self"
+      ? ""
+      : image.base === "current"
+        ? "土台: いまの基本"
+        : image.base === "stale"
+          ? image.kind === "built"
+            ? "土台: いまの基本ではありません(次の実行の前に、作り直されます)"
+            : "土台: いまの基本ではありません(作り直しが要ります)"
+          : "土台: 不明(基本が手元にありません)";
+  return [
+    image.image,
+    kind,
+    `目印 ${formatRevision(image.revision)}`,
+    `作成 ${image.created ?? "不明"}`,
+    base,
+    repos,
+  ];
+}
+
+/**
+ * イメージの状況を、表示の行にする。純粋関数。
+ *
+ * 目印のないイメージ(これまでの作り方のもの)は「不明」と出す。
+ */
+export function imageLines(status: ImageStatus): string[] {
+  const { report } = status;
+  const lines = [
+    "イメージ(目印は、作った元のコミット。手元のコードの目印は scripts/revision.sh で出せます)",
+    "  常駐用",
+    `    office    ${formatRevision(status.officeRevision)}`,
+    `    launcher  ${
+      report === null
+        ? "不明(起動係から取得できませんでした)"
+        : formatRevision(report.revision)
+    }`,
+    "    proxy     ここには出ません(docker compose logs proxy の proxy.started にあります)",
+  ];
+  if (report === null) {
+    lines.push(
+      `  ワーカー: 不明(起動係から取得できませんでした: ${status.error ?? "理由不明"})`,
+    );
+    return lines;
+  }
+  if (report.images.length === 0) {
+    lines.push("  ワーカー: なし");
+    return lines;
+  }
+  lines.push("  ワーカー");
+  const rows = report.images.map(imageRow);
+  const widths = rows.reduce<number[]>(
+    (acc, row) => row.map((cell, i) => Math.max(acc[i] ?? 0, cell.length)),
+    [],
+  );
+  for (const row of rows) {
+    lines.push(
+      `    ${row.map((cell, i) => cell.padEnd(widths[i] ?? 0)).join("  ")}`.trimEnd(),
+    );
+  }
+  return lines;
+}
+
 export function formatStatus(
   statuses: readonly RepoStatus[],
   runs: RunStatus,
+  images?: ImageStatus,
 ): string {
   const lines: string[] = [];
   if (statuses.length === 0) lines.push("リポジトリがありません。", "");
@@ -309,10 +422,14 @@ export function formatStatus(
     ]),
   );
   lines.push("");
+  if (images !== undefined) lines.push(...imageLines(images), "");
   return lines.join("\n");
 }
 
-function main(): void {
+/** 起動係のUnixソケットの既定の場所。環境変数 LAUNCHER_SOCKET で変えられる。 */
+const DEFAULT_LAUNCHER_SOCKET = "/run/launcher/launcher.sock";
+
+async function main(): Promise<void> {
   const config = loadConfig(process.env.FACTORY_CONFIG ?? DEFAULT_CONFIG_PATH);
   if (!fs.existsSync(config.db_path)) {
     throw new Error(
@@ -329,19 +446,23 @@ function main(): void {
       now: systemClock.now(),
       dailyRunLimit: config.daily_run_limit,
     });
-    process.stdout.write(formatStatus(statuses, runs));
+    const images = await collectImageStatus({
+      env: process.env,
+      reporter: createImageReporter({
+        socketPath: process.env.LAUNCHER_SOCKET ?? DEFAULT_LAUNCHER_SOCKET,
+      }),
+    });
+    process.stdout.write(formatStatus(statuses, runs, images));
   } finally {
     db.close();
   }
 }
 
 if (import.meta.main) {
-  try {
-    main();
-  } catch (error) {
+  main().catch((error: unknown) => {
     process.stderr.write(
       `${error instanceof Error ? error.message : String(error)}\n`,
     );
     process.exitCode = 1;
-  }
+  });
 }

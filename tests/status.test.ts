@@ -13,9 +13,12 @@ import {
 import type { StepName, StepOutcome } from "../src/office/run-steps.ts";
 import { finishStep, startRun, startStep } from "../src/office/runs.ts";
 import {
+  collectImageStatus,
   collectRunStatus,
   collectStatus,
   formatStatus,
+  type ImageStatus,
+  imageLines,
   preflightLines,
   type RunStatus,
   STATUS_TAIL_LINES,
@@ -474,5 +477,154 @@ describe("実行の状況", () => {
         readonly.close();
       }
     });
+  });
+});
+
+describe("イメージの状況", () => {
+  const COMMIT = "0123456789abcdef0123456789abcdef01234567";
+  const OLD_COMMIT = "89abcdef0123456789abcdef0123456789abcdef";
+
+  const REPORT: NonNullable<ImageStatus["report"]> = {
+    revision: `${COMMIT}-dirty`,
+    base_image: "factory-worker",
+    images: [
+      {
+        kind: "configured",
+        image: "factory-worker",
+        repos: ["owner/name", "owner/other"],
+        present: true,
+        created: "2026-03-01T00:00:00.000Z",
+        revision: COMMIT,
+        base: "self",
+      },
+      {
+        kind: "configured",
+        image: "manual-worker",
+        repos: ["owner/manual"],
+        present: true,
+        created: "2026-02-01T00:00:00.000Z",
+        revision: OLD_COMMIT,
+        base: "stale",
+      },
+      {
+        kind: "configured",
+        image: "missing-worker",
+        repos: ["owner/missing"],
+        present: false,
+        created: null,
+        revision: null,
+        base: "unknown",
+      },
+      {
+        kind: "built",
+        image: "factory-built:abc",
+        repos: ["owner/name"],
+        present: true,
+        created: "2026-03-01T00:10:00.000Z",
+        revision: null,
+        base: "current",
+      },
+    ],
+  };
+
+  const line = (lines: string[], needle: string) =>
+    lines.find((candidate) => candidate.includes(needle)) ?? "";
+
+  it("常駐用の目印と、ワーカーのイメージごとの目印、作った時刻、使う製品が出る", () => {
+    const lines = imageLines({
+      officeRevision: COMMIT,
+      report: REPORT,
+      error: null,
+    });
+    expect(line(lines, "office")).toContain("0123456789ab");
+    expect(line(lines, "launcher")).toContain(
+      "0123456789ab(未コミットの変更あり)",
+    );
+    const base = line(lines, "factory-worker ");
+    expect(base).toContain("基本");
+    expect(base).toContain("目印 0123456789ab");
+    expect(base).toContain("作成 2026-03-01T00:00:00.000Z");
+    expect(base).toContain("owner/name, owner/other");
+  });
+
+  it("手元にないイメージは、ないことが出る", () => {
+    const lines = imageLines({
+      officeRevision: COMMIT,
+      report: REPORT,
+      error: null,
+    });
+    expect(line(lines, "missing-worker")).toContain("手元にありません");
+    expect(line(lines, "missing-worker")).toContain("owner/missing");
+  });
+
+  it("製品用が、いまの基本を土台にしていなければ、それが出る", () => {
+    const lines = imageLines({
+      officeRevision: COMMIT,
+      report: REPORT,
+      error: null,
+    });
+    expect(line(lines, "manual-worker")).toContain(
+      "土台: いまの基本ではありません(作り直しが要ります)",
+    );
+    expect(line(lines, "manual-worker")).toContain("目印 89abcdef0123");
+    expect(line(lines, "factory-built:abc")).toContain("土台: いまの基本");
+    expect(line(lines, "factory-built:abc")).not.toContain("ではありません");
+  });
+
+  it("目印のないイメージ(これまでの作り方のもの)は、不明と出る", () => {
+    const lines = imageLines({
+      officeRevision: null,
+      report: { ...REPORT, revision: null },
+      error: null,
+    });
+    expect(line(lines, "office")).toContain("不明");
+    expect(line(lines, "launcher")).toContain("不明");
+    expect(line(lines, "factory-built:abc")).toContain("目印 不明");
+  });
+
+  it("起動係に届かなくても失敗せず、事務局の目印と、取得できなかった理由が出る", async () => {
+    const status = await collectImageStatus({
+      env: { FACTORY_REVISION: COMMIT },
+      reporter: {
+        images: async () => {
+          throw new Error("起動係に届きません: /run/launcher/launcher.sock");
+        },
+      },
+    });
+    expect(status).toEqual({
+      officeRevision: COMMIT,
+      report: null,
+      error: "起動係に届きません: /run/launcher/launcher.sock",
+    });
+    const lines = imageLines(status);
+    expect(line(lines, "office")).toContain("0123456789ab");
+    expect(line(lines, "launcher")).toContain("不明");
+    expect(line(lines, "ワーカー")).toContain(
+      "不明(起動係から取得できませんでした: 起動係に届きません: /run/launcher/launcher.sock)",
+    );
+  });
+
+  it("起動係から得た情報を、そのまま集める", async () => {
+    const status = await collectImageStatus({
+      env: {},
+      reporter: { images: async () => REPORT },
+    });
+    expect(status).toEqual({
+      officeRevision: null,
+      report: REPORT,
+      error: null,
+    });
+  });
+
+  it("状況表示の最後に、イメージの節が付く", () => {
+    const text = formatStatus([], NO_RUNS, {
+      officeRevision: COMMIT,
+      report: REPORT,
+      error: null,
+    });
+    expect(text).toContain("イメージ(目印は、作った元のコミット");
+    expect(text.indexOf("イメージ(目印")).toBeGreaterThan(
+      text.indexOf("再試行を待っているイシュー"),
+    );
   });
 });

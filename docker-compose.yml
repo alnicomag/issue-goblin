@@ -7,6 +7,7 @@
 #   LAUNCHER_ENV_FILE    起動係の環境変数(既定: .env.launcher)
 #   DOCKER_GID           ホストの docker グループの番号(起動係に必要)
 #   WORKER_IMAGE         ワーカーの基本イメージに付ける名前(既定: factory-worker)。設定の worker_image と揃える
+#   FACTORY_REVISION     イメージに付ける目印(作った元のコミット)。ビルドのときに scripts/revision.sh の出力を渡す
 
 services:
   # 事務局。GitHubのトークンとDBを持つ。Dockerソケットは持たない。
@@ -14,6 +15,8 @@ services:
     build:
       context: .
       target: office
+      args:
+        FACTORY_REVISION: ${FACTORY_REVISION:-}
     # コンテナの異常終了と、ホスト(EC2)の再起動のどちらからも自動で復旧する。
     restart: unless-stopped
     init: true
@@ -40,6 +43,8 @@ services:
     build:
       context: .
       target: launcher
+      args:
+        FACTORY_REVISION: ${FACTORY_REVISION:-}
     restart: unless-stopped
     init: true
     # Claudeのトークンは .env.launcher から渡す(Git管理外)。事務局には渡さない。
@@ -78,6 +83,8 @@ services:
     build:
       context: .
       target: proxy
+      args:
+        FACTORY_REVISION: ${FACTORY_REVISION:-}
     restart: unless-stopped
     init: true
     networks:
@@ -99,6 +106,8 @@ services:
     build:
       context: .
       dockerfile: docker/worker.Dockerfile
+      args:
+        FACTORY_REVISION: ${FACTORY_REVISION:-}
     image: ${WORKER_IMAGE:-factory-worker}
     profiles:
       - build

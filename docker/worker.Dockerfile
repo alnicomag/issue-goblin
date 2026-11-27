@@ -25,3 +25,8 @@ RUN npm install --global "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
 # 事務局の実行ユーザーと同じuid(1000)。作業場所の所有者をそろえる。
 USER node
 WORKDIR /workspace
+
+# 作った元のコミット(scripts/revision.sh の出力)。渡さなければ空で、目印は「不明」になる。
+# ラベルは、このイメージを土台にした製品用のイメージにも引き継がれる。
+ARG FACTORY_REVISION=
+LABEL factory.revision=$FACTORY_REVISION

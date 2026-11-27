@@ -26,9 +26,11 @@ docker compose config --format json | jq -r .name    # プロジェクト名を�
 
 | イメージ | 定義の場所 | 作り方 | 作り直すとき |
 | --- | --- | --- | --- |
-| 常駐用(`<プロジェクト>-office`、`-launcher`、`-proxy`) | このリポジトリの `Dockerfile`(1つのファイルに、3つのターゲット) | `docker compose up -d --build` | このリポジトリのコード、指示書、マイグレーションを更新したとき |
-| ワーカーの基本(既定の名前は `factory-worker`) | このリポジトリの `docker/worker.Dockerfile` | `docker compose build worker-image` | Claude Code の版を上げるとき。土台の `node:22-slim` を更新したいとき |
+| 常駐用(`<プロジェクト>-office`、`-launcher`、`-proxy`) | このリポジトリの `Dockerfile`(1つのファイルに、3つのターゲット) | `FACTORY_REVISION="$(scripts/revision.sh)" docker compose up -d --build` | このリポジトリのコード、指示書、マイグレーションを更新したとき |
+| ワーカーの基本(既定の名前は `factory-worker`) | このリポジトリの `docker/worker.Dockerfile` | `FACTORY_REVISION="$(scripts/revision.sh)" docker compose build worker-image` | Claude Code の版を上げるとき。土台の `node:22-slim` を更新したいとき |
 | 製品用のワーカー(`factory-built:<ハッシュ>`) | 製品リポジトリの Dockerfile(製品の `factory.yml` の `worker.dockerfile` が指すファイル) | 起動係が、必要なときに自動でビルドする(下の「製品用のイメージ」) | 自動。製品の定義か、ワーカーの基本が変わると、次の実行の前にビルドし直される |
+
+常駐用とワーカーの基本には、ビルドのときに、目印(作った元のコミット)を付けます。`scripts/revision.sh` の出力を、`FACTORY_REVISION` で渡します。渡し忘れてもビルドは通りますが、目印は「不明」になります(下の「イメージが古くないかを確かめる」)。
 
 常駐用の3つは、中身がほとんど同じです。違いは、事務局にだけ git があり、起動係にだけ docker コマンドがあることです。指示書(`prompts/`)は常駐用のイメージに入っているので、指示書だけを変えたときも、常駐用を作り直します。
 
@@ -114,8 +116,8 @@ docker build -f /tmp/owner-name/.factory/worker.Dockerfile \
 
 上から順に行います。下のものは、上のものに依存します。
 
-1. 常駐用(`docker compose up -d --build`)。コンテナも入れ替わります。
-2. ワーカーの基本(`docker compose build worker-image`)。
+1. 常駐用(`FACTORY_REVISION="$(scripts/revision.sh)" docker compose up -d --build`)。コンテナも入れ替わります。
+2. ワーカーの基本(`FACTORY_REVISION="$(scripts/revision.sh)" docker compose build worker-image`)。
 3. 製品用。`worker.dockerfile` を書いた製品は、起動係が次の実行の前に自動でビルドし直すので、何もしません。手でビルドしたもの(設定の `worker_image` で指定したもの)だけ、製品ごとに `docker build` します。
 
 1は、2と3から独立しています。常駐用だけを作り直すとき、ワーカーのイメージを作り直す必要はありません。2を行ったら、手でビルドした製品用があれば、必ず3も行います。
@@ -167,24 +169,71 @@ docker ps --filter label=factory.worker    # 実行中のワーカー
 
 ## イメージが古くないかを確かめる
 
-作り直しを忘れても、ファクトリーは古いイメージのまま動き続けます。次の方法で確かめます。目印を付けて確かめられるようにする仕組みは #50 が扱います。
+作り直しを忘れても、ファクトリーは古いイメージのまま動き続けます。稼働中のものが、どのコミットから作ったイメージで動いているかは、状況表示で見られます。
 
-**常駐用が、手元のコードより古くないか。** イメージを作った時刻と、最後のコミットの時刻を比べます。イメージのほうが古ければ、作り直します。
+### 目印
 
-```bash
-docker compose images
-docker image inspect "$(docker compose config --format json | jq -r .name)-office" --format '{{.Created}}'
-git log -1 --format=%cI
-```
-
-時刻の表記(タイムゾーン)が違うことに注意します。文書だけのコミットの後なら、古くても作り直す必要はありません。
-
-**手でビルドした製品用が、いまの基本を土台にしているか。** 起動係がビルドした製品用(`factory-built:<ハッシュ>`)は、名前が基本のイメージのIDから決まるので、確かめる必要はありません。手でビルドしたものは、基本のいちばん上の層が、製品用に含まれているかを見ます。`1` なら含まれていて、`0` なら基本を作り直した後に製品用を作り直していません。
+常駐用とワーカーの基本には、ビルドのときに、作った元のコミットを目印として付けます。
 
 ```bash
-top="$(docker image inspect factory-worker --format '{{range .RootFS.Layers}}{{println .}}{{end}}' | grep . | tail -1)"
-docker image inspect owner-name-worker --format '{{range .RootFS.Layers}}{{println .}}{{end}}' | grep -c "$top"
+scripts/revision.sh    # 手元のコードの目印を出す
 ```
+
+- **値は、このリポジトリの HEAD のコミット(40桁)です。** 作業ツリーに未コミットの変更(未追跡のファイルを含む。Git管理外として無視されているものは除く)があれば、末尾に `-dirty` が付きます。
+- **ビルドのときに、`FACTORY_REVISION` で渡します**(「作り直しの順」のコマンド)。イメージのラベル `factory.revision` に入ります。常駐用では、コンテナの環境変数 `FACTORY_REVISION` にも入り、各プロセスが起動のログに出します。
+- **渡さずに作ったイメージと、これまでの作り方のイメージは、「不明」と出ます。** 失敗はしません。
+- **製品用のイメージは、土台にした基本のラベルを引き継ぎます。** 製品用に出る目印は、ビルドした時点の基本のものです。
+- **目印として扱うのは、コミットの形の値だけです。** ラベルに別の文字列が書かれていても、表示にもログにも出しません。
+
+### 状況表示で見る
+
+```bash
+docker compose exec office node src/office/status.ts
+```
+
+```text
+イメージ(目印は、作った元のコミット。手元のコードの目印は scripts/revision.sh で出せます)
+  常駐用
+    office    0123456789ab
+    launcher  0123456789ab
+    proxy     ここには出ません(docker compose logs proxy の proxy.started にあります)
+  ワーカー
+    factory-worker         基本                      目印 0123456789ab  作成 2026-01-01T00:00:00.000Z                    owner/name
+    owner-other-worker     製品用(設定で指定)      目印 89abcdef0123  作成 2025-12-01T00:00:00.000Z  土台: いまの基本ではありません(作り直しが要ります)  owner/other
+    factory-built:<ハッシュ>  製品用(起動係がビルド)  目印 0123456789ab  作成 2026-01-01T00:10:00.000Z  土台: いまの基本  owner/name
+```
+
+- **常駐用:** `office` は、事務局が自分の環境変数から読みます。`launcher` は、起動係の自己申告です。`proxy` は、事務局からも起動係からも届かないので、起動のログで見ます。
+
+  ```bash
+  docker compose logs office launcher proxy | grep -e office.started -e launcher.started -e proxy.started
+  ```
+
+- **ワーカー:** 設定にあるイメージ(全体と、製品ごとの `worker_image`)と、起動係がビルドした製品用を、起動係に尋ねて出します。手元にないイメージは「手元にありません」と出ます。事務局はDockerソケットを持たないので、起動係の読み取りだけの口(`GET /images`)を使います。調べる対象は設定から決まり、依頼では選べません。
+- **起動係に届かない場合**(ホストで `pnpm run status` を実行した場合、起動係が止まっている場合、起動係のイメージがこの口より古い場合)は、ワーカーの欄が「不明」になり、理由が出ます。ほかの欄は表示されます。
+
+### 見比べる
+
+**常駐用と基本が、手元のコードより古くないか。** 状況表示の目印(先頭の12桁)と、`scripts/revision.sh` の出力を比べます。違っていれば、そのイメージは別のコミットから作ったものです。
+
+```bash
+scripts/revision.sh
+git log --oneline <目印>..HEAD    # 目印の後に入ったコミット
+```
+
+- 後に入ったコミットが文書だけなら、作り直す必要はありません。
+- 「未コミットの変更あり」と出るイメージは、コミットにない内容を含んでいます。コミットしてから作り直します。
+- 「作成」の時刻は、古さの目安にはなりません。ビルドのキャッシュが効くと、作り直しても前の時刻のままのことがあります。古さは、目印で見ます。
+- 「不明」と出るイメージは、`FACTORY_REVISION` を渡して作り直すと、目印が付きます。それまでは、作った時刻(状況表示の「作成」、常駐用は `docker compose images`)と `git log -1 --format=%cI` を比べます。
+
+**製品用が、いまの基本を土台にしているか。** 状況表示の「土台」で分かります。起動係は、基本の層の並びが、製品用の層の先頭にそのまま含まれるかを見ています。
+
+| 表示 | 意味 | すること |
+| --- | --- | --- |
+| いまの基本 | いま手元にある基本を土台にしている | なし |
+| いまの基本ではありません(作り直しが要ります) | 手でビルドした製品用(設定の `worker_image` で指定したもの)が、基本を作り直す前のままになっている。または、基本を土台にしていない | 「手でビルドする場合」のとおりに作り直す |
+| いまの基本ではありません(次の実行の前に、作り直されます) | 起動係がビルドした製品用が、基本を作り直す前のもの | なし。次の実行の前に、起動係がビルドし直し、古いものを消す |
+| 不明(基本が手元にありません) | 比べる相手の基本がない | 基本を作る |
 
 **Claude Code の版が揃っているか。**
 

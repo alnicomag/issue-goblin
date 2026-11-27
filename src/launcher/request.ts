@@ -145,3 +145,45 @@ export const RunResultSchema = z.strictObject({
 });
 
 export type RunResult = z.infer<typeof RunResultSchema>;
+
+/**
+ * 製品用のイメージと、その土台(基本のイメージ)の関係。
+ *
+ * - `self`: 基本のイメージそのもの(設定の全体の `worker_image`)。
+ * - `current`: いま手元にある基本を土台にしている(基本の層を、そのまま先頭に含む)。
+ * - `stale`: いまの基本を土台にしていない(基本を作り直した後に、作り直していない。または、基本を土台にしていない)。
+ * - `unknown`: 比べられない(このイメージか、基本が、手元にない)。
+ */
+export const IMAGE_BASES = ["self", "current", "stale", "unknown"] as const;
+export type ImageBase = (typeof IMAGE_BASES)[number];
+
+/**
+ * ワーカーのイメージ1つの情報。
+ *
+ * - `configured`: 設定にあるイメージ(全体か、製品ごとの `worker_image`)。
+ * - `built`: 起動係が、製品の Dockerfile からビルドしたイメージ。
+ */
+export const ImageInfoSchema = z.strictObject({
+  kind: z.enum(["configured", "built"]),
+  image: z.string(),
+  /** このイメージを使う製品(設定にある書き方のリポジトリ名)。 */
+  repos: z.array(z.string()),
+  /** 手元にあるか。 */
+  present: z.boolean(),
+  /** 作った時刻(UTCのISO 8601形式)。手元にないか、読めなければ null。 */
+  created: z.string().nullable(),
+  /** 目印(作った元のコミット)。目印のないイメージと、手元にないイメージは null。 */
+  revision: z.string().nullable(),
+  base: z.enum(IMAGE_BASES),
+});
+export type ImageInfo = z.infer<typeof ImageInfoSchema>;
+
+/** `GET /images` の応答。稼働中の起動係と、ワーカーのイメージが、どの目印のものかを表す。 */
+export const ImagesReportSchema = z.strictObject({
+  /** 起動係自身のイメージの目印。目印のないイメージでは null。 */
+  revision: z.string().nullable(),
+  /** 基本のイメージの名前(設定の全体の `worker_image`)。 */
+  base_image: z.string(),
+  images: z.array(ImageInfoSchema),
+});
+export type ImagesReport = z.infer<typeof ImagesReportSchema>;

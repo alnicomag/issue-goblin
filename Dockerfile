@@ -40,10 +40,18 @@ USER node
 # 起動係。Dockerソケットを持つので、docker コマンドを足す。
 FROM app AS launcher
 COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+# 作った元のコミット(scripts/revision.sh の出力)。渡さなければ空で、目印は「不明」になる。
+# 末尾に置いて、コミットが変わっても、上の層を作り直さずに済むようにする。
+ARG FACTORY_REVISION=
+LABEL factory.revision=$FACTORY_REVISION
+ENV FACTORY_REVISION=$FACTORY_REVISION
 CMD ["node", "src/launcher/main.ts"]
 
 # プロキシ。ワーカーの通信を直接受けるので、使わないものを持たせない。
 FROM app AS proxy
+ARG FACTORY_REVISION=
+LABEL factory.revision=$FACTORY_REVISION
+ENV FACTORY_REVISION=$FACTORY_REVISION
 CMD ["node", "src/proxy/main.ts"]
 
 # 事務局。git のある実行環境に、同じアプリのコードを入れる。
@@ -51,4 +59,7 @@ CMD ["node", "src/proxy/main.ts"]
 FROM runtime-git AS office
 COPY --from=app /app /app
 USER node
+ARG FACTORY_REVISION=
+LABEL factory.revision=$FACTORY_REVISION
+ENV FACTORY_REVISION=$FACTORY_REVISION
 CMD ["node", "src/office/main.ts"]

@@ -3,6 +3,8 @@
  *
  * - `POST /run`: 依頼を1件実行し、終わったら結果を返す。
  * - `GET /health`: 動いていることを返す。
+ * - `GET /images`: 起動係自身と、ワーカーのイメージが、どの目印のものかを返す。読むだけで、
+ *   本文もクエリも受け付けない(調べる対象は、設定から決まる)。
  *
  * ソケットは、事務局と起動係だけが共有するボリュームに置く。
  */
@@ -61,8 +63,17 @@ export function createLauncherServer(deps: {
       send(response, 200, { ok: true });
       return;
     }
+    // クエリの付いたものは、パスが一致しないので、ここを通らない。
+    if (request.method === "GET" && request.url === "/images") {
+      // 本文は使わない。読まずに捨てる。
+      request.resume();
+      send(response, 200, await launcher.inspectImages());
+      return;
+    }
     if (request.method !== "POST" || request.url !== "/run") {
-      send(response, 404, { error: "POST /run だけを受け付けます" });
+      send(response, 404, {
+        error: "POST /run、GET /images、GET /health だけを受け付けます",
+      });
       return;
     }
 

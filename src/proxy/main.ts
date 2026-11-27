@@ -6,6 +6,7 @@
  */
 import dns from "node:dns/promises";
 import { createLogger, errorFields } from "../office/log.ts";
+import { revisionFromEnv } from "../office/revision.ts";
 import { createProxyServer } from "./server.ts";
 
 export const DEFAULT_PROXY_PORT = 3128;
@@ -24,7 +25,12 @@ function main(): void {
       return results.map((result) => result.address);
     },
   });
-  server.listen(port, () => logger.info("proxy.started", { port }));
+  server.listen(port, () =>
+    logger.info("proxy.started", {
+      revision: revisionFromEnv(process.env),
+      port,
+    }),
+  );
 
   for (const name of ["SIGTERM", "SIGINT"] as const) {
     process.on(name, () => {

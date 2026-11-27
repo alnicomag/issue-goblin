@@ -29,6 +29,7 @@ import { createLogger, errorFields, type Logger } from "./log.ts";
 import { createPreflightGate } from "./preflight.ts";
 import { readStoredWorkerDockerfile } from "./product.ts";
 import { withProductImage } from "./product-image.ts";
+import { revisionFromEnv } from "./revision.ts";
 import type { RunnerDeps } from "./runner.ts";
 import { createSupervisor, type Supervisor } from "./supervisor.ts";
 import { type SyncDeps, syncAll } from "./sync.ts";
@@ -162,6 +163,8 @@ async function main(): Promise<boolean> {
   try {
     const migration = migrate(db, { clock });
     logger.info("office.started", {
+      // 常駐用のイメージの目印(作った元のコミット)。目印のないイメージでは null。
+      revision: revisionFromEnv(process.env),
       config: configPath,
       dry_run: config.dry_run,
       poll_interval_sec: config.poll_interval_sec,
