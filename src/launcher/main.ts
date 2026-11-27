@@ -13,6 +13,7 @@ import {
   loadConfig,
 } from "../office/config.ts";
 import { createLogger, errorFields } from "../office/log.ts";
+import { revisionFromEnv } from "../office/revision.ts";
 import { CLAUDE_TOKEN_ENV, type ContainerSettings } from "./container.ts";
 import { createDockerCli } from "./docker.ts";
 import { createLauncher } from "./launcher.ts";
@@ -137,6 +138,7 @@ async function main(): Promise<void> {
     });
   });
   logger.info("launcher.started", {
+    revision: revisionFromEnv(process.env),
     socket: socketPath,
     repos: config.repos.map((repo) => repo.repo),
     network: settings.network,
