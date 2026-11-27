@@ -4,8 +4,10 @@
  * 起動係はDockerソケットを持つので、受け付けるものを決まった形の依頼だけに絞る。
  * GitHubのトークンもDBも持たず、製品のコードもイシューの文章も読まない。
  */
+import { z } from "zod";
 import { type FactoryConfig, workerImageFor } from "../office/config.ts";
 import { errorFields, type Logger } from "../office/log.ts";
+import { parseRevision, REVISION_LABEL } from "../office/revision.ts";
 import {
   buildRunArgs,
   CLAUDE_TOKEN_ENV,
@@ -21,12 +23,26 @@ import {
   buildProbeArgs,
   builtImageFilters,
   builtImageName,
+  IMAGE_DETAILS_FORMAT,
+  isBuiltOn,
 } from "./image.ts";
 import {
   BUILD_TIMEOUT_SEC,
+  type ImageBase,
+  type ImageInfo,
+  type ImagesReport,
   parseRunRequest,
   type RunResult,
 } from "./request.ts";
+
+/** `docker image inspect` で読む、イメージの情報。 */
+const ImageDetailsSchema = z.object({
+  id: z.string(),
+  created: z.string(),
+  labels: z.record(z.string(), z.string()).nullable(),
+  layers: z.array(z.string()).nullable(),
+});
+type ImageDetails = z.infer<typeof ImageDetailsSchema>;
 
 /** ワーカーの標準出力と標準エラーの、それぞれの上限。 */
 export const MAX_OUTPUT_BYTES = 16 * 1024 * 1024;
@@ -74,6 +90,12 @@ export interface Launcher {
    * 基本イメージが手元になくて試せない場合は、null を返す。
    */
   checkBuilder(): Promise<boolean | null>;
+  /**
+   * 起動係自身と、ワーカーのイメージ(設定にあるものと、起動係がビルドしたもの)が、
+   * どの目印のものかを調べる。読むだけで、何も作らず、何も消さない。
+   * 調べる対象は設定から決まり、依頼では選べない。
+   */
+  inspectImages(): Promise<ImagesReport>;
   /** 実行中のコンテナと、途中のビルドをすべて止める。 */
   stopAll(): Promise<void>;
 }
@@ -87,6 +109,8 @@ export interface LauncherDeps {
   /** `docker` コマンド自体に渡す環境変数(PATHなど)。 */
   readonly dockerEnv: Record<string, string>;
   readonly logger: Logger;
+  /** 起動係自身のイメージの目印。目印のないイメージでは null。 */
+  readonly revision?: string | null;
   /** コンテナの名前を作る。重ならないこと。 */
   readonly newContainerName: () => string;
   /** 時間の上限の計り方。テストで差し替えられる。 */
@@ -287,6 +311,61 @@ export function createLauncher(deps: LauncherDeps): Launcher {
         `イメージを用意できませんでした: ${error instanceof Error ? error.message : String(error)}`,
       );
     }
+  }
+
+  /** イメージの情報を読む。手元になければ null。読めない応答は、原因の分かるメッセージで失敗させる。 */
+  async function readImage(image: string): Promise<ImageDetails | null> {
+    const result = await docker.exec(
+      ["image", "inspect", `--format=${IMAGE_DETAILS_FORMAT}`, "--", image],
+      quiet,
+    );
+    if (result.exitCode !== 0) return null;
+    let raw: unknown;
+    try {
+      raw = JSON.parse(result.stdout);
+    } catch (error) {
+      throw new Error(`イメージの情報をJSONとして読めません: ${image}`, {
+        cause: error,
+      });
+    }
+    const parsed = ImageDetailsSchema.safeParse(raw);
+    if (!parsed.success) {
+      throw new Error(`イメージの情報の形式が不正です: ${image}`);
+    }
+    return parsed.data;
+  }
+
+  /** イメージの情報を、応答の1件にする。 */
+  function imageInfo(input: {
+    kind: ImageInfo["kind"];
+    image: string;
+    repos: string[];
+    details: ImageDetails | null;
+    /** 土台にしているはずの基本。`self` は、このイメージが基本そのものであること。 */
+    base: ImageDetails | null | "self";
+  }): ImageInfo {
+    const { kind, image, repos, details, base } = input;
+    let relation: ImageBase;
+    if (base === "self") {
+      relation = "self";
+    } else if (details === null || base === null) {
+      relation = "unknown";
+    } else {
+      relation = isBuiltOn(details.layers ?? [], base.layers ?? [])
+        ? "current"
+        : "stale";
+    }
+    const created = details === null ? Number.NaN : Date.parse(details.created);
+    return {
+      kind,
+      image,
+      repos,
+      present: details !== null,
+      created: Number.isNaN(created) ? null : new Date(created).toISOString(),
+      // ラベルは、イメージを作った者が自由に書ける。目印の形のものだけを返す。
+      revision: parseRevision(details?.labels?.[REVISION_LABEL]),
+      base: relation,
+    };
   }
 
   /**
@@ -560,6 +639,72 @@ export function createLauncher(deps: LauncherDeps): Launcher {
         logger.error("launcher.builder_check_failed", errorFields(error));
         return false;
       }
+    },
+
+    async inspectImages() {
+      // 同じイメージは、1回だけ読む。
+      const cache = new Map<string, Promise<ImageDetails | null>>();
+      const read = (image: string) => {
+        const known = cache.get(image);
+        if (known !== undefined) return known;
+        const started = readImage(image);
+        cache.set(image, started);
+        return started;
+      };
+
+      const baseImage = config.worker_image;
+      const users = new Map<string, string[]>();
+      for (const entry of config.repos) {
+        const image = workerImageFor(config, entry.repo);
+        users.set(image, [...(users.get(image) ?? []), entry.repo]);
+      }
+      const images: ImageInfo[] = [];
+      for (const [image, repos] of users) {
+        images.push(
+          imageInfo({
+            kind: "configured",
+            image,
+            repos,
+            details: await read(image),
+            // 製品ごとのイメージ(手でビルドしたもの)は、全体の基本を土台にしているはずである。
+            base: image === baseImage ? "self" : await read(baseImage),
+          }),
+        );
+      }
+      for (const entry of config.repos) {
+        const listed = await docker.exec(
+          [
+            "image",
+            "ls",
+            ...builtImageFilters(settings, entry.repo),
+            "--format={{.Repository}}:{{.Tag}}",
+          ],
+          quiet,
+        );
+        if (listed.exitCode !== 0) {
+          throw new Error(
+            `ビルドしたイメージを一覧できません: ${listed.stderr.trim()}`,
+          );
+        }
+        const built = listed.stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((name) => name !== "" && !name.includes("<"))
+          .sort();
+        for (const image of built) {
+          images.push(
+            imageInfo({
+              kind: "built",
+              image,
+              repos: [entry.repo],
+              details: await read(image),
+              // ビルドの土台は、その製品の、設定のイメージである。
+              base: await read(workerImageFor(config, entry.repo)),
+            }),
+          );
+        }
+      }
+      return { revision: deps.revision ?? null, base_image: baseImage, images };
     },
 
     async stopAll() {

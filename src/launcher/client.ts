@@ -8,6 +8,8 @@ import http from "node:http";
 import { z } from "zod";
 import {
   BUILD_TIMEOUT_SEC,
+  type ImagesReport,
+  ImagesReportSchema,
   type RunRequestInput,
   type RunResult,
   RunResultSchema,
@@ -125,6 +127,73 @@ export function createLauncherClient(options: {
           );
         });
         call.end(body);
+      });
+    },
+  };
+}
+
+export interface ImageReporter {
+  /**
+   * 起動係自身と、ワーカーのイメージが、どの目印のものかを尋ねる。
+   * 起動係に届かない場合や、応答が読めない場合は、例外になる。
+   */
+  images(): Promise<ImagesReport>;
+}
+
+/** イメージの情報を待つ時間の既定値。 */
+const IMAGES_TIMEOUT_MS = 30_000;
+
+export function createImageReporter(options: {
+  /** 起動係のUnixソケットの場所。 */
+  socketPath: string;
+  timeoutMs?: number;
+}): ImageReporter {
+  return {
+    images() {
+      return new Promise((resolve, reject) => {
+        const call = http.request(
+          { socketPath: options.socketPath, path: "/images", method: "GET" },
+          (response) => {
+            const chunks: Buffer[] = [];
+            response.on("data", (chunk: Buffer) => chunks.push(chunk));
+            response.on("error", reject);
+            response.on("end", () => {
+              if (response.statusCode !== 200) {
+                // 古い起動係(この口ができる前のもの)は、404 を返す。
+                reject(
+                  new Error(
+                    `起動係がイメージの情報を返しません(状態 ${response.statusCode})。起動係のイメージが古い可能性があります`,
+                  ),
+                );
+                return;
+              }
+              let raw: unknown;
+              try {
+                raw = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+              } catch {
+                reject(new Error("起動係の応答をJSONとして読めません"));
+                return;
+              }
+              const result = ImagesReportSchema.safeParse(raw);
+              if (!result.success) {
+                reject(new Error("起動係の応答の形式が不正です"));
+                return;
+              }
+              resolve(result.data);
+            });
+          },
+        );
+        call.setTimeout(options.timeoutMs ?? IMAGES_TIMEOUT_MS, () => {
+          call.destroy(new Error("起動係の応答がありません"));
+        });
+        call.on("error", (error) => {
+          reject(
+            new Error(`起動係に届きません: ${options.socketPath}`, {
+              cause: error,
+            }),
+          );
+        });
+        call.end();
       });
     },
   };

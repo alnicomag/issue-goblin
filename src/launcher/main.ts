@@ -105,6 +105,7 @@ async function main(): Promise<void> {
     claudeToken: token === undefined || token === "" ? undefined : token,
     dockerEnv: dockerEnvFrom(process.env),
     logger,
+    revision: revisionFromEnv(process.env),
     newContainerName: () => `factory-worker-${randomBytes(8).toString("hex")}`,
   });
 

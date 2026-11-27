@@ -126,3 +126,25 @@ export function buildProbeArgs(input: {
     "-",
   ];
 }
+
+/**
+ * イメージの情報を読む `docker image inspect` の書式。1行のJSONになる。
+ * 読むのは、ID、作った時刻、ラベル、層の並びだけである。
+ */
+export const IMAGE_DETAILS_FORMAT =
+  '{"id":{{json .Id}},"created":{{json .Created}},"labels":{{json .Config.Labels}},"layers":{{json .RootFS.Layers}}}';
+
+/**
+ * `image` が、`base` を土台にしているか。`base` の層の並びが、`image` の層の先頭と一致すれば true。
+ *
+ * ラベルに頼らないので、手でビルドしたものにも、これまでに作ったものにも使える。
+ */
+export function isBuiltOn(
+  imageLayers: readonly string[],
+  baseLayers: readonly string[],
+): boolean {
+  if (baseLayers.length === 0 || baseLayers.length > imageLayers.length) {
+    return false;
+  }
+  return baseLayers.every((layer, index) => imageLayers[index] === layer);
+}
