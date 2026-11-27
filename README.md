@@ -113,8 +113,10 @@ done
 3. ワーカーのイメージを作ります。
 
    ```bash
-   docker compose build worker-image
+   FACTORY_REVISION="$(scripts/revision.sh)" docker compose build worker-image
    ```
+
+   `FACTORY_REVISION` は、イメージに付ける目印(作った元のコミット)です。状況表示で、稼働中のイメージが古くないかを確かめるのに使います(`docs/docker.md` の「イメージが古くないかを確かめる」)。
 
    イメージの名前は、設定(`config/factory.config.yml`)の `worker_image` で決めます。既定は `factory-worker` で、そのまま使うなら、ほかに書くものはありません。別の名前にするときは、設定の `worker_image` に書いたうえで、ビルドで同じ名前が付くように、`.env` の `WORKER_IMAGE` にも同じ値を書きます。
 
@@ -179,7 +181,7 @@ repos:
 ## 起動
 
 ```bash
-docker compose up -d --build
+FACTORY_REVISION="$(scripts/revision.sh)" docker compose up -d --build
 docker compose logs -f office
 ```
 
@@ -253,6 +255,7 @@ scripts/check-isolation.sh
 - 進行中の実行(リポジトリ、イシュー番号、試行回数、現在のステップ、開始時刻)。ステップの合間にある実行は、次に行うステップを出します。
 - クローズ待ちの実行。PRの作成まで終わり、イシューのクローズを待っているだけの実行です。同時実行の枠には数えません。
 - 再試行を待っているイシューと、再試行してよい時刻。失敗の後、待機時間が過ぎていないものです。
+- 稼働中のイメージの目印(作った元のコミット)。常駐用(事務局、起動係)と、設定にあるワーカーのイメージごとに出ます。ワーカーのイメージは、手元にあるか、製品用がいまの基本を土台にしているかも出ます。目印のないイメージは「不明」と出ます。ワーカーの欄は起動係に尋ねて出すので、起動係に届かない場合は「不明」になります(`docs/docker.md` の「イメージが古くないかを確かめる」)。
 
 ```bash
 docker compose exec office node src/office/status.ts
@@ -281,7 +284,7 @@ pnpm run status
   ワーカーのコンテナは、ルートが読み取り専用で、書けるのは作業場所(`HOME` を含む)と `/tmp` だけです。実行時にツールを入れる作りにはせず、イメージに入れておきます。
 
   足りないまま `dry_run: false` で動かした場合も、事務局が着手の前に `commands.setup` を実行して確かめるので、通らなければ着手しません。理由は、状況表示の「着手前の確認」に出ます。
-- 稼働中のイメージが、手元のコードから作ったものであることを確かめます。古ければ `docker compose up -d --build` で作り直します。
+- 稼働中のイメージが、手元のコードから作ったものであることを確かめます。状況表示の「イメージ」の目印と、`scripts/revision.sh` の出力を比べます。古ければ `FACTORY_REVISION="$(scripts/revision.sh)" docker compose up -d --build` で作り直します。
 
 ### 2. `dry_run: true` で動かす
 
@@ -487,13 +490,14 @@ pnpm test
 | `src/office/product.ts` | `factory.yml` の取得と検証 |
 | `src/office/preflight.ts` | 着手前の確認(`commands.setup` がワーカーのイメージで通るか) |
 | `src/office/status.ts` | 状況表示コマンド |
+| `src/office/revision.ts` | イメージの目印(作った元のコミット)の検証と表示 |
 | `src/office/events.ts` | イベントの記録 |
 | `src/office/log.ts` | 構造化ログ |
 | `src/office/clock.ts` | 時計 |
 | `src/launcher/` | 起動係と、事務局から起動係に依頼する口 |
 | `src/proxy/` | ワーカーの出口になるプロキシ |
 | `docker/worker.Dockerfile` | ワーカーの基本イメージ |
-| `scripts/` | 確認用のスクリプト |
+| `scripts/` | 確認用のスクリプトと、イメージに付ける目印を出すスクリプト(`revision.sh`) |
 | `migrations/` | 連番のSQLファイル |
 | `config/` | ファクトリー側の設定の例 |
 | `tests/` | 自動テスト |
